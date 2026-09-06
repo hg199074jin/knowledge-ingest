@@ -139,6 +139,27 @@ def gate_resolve(
         transition_to(manifest, "COMPLETED")
 
 
+def target_start(manifest: JobManifest, target: str) -> None:
+    """Agent begins a distillation target (CORPUS_READY -> DISTILLING_*)."""
+    state = _target_state(manifest, target)
+    if state.status not in {"pending", "running"}:
+        raise ValueError(f"target {target} not startable (status={state.status})")
+    if manifest.status == "CORPUS_READY":
+        transition_to(manifest, "DISTILLING_CANGJIE" if target == "cangjie"
+                      else "DISTILLING_PERSONAL")
+    elif manifest.status == "DISTILLING_CANGJIE" and target == "cangjie":
+        pass
+    elif manifest.status == "DISTILLING_PERSONAL" and target == "personal":
+        pass
+    else:
+        raise InvalidTransition(
+            f"cannot start target {target} from {manifest.status}")
+    state.status = "running"
+    manifest.gate_history.append({
+        "ts": _now_iso(), "target": target, "action": "start",
+    })
+
+
 def target_complete(manifest: JobManifest, target: str, output_path: Path) -> None:
     state = _target_state(manifest, target)
     state.status = "success"

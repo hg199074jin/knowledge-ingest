@@ -139,6 +139,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     target = sub.add_parser("target", parents=[common], help="target skill operations")
     target_sub = target.add_subparsers(dest="target_command", required=True)
+    target_start_cmd = target_sub.add_parser(
+        "start", parents=[common],
+        help="begin distillation for a target (CORPUS_READY -> DISTILLING_*)")
+    target_start_cmd.add_argument("job_id")
+    target_start_cmd.add_argument("--target", required=True,
+                                  choices=["cangjie", "personal"])
     target_done = target_sub.add_parser(
         "complete", parents=[common],
         help="register a distillation target's final output")
@@ -469,6 +475,17 @@ def _cmd_target_complete(config: AppConfig, args) -> int:
     return 0
 
 
+def _cmd_target_start(config: AppConfig, args) -> int:
+    from knowledge_ingest.next_action import target_start
+
+    store = _store(config)
+    manifest = _load_job(store, args.job_id)
+    target_start(manifest, args.target)
+    store.save(manifest)
+    print(f"{args.target} started: status={manifest.status}")
+    return 0
+
+
 def _cmd_status(config: AppConfig, args) -> int:
     from knowledge_ingest.report import build_status
 
@@ -522,6 +539,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_next(config, args)
         if args.command == "gate":
             return _cmd_gate(config, args)
+        if args.command == "target" and args.target_command == "start":
+            return _cmd_target_start(config, args)
         if args.command == "target" and args.target_command == "complete":
             return _cmd_target_complete(config, args)
         if args.command == "status":
