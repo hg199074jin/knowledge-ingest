@@ -283,9 +283,11 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
 
     store = _store(config)
     manifest = _load_job(store, args.job_id)
-    if manifest.status not in {"ROUTING", "DOCCHUNKING", "VERIFYING"}:
+    if manifest.status not in {"ROUTING", "TRANSCRIBING", "DOCCHUNKING",
+                               "VERIFYING"}:
         print(f"error: preprocess expects ROUTING (or interrupted "
-              f"DOCCHUNKING/VERIFYING), got {manifest.status}", file=sys.stderr)
+              f"TRANSCRIBING/DOCCHUNKING/VERIFYING), got {manifest.status}",
+              file=sys.stderr)
         return 2
 
     routing = manifest.routing
@@ -303,9 +305,12 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
 
     transcripts: dict[str, str] = {}
     if media_paths:
-        tsm(manifest, "TRANSCRIBING")
+        if manifest.status == "ROUTING":
+            tsm(manifest, "TRANSCRIBING")
         manifest.media.status = "running"
-        manifest.media.started_at = datetime.now(timezone.utc)
+        manifest.media.started_at = manifest.media.started_at or \
+            datetime.now(timezone.utc)
+        manifest.media.outputs = []   # 重入时重建（缓存让重建零成本）
         store.save(manifest)
 
         media_adapter = MediaAdapter(
@@ -356,7 +361,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
         manifest.media.status = "success"
         manifest.media.completed_at = datetime.now(timezone.utc)
 
-    if manifest.status == "ROUTING":
+    if manifest.status in {"ROUTING", "TRANSCRIBING"}:
         tsm(manifest, "DOCCHUNKING")
     manifest.docchunk.status = "running"
     store.save(manifest)
