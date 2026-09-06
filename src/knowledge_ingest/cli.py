@@ -187,46 +187,133 @@ def _cmd_route(config: AppConfig, args) -> int:
 
 
 def _cmd_preprocess(config: AppConfig, args) -> int:
+    from datetime import datetime, timezone
+
     from knowledge_ingest.adapters.docchunk import DocchunkAdapter
+    from knowledge_ingest.adapters.media import MediaAdapter
+    from knowledge_ingest.cache import (
+        TranscriptCache,
+        TranscriptCacheEntry,
+        build_transcript_cache_key,
+    )
+    from knowledge_ingest.collection import (
+        CollectionIncomplete,
+        build_document_set,
+        clear_handoff,
+    )
+    from knowledge_ingest.fingerprint import fingerprint_file
+    from knowledge_ingest.models import MediaOutput
+    from knowledge_ingest.state_machine import transition_to as tsm
 
     store = _store(config)
     manifest = _load_job(store, args.job_id)
+    if manifest.status not in {"ROUTING", "DOCCHUNKING", "VERIFYING"}:
+        print(f"error: preprocess expects ROUTING (or interrupted "
+              f"DOCCHUNKING/VERIFYING), got {manifest.status}", file=sys.stderr)
+        return 2
+
     routing = manifest.routing
-    if routing.get("media_paths"):
-        print("error: media processing not wired yet", file=sys.stderr)
-        return 2
-    if routing.get("collection"):
-        print("error: collection processing not wired yet", file=sys.stderr)
-        return 2
-    docs = routing.get("document_paths") or []
-    if len(docs) != 1:
-        print(f"error: expected exactly one document, got {len(docs)}",
-              file=sys.stderr)
-        return 2
-    if manifest.status != "ROUTING":
-        print(f"error: preprocess expects ROUTING, got {manifest.status}",
+    excluded = {str(Path(p).expanduser().resolve()) for p in
+                (routing.get("excluded") or [])}
+    document_paths = [Path(p) for p in routing.get("document_paths") or []]
+    media_paths = [Path(p) for p in routing.get("media_paths") or []]
+    if not document_paths and not media_paths:
+        print("error: nothing to preprocess (all inputs excluded?)",
               file=sys.stderr)
         return 2
 
-    doc = Path(docs[0])
-    adapter = DocchunkAdapter(project=config.docchunk_project)
+    job_dir = store.job_dir(manifest.job_id)
+    handoff_dir = job_dir / "handoff" / "document-set"
 
-    transition_to(manifest, "DOCCHUNKING")
+    transcripts: dict[str, str] = {}
+    if media_paths:
+        tsm(manifest, "TRANSCRIBING")
+        manifest.media.status = "running"
+        manifest.media.started_at = datetime.now(timezone.utc)
+        store.save(manifest)
+
+        media_adapter = MediaAdapter(
+            project=config.media_project, output_root=config.media_output_root)
+        cache = TranscriptCache(
+            config.pipeline_root / "cache" / "transcript-index.json")
+        mt_head = media_adapter.head()
+
+        for media in media_paths:
+            media_resolved = media.resolve()
+            if media_resolved.as_posix() in excluded:
+                continue
+            source_sha = fingerprint_file(media_resolved)
+            key = build_transcript_cache_key(
+                source_sha256=source_sha, mt_head=mt_head, config_sha=None,
+                device=config.processing.media_device,
+                timestamp=config.processing.media_timestamp,
+                glossary=None, hotwords=None)
+            entry = cache.lookup(key)
+            if entry is None:
+                try:
+                    result = media_adapter.transcribe(
+                        media_resolved,
+                        device=config.processing.media_device,
+                        timestamp=config.processing.media_timestamp)
+                except (RuntimeError, OSError) as exc:
+                    manifest.media.status = "failed"
+                    manifest.media.error = f"{media}: {exc}"
+                    _block(manifest, "media_failed")
+                    store.save(manifest)
+                    print(f"BLOCKED: media_failed ({media})")
+                    return 1
+                entry = TranscriptCacheEntry(
+                    cache_key=result.cache_key, source_path=media_resolved,
+                    markdown_path=result.markdown_path,
+                    metadata_path=result.metadata_path,
+                    transcript_sha256=result.transcript_sha256)
+                cache.put(entry)
+            transcripts[media_resolved.as_posix()] = str(entry.markdown_path)
+            manifest.media.outputs.append(MediaOutput(
+                source_relative_path=media.name,
+                source_sha256=source_sha,
+                transcript=entry.markdown_path,
+                transcript_sha256=entry.transcript_sha256,
+                metadata=entry.metadata_path,
+                cache_key=entry.cache_key,
+            ))
+        manifest.media.status = "success"
+        manifest.media.completed_at = datetime.now(timezone.utc)
+
+    if manifest.status == "ROUTING":
+        tsm(manifest, "DOCCHUNKING")
     manifest.docchunk.status = "running"
     store.save(manifest)
 
-    corpus = adapter.split(doc)
-
-    transition_to(manifest, "VERIFYING")
+    source_root = Path(manifest.source.get("local_path") or
+                       manifest.request.source)
+    clear_handoff(handoff_dir)
+    try:
+        built = build_document_set(
+            handoff_dir=handoff_dir, source_root=source_root,
+            document_paths=document_paths, media_paths=media_paths,
+            transcripts=transcripts, excluded=excluded)
+    except CollectionIncomplete as exc:
+        _block(manifest, "collection_incomplete")
+        store.save(manifest)
+        print(f"BLOCKED: collection_incomplete ({exc})")
+        return 1
+    manifest.routing["document_set_map"] = str(built.map_path)
     store.save(manifest)
-    verified = adapter.verify(corpus)
+
+    docchunk_adapter = DocchunkAdapter(project=config.docchunk_project)
+    corpus = docchunk_adapter.split(handoff_dir)
+
+    if manifest.status != "VERIFYING":
+        tsm(manifest, "VERIFYING")
+    store.save(manifest)
+    verified = docchunk_adapter.verify(corpus)
 
     manifest.docchunk.corpus_path = corpus
     manifest.docchunk.verify = "PASS" if verified else "FAIL"
     manifest.docchunk.status = "verified" if verified else "failed"
-    manifest.docchunk.completed_at = None
     if verified:
-        transition_to(manifest, "CORPUS_READY")
+        tsm(manifest, "CORPUS_READY")
         store.save(manifest)
         print(f"corpus verified: {corpus}")
         print(f"status: {manifest.status}")
