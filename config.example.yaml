@@ -1,0 +1,23 @@
+pipeline_root: /Volumes/ORICO/KnowledgePipeline
+media_project: /Volumes/ORICO/Projects/media-transcriber
+docchunk_project: /Volumes/ORICO/Projects/docchunk
+media_output_root: /Volumes/ORICO/MediaTranscriber/output
+docchunk_corpus_root: /Volumes/ORICO/LongDocCorpus
+
+# 唯一实体库是 ~/.agents/skills（AGENTS.md §19）；其余为 symlink 视图。
+# doctor 端对 resolve() 后的根去重，同一实体不会被重复检查。
+skill_roots:
+  - ~/.agents/skills
+  - ~/.zcode/skills
+  - ~/.claude/skills
+
+skills:
+  baidu: baidu-drive
+  quark: quarkclouddrive
+  cangjie: cangjie-skill
+  personal_distiller: personal-capability-distiller
+
+processing:
+  media_device: auto
+  media_timestamp: 10m
+  require_orico: true
