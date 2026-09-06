@@ -82,6 +82,12 @@ def _build_parser() -> argparse.ArgumentParser:
                        metavar="PATH",
                        help="user-approved exclusion (repeatable)")
 
+    preprocess = sub.add_parser(
+        "preprocess",
+        help="route -> media(when present) -> document set -> docchunk -> verify",
+    )
+    preprocess.add_argument("job_id")
+
     return parser
 
 
@@ -153,6 +159,8 @@ def _cmd_route(config: AppConfig, args) -> int:
         "documents": len(result.documents),
         "media": len(result.media),
         "unsupported": len(result.unsupported),
+        "document_paths": [str(p) for p in result.documents],
+        "media_paths": [str(p) for p in result.media],
         "unsupported_paths": [str(p) for p in result.unsupported],
         "excluded": list(args.excludes),
     }
@@ -178,6 +186,57 @@ def _cmd_route(config: AppConfig, args) -> int:
     return 0
 
 
+def _cmd_preprocess(config: AppConfig, args) -> int:
+    from knowledge_ingest.adapters.docchunk import DocchunkAdapter
+
+    store = _store(config)
+    manifest = _load_job(store, args.job_id)
+    routing = manifest.routing
+    if routing.get("media_paths"):
+        print("error: media processing not wired yet", file=sys.stderr)
+        return 2
+    if routing.get("collection"):
+        print("error: collection processing not wired yet", file=sys.stderr)
+        return 2
+    docs = routing.get("document_paths") or []
+    if len(docs) != 1:
+        print(f"error: expected exactly one document, got {len(docs)}",
+              file=sys.stderr)
+        return 2
+    if manifest.status != "ROUTING":
+        print(f"error: preprocess expects ROUTING, got {manifest.status}",
+              file=sys.stderr)
+        return 2
+
+    doc = Path(docs[0])
+    adapter = DocchunkAdapter(project=config.docchunk_project)
+
+    transition_to(manifest, "DOCCHUNKING")
+    manifest.docchunk.status = "running"
+    store.save(manifest)
+
+    corpus = adapter.split(doc)
+
+    transition_to(manifest, "VERIFYING")
+    store.save(manifest)
+    verified = adapter.verify(corpus)
+
+    manifest.docchunk.corpus_path = corpus
+    manifest.docchunk.verify = "PASS" if verified else "FAIL"
+    manifest.docchunk.status = "verified" if verified else "failed"
+    manifest.docchunk.completed_at = None
+    if verified:
+        transition_to(manifest, "CORPUS_READY")
+        store.save(manifest)
+        print(f"corpus verified: {corpus}")
+        print(f"status: {manifest.status}")
+        return 0
+    _block(manifest, "corpus_verify_failed")
+    store.save(manifest)
+    print("BLOCKED: corpus_verify_failed")
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -197,6 +256,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_source_register(config, args)
         if args.command == "route":
             return _cmd_route(config, args)
+        if args.command == "preprocess":
+            return _cmd_preprocess(config, args)
     except InvalidTransition as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
