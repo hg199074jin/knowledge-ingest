@@ -71,16 +71,19 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="knowledge-ingest",
         description="Multi-source knowledge ingestion orchestrator",
     )
-    parser.add_argument("--config", default=None, help="path to config YAML")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default=None, help="path to config YAML")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    doctor = sub.add_parser("doctor", help="verify machine baseline")
+    doctor = sub.add_parser("doctor", parents=[common],
+                            help="verify machine baseline")
     doctor.add_argument("--json", dest="json_output", action="store_true",
                         help="emit machine-readable JSON")
 
-    create = sub.add_parser("job", help="job operations")
+    create = sub.add_parser("job", parents=[common], help="job operations")
     job_sub = create.add_subparsers(dest="job_command", required=True)
-    create_cmd = job_sub.add_parser("create", help="create a new ingest job")
+    create_cmd = job_sub.add_parser("create", parents=[common],
+                                    help="create a new ingest job")
     create_cmd.add_argument("--provider", required=True,
                             choices=["local", "baidu", "quark"])
     create_cmd.add_argument("--source", required=True,
@@ -90,41 +93,43 @@ def _build_parser() -> argparse.ArgumentParser:
     create_cmd.add_argument("--prompt", default="",
                             help="raw user request text for provenance")
 
-    register = sub.add_parser("source", help="source operations")
+    register = sub.add_parser("source", parents=[common], help="source operations")
     source_sub = register.add_subparsers(dest="source_command", required=True)
-    register_cmd = source_sub.add_parser("register",
+    register_cmd = source_sub.add_parser("register", parents=[common],
                                          help="register a completed Source Handoff")
     register_cmd.add_argument("job_id")
     register_cmd.add_argument("--handoff", required=True,
                               help="path to source.json handoff file")
 
-    route = sub.add_parser("route", help="classify source files (documents/media)")
+    route = sub.add_parser("route", parents=[common],
+                       help="classify source files (documents/media)")
     route.add_argument("job_id")
     route.add_argument("--exclude", dest="excludes", action="append", default=[],
                        metavar="PATH",
                        help="user-approved exclusion (repeatable)")
 
     preprocess = sub.add_parser(
-        "preprocess",
+        "preprocess", parents=[common],
         help="route -> media(when present) -> document set -> docchunk -> verify",
     )
     preprocess.add_argument("job_id")
 
-    nxt = sub.add_parser("next", help="next action for this job")
+    nxt = sub.add_parser("next", parents=[common], help="next action for this job")
     nxt.add_argument("job_id")
     nxt.add_argument("--json", dest="json_output", action="store_true",
                      default=True, help="emit JSON (default)")
 
-    gate = sub.add_parser("gate", help="human confirmation gates")
+    gate = sub.add_parser("gate", parents=[common], help="human confirmation gates")
     gate_sub = gate.add_subparsers(dest="gate_command", required=True)
-    gate_enter_cmd = gate_sub.add_parser("enter",
+    gate_enter_cmd = gate_sub.add_parser("enter", parents=[common],
                                          help="record that a gate is now open")
     gate_enter_cmd.add_argument("job_id")
     gate_enter_cmd.add_argument("--target", required=True,
                                 choices=["cangjie", "personal"])
     gate_enter_cmd.add_argument("--name", required=True)
     gate_resolve_cmd = gate_sub.add_parser(
-        "resolve", help="record a REAL user decision (never fabricate)")
+        "resolve", parents=[common],
+        help="record a REAL user decision (never fabricate)")
     gate_resolve_cmd.add_argument("job_id")
     gate_resolve_cmd.add_argument("--target", required=True,
                                   choices=["cangjie", "personal"])
@@ -132,21 +137,24 @@ def _build_parser() -> argparse.ArgumentParser:
     gate_resolve_cmd.add_argument("--decision", required=True,
                                   choices=["confirmed", "rejected"])
 
-    target = sub.add_parser("target", help="target skill operations")
+    target = sub.add_parser("target", parents=[common], help="target skill operations")
     target_sub = target.add_subparsers(dest="target_command", required=True)
     target_done = target_sub.add_parser(
-        "complete", help="register a distillation target's final output")
+        "complete", parents=[common],
+        help="register a distillation target's final output")
     target_done.add_argument("job_id")
     target_done.add_argument("--target", required=True,
                              choices=["cangjie", "personal"])
     target_done.add_argument("--output-path", required=True)
 
-    status = sub.add_parser("status", help="human-readable job status")
+    status = sub.add_parser("status", parents=[common],
+                        help="human-readable job status")
     status.add_argument("job_id")
     status.add_argument("--json", dest="json_output", action="store_true",
                         help="emit machine-readable JSON")
 
-    report = sub.add_parser("report", help="render reports/final.md")
+    report = sub.add_parser("report", parents=[common],
+                        help="render reports/final.md")
     report.add_argument("job_id")
 
     return parser
