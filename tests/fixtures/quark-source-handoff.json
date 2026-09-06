@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "provider": "quark",
+  "remote": {
+    "id": "provider-fid-example",
+    "path": "/审计课程/融资担保",
+    "name": "融资担保",
+    "size_bytes": 678901234,
+    "mtime": null
+  },
+  "local_path": "/Volumes/ORICO/KnowledgePipeline/jobs/<job>/source/融资担保",
+  "download_completed": true,
+  "source_notes": ["quark official skill artifact"]
+}

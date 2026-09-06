@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "provider": "baidu",
+  "remote": {
+    "id": null,
+    "path": "apps/bdpan/审计/课程.pdf",
+    "name": "课程.pdf",
+    "size_bytes": 123456,
+    "mtime": null
+  },
+  "local_path": "/Volumes/ORICO/KnowledgePipeline/jobs/<job>/source/课程.pdf",
+  "download_completed": true,
+  "source_notes": ["baidu app scope"]
+}
