@@ -76,3 +76,15 @@ def test_corpus_cache_miss_when_dir_gone(tmp_path: Path):
     import shutil
     shutil.rmtree(corpus)
     assert cache.lookup("k1", verify=lambda p: True) is None
+
+
+def test_corpus_cache_heals_corrupted_index(tmp_path: Path):
+    import json
+    index = tmp_path / "corpus-index.json"
+    index.write_text("not json at all", encoding="utf-8")
+    cache = CorpusCache(index)
+    assert cache.lookup("k1", verify=lambda p: True) is None
+    corpus = make_fake_corpus(tmp_path)
+    cache.put("k1", corpus)
+    data = json.loads(index.read_text(encoding="utf-8"))
+    assert "k1" in data

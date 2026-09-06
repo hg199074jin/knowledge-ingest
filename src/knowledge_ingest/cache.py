@@ -10,12 +10,29 @@ from typing import Callable
 from pydantic import BaseModel
 
 from knowledge_ingest.fingerprint import fingerprint_file
+from knowledge_ingest.manifest_store import atomic_write_text
 
 
 def _sha256_of_payload(payload: dict) -> str:
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
                            separators=(",", ":"))
     return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _load_index(path: Path) -> dict:
+    """损坏的索引自愈为空（断电/中断留下的半文件不应造成 crash-loop）。"""
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_index(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def build_transcript_cache_key(
@@ -65,14 +82,10 @@ class TranscriptCache:
         self.index_path = Path(index_path)
 
     def _read(self) -> dict:
-        if not self.index_path.is_file():
-            return {}
-        return json.loads(self.index_path.read_text(encoding="utf-8"))
+        return _load_index(self.index_path)
 
     def _write(self, data: dict) -> None:
-        self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        self.index_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _save_index(self.index_path, data)
 
     def put(self, entry: TranscriptCacheEntry) -> None:
         data = self._read()
@@ -99,14 +112,10 @@ class CorpusCache:
         self.index_path = Path(index_path)
 
     def _read(self) -> dict:
-        if not self.index_path.is_file():
-            return {}
-        return json.loads(self.index_path.read_text(encoding="utf-8"))
+        return _load_index(self.index_path)
 
     def _write(self, data: dict) -> None:
-        self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        self.index_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _save_index(self.index_path, data)
 
     def lookup(self, key: str, verify: Callable[[Path], bool]) -> Path | None:
         raw = self._read().get(key)

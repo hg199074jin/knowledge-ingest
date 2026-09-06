@@ -66,3 +66,13 @@ def test_cache_overwrites_same_key(tmp_path: Path):
     reloaded = cache.lookup("k1")
     assert reloaded is not None
     assert reloaded.transcript_sha256 == entry.transcript_sha256
+
+
+def test_cache_heals_corrupted_index(tmp_path: Path):
+    index = tmp_path / "transcript-index.json"
+    index.write_text("{broken json", encoding="utf-8")
+    cache = TranscriptCache(index)
+    assert cache.lookup("k1") is None      # 损坏不抛异常
+    entry = make_entry(tmp_path)
+    cache.put(entry)                        # 自愈：损坏被干净覆盖
+    assert TranscriptCache(index).lookup("k1") == entry
