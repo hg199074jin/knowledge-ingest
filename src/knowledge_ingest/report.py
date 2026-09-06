@@ -76,7 +76,7 @@ def render_report(manifest: JobManifest) -> str:
     lines.append(f"# Knowledge Ingest 报告 — {manifest.job_id}")
     lines.append("")
     lines.append(f"- 状态：{manifest.status}")
-    lines.append(f"- 请求：{manifest.request.raw_prompt}")
+    lines.append(f"- 请求：{redact_text(manifest.request.raw_prompt)}")
     lines.append(f"- 目标：{', '.join(manifest.request.targets)}")
     lines.append("")
     lines.append("## 来源")

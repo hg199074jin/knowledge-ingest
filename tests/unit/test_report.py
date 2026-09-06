@@ -99,3 +99,13 @@ def test_render_report_has_required_sections():
     for marker in ("请求", "来源", "源指纹", "路由统计", "转写产物",
                    "Corpus", "Cangjie", "Personal", "排除", "失败", "恢复"):
         assert marker in report, f"missing section: {marker}"
+
+
+def test_raw_prompt_redacted_in_report():
+    from knowledge_ingest.report import redact_text
+    manifest = make_manifest()
+    manifest.request.raw_prompt = "帮我把 access_token=abc123 的课程做成 skill"
+    report = render_report(manifest)
+    assert "abc123" not in report
+    assert "[REDACTED]" in report
+    assert redact_text(manifest.request.raw_prompt) != manifest.request.raw_prompt

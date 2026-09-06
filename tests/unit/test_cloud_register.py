@@ -135,3 +135,19 @@ def test_register_rejects_bad_schema_version(tmp_path: Path):
     rc = _cmd_source_register(config, Namespace(job_id=job_id, handoff=str(handoff)))
     assert rc == 1
     assert store.load(job_id).errors[-1]["reason"] == "invalid_handoff_schema"
+
+
+def test_job_create_redacts_prompt(tmp_path: Path):
+    from argparse import Namespace
+    from knowledge_ingest.cli import _cmd_job_create
+
+    config, store, existing = make_job(tmp_path, "local")
+    args = Namespace(provider="local", source="/tmp/课程.pdf",
+                     targets=["cangjie"], prompt="处理 token=supersecret 这个")
+    rc = _cmd_job_create(config, args)
+    assert rc == 0
+    new_jobs = [j for j in store.list_jobs() if j != existing]
+    assert len(new_jobs) == 1
+    manifest = store.load(new_jobs[0])
+    assert "supersecret" not in manifest.request.raw_prompt
+    assert "[REDACTED]" in manifest.request.raw_prompt

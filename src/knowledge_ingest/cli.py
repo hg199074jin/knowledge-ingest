@@ -187,8 +187,11 @@ def _cmd_doctor(config: AppConfig, args) -> int:
 
 
 def _cmd_job_create(config: AppConfig, args) -> int:
+    from knowledge_ingest.report import redact_text
+
     request = JobRequest(
-        raw_prompt=args.prompt or args.source,
+        # prompt 是自由文本，可能携带敏感串——落盘前脱敏（硬约束：Token 不入 Manifest）
+        raw_prompt=redact_text(args.prompt or args.source),
         provider=args.provider,
         source=args.source,
         targets=list(args.targets),
