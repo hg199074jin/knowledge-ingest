@@ -1,56 +1,84 @@
 # knowledge-ingest
 
-多源知识摄取与能力蒸馏流水线（macOS / Apple Silicon）。
+[![Tests](https://github.com/hg199074jin/knowledge-ingest/actions/workflows/tests.yml/badge.svg)](https://github.com/hg199074jin/knowledge-ingest/actions/workflows/tests.yml)
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/hg199074jin/knowledge-ingest)](https://github.com/hg199074jin/knowledge-ingest/releases)
 
-把**本地文件、百度网盘、夸克网盘**的资料统一送入现有能力：
+[简体中文](README.zh-CN.md)
 
-```text
-media-transcriber（视频/音频 → Markdown）
-docchunk（长文档 → 可验证 Corpus）
-cangjie-skill（方法论蒸馏为可执行 Agent Skill）
-personal-capability-distiller（沉淀个人能力卡/SOP/Prompt → Obsidian 能力库）
-```
-
-`knowledge-ingest` 本身不做 OCR/ASR/chunking/蒸馏——它只做**编排、状态、
-断点恢复、去重、缓存、人工确认门与最终报告**。
+A multi-source knowledge ingestion and capability-distillation pipeline for
+macOS (Apple Silicon). It routes material from **Baidu Netdisk, Quark Drive,
+or local paths** through the existing toolchain:
 
 ```text
-百度/夸克/本地资料 → 可验证 Corpus → Agent Skill + 个人能力资产
+media-transcriber (video/audio → Markdown)
+docchunk (long documents → verifiable Corpus)
+cangjie-skill (methodology → executable Agent Skills)
+personal-capability-distiller (capability cards / SOPs / prompts → Obsidian)
 ```
 
-## 安装
+`knowledge-ingest` itself does **no** OCR, ASR, chunking, or distillation —
+it provides orchestration, durable state, resumable breakpoints, dedup,
+caching, human confirmation gates, and final reporting.
+
+```text
+Baidu / Quark / local material → verifiable Corpus → Agent Skills + capability assets
+```
+
+## How it works
+
+```text
+Cloud skills (baidu-drive / quarkclouddrive) download into the job's source dir
+  → Source Handoff (canonical source.json)
+  → file-type router (documents / media / unsupported)
+  → media transcription (cached by content hash + tool revision)
+  → Document Set (symlinks + provenance map, never merged into one blob)
+  → docchunk split → verify PASS (hard gate)
+  → cangjie-skill → personal-capability-distiller (serial, human gates)
+  → final report (secrets-redacted)
+```
+
+Key guarantees:
+
+- **`docchunk verify` FAIL blocks distillation** — structurally enforced by the
+  explicit state machine, not by convention.
+- **Human confirmation gates are never fabricated.** Gate resolutions can only
+  come from a real user reply, and every gate event is recorded.
+- **No credentials anywhere.** Cloud tokens/cookies are never read; free-text
+  prompts and reports pass through a redactor; event logs are structured and
+  sanitized.
+- **Dedup across sources.** Same content from Baidu and Quark reuses the same
+  verified corpus (handoff fingerprint + tool HEAD + config in the cache key).
+- **Resumable.** Every stage transition is atomically persisted; `next` always
+  returns the exact remaining action, never a re-run of completed stages.
+
+## Install
 
 ```bash
-cd /Volumes/ORICO/Projects/knowledge-ingest
+git clone git@github.com:hg199074jin/knowledge-ingest.git
+cd knowledge-ingest
 uv sync
 uv run knowledge-ingest doctor --config ./config.example.yaml
 ```
 
-Skill 全局注册（实体库 symlink + 视图同步）：
-
-```bash
-ln -sfn /Volumes/ORICO/Projects/knowledge-ingest ~/.agents/skills/knowledge-ingest
-~/.local/bin/skill-sync        # 体检；必要时 skill-sync fix
-```
-
-可选 CLI wrapper（`~/.local/bin/knowledge-ingest`）：
+Optional CLI wrapper (`~/.local/bin/knowledge-ingest`):
 
 ```zsh
 #!/bin/zsh
-cd /Volumes/ORICO/Projects/knowledge-ingest || exit 1
+cd /path/to/knowledge-ingest || exit 1
 exec uv run knowledge-ingest "$@"
 ```
 
-## 快速上手
+## Quick start
 
 ```bash
 knowledge-ingest job create --provider local --source /path/book.pdf --target cangjie
-# 云端：Agent 用 baidu-drive / quarkclouddrive 下载后生成 source.json 再 register
-knowledge-ingest source register JOB --handoff source.json
+knowledge-ingest source register JOB --handoff source.json   # after cloud download
 knowledge-ingest route JOB
-knowledge-ingest preprocess JOB        # 长任务请放后台，轮询 status
+knowledge-ingest preprocess JOB       # long task: run in background, poll status
 knowledge-ingest status JOB
-# （完整 CLI 表面见 SKILL.md）
 knowledge-ingest next JOB --json
 knowledge-ingest target start JOB --target cangjie
 knowledge-ingest gate enter JOB --target cangjie --name GATE
@@ -59,25 +87,32 @@ knowledge-ingest target complete JOB --target cangjie --output-path PATH
 knowledge-ingest report JOB
 ```
 
-自然语言入口（经 Skill）：*"把夸克网盘'审计课程/融资担保'学习掉，做成 Skill，
-并沉淀成我的个人能力。"* 用户只在确认门处参与判断。
+As an Agent Skill, the natural-language entry points are: *"turn this Baidu
+Netdisk PDF into a skill"*, *"learn this Quark course and distill it"*, *"continue
+the ingestion task"*, *"where is that job at?"* — see [SKILL.md](SKILL.md).
 
-## 目录
+## Repository layout
 
-- `src/knowledge_ingest/` — Python CLI（uv 管理，stdlib + PyYAML + pydantic）
-- `SKILL.md` — Agent Skill 入口；`references/` — 详细规则
-- `schemas/` — Source/Target handoff 契约示例
-- `docs/` — 设计文档 V1.1、实施计划 V1.1、Runtime Inventory
-- `tests/` — 单元 + 集成（TDD 全程）
+| Path | Purpose |
+|---|---|
+| `src/knowledge_ingest/` | Python CLI (stdlib + PyYAML + pydantic, managed by uv) |
+| `SKILL.md` | Agent Skill entry point |
+| `references/` | Architecture, routing, cloud sources, target gates, recovery, handoff contracts |
+| `schemas/` | Source/Target handoff contract examples |
+| `docs/` | Design v1.1, implementation plan v1.1, runtime inventory, acceptance record |
+| `tests/` | Unit + integration tests (TDD throughout) |
 
-## 安全边界
+## Docs
 
-- 不读取/不落盘任何云盘 Token/Cookie/授权码；日志与报告强制脱敏。
-- 默认只下载，不删除/移动/上传云盘文件；本地原始文件只读。
-- 百度仅支持 `/apps/bdpan` 应用目录与分享链接；越界请求显式 BLOCKED。
-- `docchunk verify` FAIL 一律 BLOCKED，绝不进入蒸馏。
-- 用户确认门绝不允许伪造。
+- [Design document v1.1](docs/knowledge-ingest-design-v1.md)
+- [Implementation plan v1.1](docs/knowledge-ingest-implementation-v1.md)
+- [Acceptance record](docs/acceptance-v1.md)
 
-## 许可
+## Related projects
 
-私有项目（hg199074jin）。
+- [docchunk](https://github.com/hg199074jin/docchunk) — verifiable long-document corpora
+- [media-transcriber](https://github.com/hg199074jin/media-transcriber) — local ASR to structured Markdown
+
+## License
+
+[MIT](LICENSE)

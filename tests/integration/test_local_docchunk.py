@@ -1,14 +1,26 @@
 """Real docchunk integration: TXT fixture -> verified corpus (isolated corpus root)."""
 
+import pytest
+
 from pathlib import Path
 
 from knowledge_ingest.adapters.docchunk import DocchunkAdapter
 from knowledge_ingest.config import AppConfig
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "small.txt"
+DOCSHUNK_PROJECT = Path("/Volumes/ORICO/Projects/docchunk")
+requires_docchunk = pytest.mark.skipif(
+    not DOCSHUNK_PROJECT.is_dir(),
+    reason="real docchunk project not available on this machine",
+)
 
 
-def make_config(tmp_path: Path) -> AppConfig:
+@pytest.fixture()
+def config(tmp_path: Path) -> AppConfig:
+    return _make_config(tmp_path)
+
+
+def _make_config(tmp_path: Path) -> AppConfig:
     return AppConfig.model_validate({
         "pipeline_root": str(tmp_path / "kp"),
         "media_project": "/Volumes/ORICO/Projects/media-transcriber",
@@ -27,8 +39,9 @@ def make_config(tmp_path: Path) -> AppConfig:
     })
 
 
+@requires_docchunk
 def test_local_txt_split_and_verify(tmp_path: Path):
-    config = make_config(tmp_path)
+    config = _make_config(tmp_path)
     adapter = DocchunkAdapter(project=config.docchunk_project)
     corpus_root = tmp_path / "corpus-root"
     corpus_root.mkdir()

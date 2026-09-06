@@ -1,14 +1,22 @@
 """Real docchunk integration over a symlink-based Document Set (Task 6 Step 3)."""
 
-from pathlib import Path
 import shutil
+from pathlib import Path
+
+import pytest
 
 from knowledge_ingest.adapters.docchunk import DocchunkAdapter
 from knowledge_ingest.collection import build_document_set
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
+DOCSHUNK_PROJECT = Path("/Volumes/ORICO/Projects/docchunk")
+requires_docchunk = pytest.mark.skipif(
+    not DOCSHUNK_PROJECT.is_dir(),
+    reason="real docchunk project not available on this machine",
+)
 
 
+@requires_docchunk
 def test_docchunk_reads_symlinked_document_set(tmp_path: Path):
     source = tmp_path / "source" / "course"
     source.mkdir(parents=True)
