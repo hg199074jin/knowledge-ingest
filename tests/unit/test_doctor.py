@@ -1,3 +1,5 @@
+import platform
+import sys
 from pathlib import Path
 
 import pytest
@@ -6,6 +8,14 @@ from knowledge_ingest.config import AppConfig
 from knowledge_ingest.doctor import DoctorCheck, has_fail, run_doctor
 
 from .test_config import make_config_dict
+
+
+@pytest.fixture(autouse=True)
+def fake_darwin_env(monkeypatch: pytest.MonkeyPatch):
+    """doctor 的平台检查与被测环境解耦：CI (ubuntu) 与本机 (darwin) 都跑同一套断言。"""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(platform, "machine", lambda: "arm64")
+    monkeypatch.setattr("knowledge_ingest.doctor.ORICO_ROOT", Path("/"))
 
 
 @pytest.fixture()
