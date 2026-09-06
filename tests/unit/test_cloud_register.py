@@ -34,12 +34,17 @@ def make_job(tmp_path: Path, provider: str) -> tuple[AppConfig, ManifestStore, s
     return config, store, manifest.job_id
 
 
-def write_handoff(tmp_path: Path, provider: str, remote_path: str) -> Path:
+def write_handoff(tmp_path: Path, provider: str, remote_path: str,
+                  local_name: str = "x.pdf",
+                  download_completed: bool = True) -> Path:
+    local_file = tmp_path / local_name
+    local_file.write_bytes(b"pdf")
     handoff = {
         "schema_version": 1, "provider": provider,
         "remote": {"id": None, "path": remote_path, "name": "x.pdf",
                    "size_bytes": 10, "mtime": None},
-        "local_path": "/tmp/x.pdf", "download_completed": True,
+        "local_path": str(local_file),
+        "download_completed": download_completed,
         "source_notes": [],
     }
     path = tmp_path / "source.json"
@@ -57,12 +62,31 @@ def test_baidu_out_of_scope_blocks(tmp_path: Path):
     assert loaded.errors[-1]["reason"] == "baidu_scope_limited"
 
 
-def test_baidu_app_scope_ok(tmp_path: Path):
+def test_baidu_prefix_boundary_rejects_lookalike(tmp_path: Path):
     config, store, job_id = make_job(tmp_path, "baidu")
-    handoff = write_handoff(tmp_path, "baidu", "apps/bdpan/审计/课程.pdf")
+    handoff = write_handoff(tmp_path, "baidu", "apps/bdpan-evil/x.pdf")
     rc = _cmd_source_register(config, Namespace(job_id=job_id, handoff=str(handoff)))
-    assert rc == 0
-    assert store.load(job_id).status == "DOWNLOADED"
+    assert rc == 1
+    assert store.load(job_id).errors[-1]["reason"] == "baidu_scope_limited"
+
+
+def test_baidu_bare_relative_path_rejected_full_path_norm(tmp_path: Path):
+    """规范统一为全路径：应用目录内文件也必须写 /apps/bdpan/ 前缀。"""
+    config, store, job_id = make_job(tmp_path, "baidu")
+    handoff = write_handoff(tmp_path, "baidu", "审计/课程.pdf")
+    rc = _cmd_source_register(config, Namespace(job_id=job_id, handoff=str(handoff)))
+    assert rc == 1
+    assert store.load(job_id).errors[-1]["reason"] == "baidu_scope_limited"
+
+
+def test_baidu_app_scope_ok(tmp_path: Path):
+    for remote in ("apps/bdpan/审计/课程.pdf", "/apps/bdpan/审计/课程.pdf"):
+        config, store, job_id = make_job(tmp_path, "baidu")
+        handoff = write_handoff(tmp_path, "baidu", remote)
+        rc = _cmd_source_register(config, Namespace(job_id=job_id,
+                                                    handoff=str(handoff)))
+        assert rc == 0, remote
+        assert store.load(job_id).status == "DOWNLOADED"
 
 
 def test_quark_register_ok(tmp_path: Path):
@@ -71,3 +95,43 @@ def test_quark_register_ok(tmp_path: Path):
     rc = _cmd_source_register(config, Namespace(job_id=job_id, handoff=str(handoff)))
     assert rc == 0
     assert store.load(job_id).status == "DOWNLOADED"
+
+
+def test_register_rejects_incomplete_download(tmp_path: Path):
+    config, store, job_id = make_job(tmp_path, "quark")
+    handoff = write_handoff(tmp_path, "quark", "/x", download_completed=False)
+    rc = _cmd_source_register(config, Namespace(job_id=job_id, handoff=str(handoff)))
+    assert rc == 1
+    loaded = store.load(job_id)
+    assert loaded.status == "BLOCKED"
+    assert loaded.errors[-1]["reason"] == "source_incomplete"
+
+
+def test_register_rejects_missing_local_file(tmp_path: Path):
+    config, store, job_id = make_job(tmp_path, "quark")
+    handoff = write_handoff(tmp_path, "quark", "/x")
+    handoff_data = json.loads(handoff.read_text(encoding="utf-8"))
+    handoff_data["local_path"] = "/tmp/definitely-missing-9f31.pdf"
+    handoff.write_text(json.dumps(handoff_data), encoding="utf-8")
+    rc = _cmd_source_register(config, Namespace(job_id=job_id, handoff=str(handoff)))
+    assert rc == 1
+    assert store.load(job_id).errors[-1]["reason"] == "source_missing"
+
+
+def test_register_rejects_provider_mismatch(tmp_path: Path):
+    config, store, job_id = make_job(tmp_path, "quark")
+    handoff = write_handoff(tmp_path, "baidu", "apps/bdpan/x.pdf")
+    rc = _cmd_source_register(config, Namespace(job_id=job_id, handoff=str(handoff)))
+    assert rc == 1
+    assert store.load(job_id).errors[-1]["reason"] == "provider_mismatch"
+
+
+def test_register_rejects_bad_schema_version(tmp_path: Path):
+    config, store, job_id = make_job(tmp_path, "quark")
+    handoff = write_handoff(tmp_path, "quark", "/x")
+    handoff_data = json.loads(handoff.read_text(encoding="utf-8"))
+    handoff_data["schema_version"] = 99
+    handoff.write_text(json.dumps(handoff_data), encoding="utf-8")
+    rc = _cmd_source_register(config, Namespace(job_id=job_id, handoff=str(handoff)))
+    assert rc == 1
+    assert store.load(job_id).errors[-1]["reason"] == "invalid_handoff_schema"

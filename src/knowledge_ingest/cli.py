@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -194,12 +195,38 @@ def _cmd_job_create(config: AppConfig, args) -> int:
     return 0
 
 
+BAIDU_APP_PATH = re.compile(r"^/?apps/bdpan(/|$)")
+
+
+def _handoff_validation_error(manifest, handoff: dict) -> str | None:
+    """Source Handoff 完成门：不完整/不存在/provider 不符一律拒绝。"""
+    if handoff.get("schema_version") != 1:
+        return "invalid_handoff_schema"
+    if handoff.get("download_completed") is not True:
+        return "source_incomplete"
+    if handoff.get("provider") != manifest.request.provider:
+        return "provider_mismatch"
+    local = handoff.get("local_path")
+    if not local or not Path(str(local)).expanduser().exists():
+        return "source_missing"
+    return None
+
+
 def _cmd_source_register(config: AppConfig, args) -> int:
     store = _store(config)
     manifest = _load_job(store, args.job_id)
     handoff_path = Path(args.handoff).expanduser()
     handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
     manifest.source = handoff
+
+    _advance(manifest, ["DISCOVERING"])
+    validation_error = _handoff_validation_error(manifest, handoff)
+    if validation_error:
+        _block(manifest, validation_error)
+        store.save(manifest)
+        print(f"BLOCKED: {validation_error}")
+        return 1
+
     fingerprint = _source_fingerprint(
         Path(handoff.get("local_path") or manifest.request.source))
     if fingerprint:
@@ -211,15 +238,15 @@ def _cmd_source_register(config: AppConfig, args) -> int:
     remote = handoff.get("remote") or {}
     if manifest.request.provider == "baidu":
         remote_path = str(remote.get("path") or "")
-        if not remote_path.startswith(BAIDU_APP_PREFIXES):
+        # 规范：remote.path 必须是应用目录全路径（/apps/bdpan/... 或 apps/bdpan/...）
+        if not BAIDU_APP_PATH.match(remote_path):
             manifest.source["scope_violation"] = True
-            _advance(manifest, ["DISCOVERING"])
             _block(manifest, "baidu_scope_limited")
             store.save(manifest)
             print(f"BLOCKED: baidu_scope_limited ({remote_path or '<empty>'})")
             return 1
 
-    _advance(manifest, ["DISCOVERING", "DOWNLOADING", "DOWNLOADED"])
+    _advance(manifest, ["DOWNLOADING", "DOWNLOADED"])
     store.save(manifest)
     print(f"source registered: {handoff.get('local_path')}")
     print(f"status: {manifest.status}")
