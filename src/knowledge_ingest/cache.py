@@ -39,6 +39,19 @@ def build_transcript_cache_key(
     return _sha256_of_payload(payload)
 
 
+def build_corpus_cache_key(
+    handoff_fingerprint: str,
+    docchunk_revision: str,
+    config_fingerprint: str,
+) -> str:
+    payload = {
+        "handoff_fingerprint": handoff_fingerprint,
+        "docchunk_revision": docchunk_revision,
+        "config_fingerprint": config_fingerprint,
+    }
+    return _sha256_of_payload(payload)
+
+
 class TranscriptCacheEntry(BaseModel):
     cache_key: str
     source_path: Path

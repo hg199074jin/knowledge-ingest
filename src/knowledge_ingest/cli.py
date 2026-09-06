@@ -302,7 +302,29 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
     store.save(manifest)
 
     docchunk_adapter = DocchunkAdapter(project=config.docchunk_project)
-    corpus = docchunk_adapter.split(handoff_dir)
+    from knowledge_ingest.cache import CorpusCache, build_corpus_cache_key
+    from knowledge_ingest.fingerprint import fingerprint_collection
+
+    handoff_fp = fingerprint_collection(handoff_dir)
+    config_fp = (fingerprint_file(Path(args.config).expanduser())
+                 if getattr(args, "config", None) else "no-config")
+    corpus_cache = CorpusCache(
+        config.pipeline_root / "cache" / "corpus-index.json")
+    corpus_key = build_corpus_cache_key(
+        handoff_fingerprint=handoff_fp.sha256,
+        docchunk_revision=docchunk_adapter.head(),
+        config_fingerprint=config_fp)
+    manifest.docchunk.cache_key = corpus_key
+
+    reused_corpus = corpus_cache.lookup(corpus_key, docchunk_adapter.verify)
+    if reused_corpus is not None:
+        corpus = reused_corpus
+        manifest.docchunk.reused = True
+        print(f"corpus reused (verified): {corpus}")
+    else:
+        corpus = docchunk_adapter.split(handoff_dir)
+        corpus_cache.put(corpus_key, corpus)
+        manifest.docchunk.reused = False
 
     if manifest.status != "VERIFYING":
         tsm(manifest, "VERIFYING")

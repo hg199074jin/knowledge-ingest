@@ -12,14 +12,6 @@ IGNORED_PREFIXES = ("._",)
 IGNORED_NAMES = {".DS_Store"}
 
 
-def fingerprint_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        while block := f.read(CHUNK):
-            h.update(block)
-    return f"sha256:{h.hexdigest()}"
-
-
 @dataclass(frozen=True)
 class FileFingerprint:
     relative_path: str
@@ -34,10 +26,24 @@ class CollectionFingerprint:
     sha256: str
 
 
+def _hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while block := f.read(CHUNK):
+            h.update(block)
+    return f"sha256:{h.hexdigest()}"
+
+
+def fingerprint_file(path: Path) -> str:
+    return _hash_file(Path(path))
+
+
 def _iter_files(root: Path):
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.is_symlink():
+        if not path.is_file():
             continue
+        # 文件 symlink 按其解析目标参与指纹（handoff 目录由 symlink 组成，
+        # 指纹必须反映最终内容才能支撑跨来源去重）；坏链自动跳过
         if path.name in IGNORED_NAMES or path.name.startswith(IGNORED_PREFIXES):
             continue
         if any(part.startswith(".") for part in path.relative_to(root).parts):
@@ -51,15 +57,13 @@ def fingerprint_collection(root: Path) -> CollectionFingerprint:
         FileFingerprint(
             relative_path=path.relative_to(root).as_posix(),
             size_bytes=path.stat().st_size,
-            sha256=fingerprint_file(path),
+            sha256=_hash_file(path),
         )
         for path in _iter_files(root)
     )
     canonical = json.dumps(
-        [f.__dict__ if not hasattr(f, "__dataclass_fields__") else
-         {"relative_path": f.relative_path, "size_bytes": f.size_bytes,
-          "sha256": f.sha256}
-         for f in files],
+        [{"relative_path": f.relative_path, "size_bytes": f.size_bytes,
+          "sha256": f.sha256} for f in files],
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
