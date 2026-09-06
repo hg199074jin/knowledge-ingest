@@ -57,16 +57,34 @@ class DocchunkAdapter:
         corpus_root: Path | None = None,
         timeout: int | None = None,
     ) -> Path:
-        argv = self._base() + ["split", str(Path(input_path).resolve())]
-        if corpus_root is not None:
-            argv += ["--corpus-root", str(Path(corpus_root).resolve())]
-        result = run_checked(argv, cwd=self.project, timeout=timeout)
+        result = run_checked(self._split_argv(input_path, corpus_root),
+                             cwd=self.project, timeout=timeout)
         if result.returncode != 0:
             raise RuntimeError(
                 f"docchunk split failed (exit {result.returncode}): "
                 f"{result.stderr.strip()[-500:] or result.stdout.strip()[-500:]}"
             )
         return resolve_corpus_path(result)
+
+    def _split_argv(self, input_path: Path,
+                    corpus_root: Path | None) -> list[str]:
+        argv = self._base() + ["split", str(Path(input_path).resolve())]
+        if corpus_root is not None:
+            argv += ["--corpus-root", str(Path(corpus_root).resolve())]
+        return argv
+
+    def split_task(self, input_path: Path, corpus_root: Path | None = None,
+                   log_path: Path | None = None):
+        """长任务入口：spawn 而不阻塞（PDF 走 MinerU 可达 10-20+ 分钟）。
+
+        调用方用 runner.poll 轮询，结束后用 resolve_corpus_path 解析。
+        """
+        from knowledge_ingest.runner import spawn
+
+        if log_path is None:
+            log_path = Path.cwd() / "docchunk-split.log"
+        return spawn(self._split_argv(input_path, corpus_root),
+                     cwd=self.project, log_path=Path(log_path))
 
     def verify(self, corpus: Path, timeout: int = 300) -> bool:
         result = run_checked(
