@@ -50,7 +50,12 @@ knowledge-ingest source register JOB --handoff source.json
 knowledge-ingest route JOB
 knowledge-ingest preprocess JOB        # 长任务请放后台，轮询 status
 knowledge-ingest status JOB
+# （完整 CLI 表面见 SKILL.md）
 knowledge-ingest next JOB --json
+knowledge-ingest target start JOB --target cangjie
+knowledge-ingest gate enter JOB --target cangjie --name GATE
+knowledge-ingest gate resolve JOB --target cangjie --name GATE --decision confirmed
+knowledge-ingest target complete JOB --target cangjie --output-path PATH
 knowledge-ingest report JOB
 ```
 

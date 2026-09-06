@@ -30,8 +30,9 @@ canonical 文件：`jobs/<job-id>/handoff/source.json`（schema 见
 - Local provider：`remote=null`，`local_path` 指向用户原路径，**不复制**。
 - 云端 provider：只有 Skill 明确下载完成、本地文件存在且大小稳定后才生成；
   `download_completed=false` 时总控拒绝 register。
-- 百度：`remote.path` 必须位于 `apps/bdpan`（或 `/apps/bdpan`）之下，否则
-  register 直接 `BLOCKED: baidu_scope_limited`。
+- 百度：`remote.path` **必须写应用目录全路径**（`/apps/bdpan/...` 或
+  `apps/bdpan/...`），register 用正则边界校验（`apps/bdpan-evil` 等仿冒前缀
+  与裸相对路径一律拒绝），否则 `BLOCKED: baidu_scope_limited`。
 - 不得包含任何 Token/Cookie/授权码。
 
 ## 2. Target Handoff（knowledge-ingest → 蒸馏 Skill）

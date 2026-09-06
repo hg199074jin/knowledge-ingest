@@ -43,7 +43,8 @@ def build_document_set(
     handoff_dir = Path(handoff_dir)
     source_root = Path(source_root).resolve()
 
-    existing = [p for p in handoff_dir.iterdir()] if handoff_dir.is_dir() else []
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    existing = [p for p in handoff_dir.iterdir()]
     if existing:
         raise RuntimeError(
             f"refusing to overwrite non-empty handoff dir: {handoff_dir}")
@@ -106,7 +107,6 @@ def build_document_set(
             entry["source_path"] = str(target)
         entries.append(entry)
 
-    handoff_dir.mkdir(parents=True, exist_ok=True)
     # map 与 document-set 同级（handoff/document-set-map.yaml），
     # 不混入送入 docchunk 的目录本身
     map_path = handoff_dir.parent / "document-set-map.yaml"

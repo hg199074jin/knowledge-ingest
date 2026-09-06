@@ -12,8 +12,8 @@
 | C | 夸克混合课程 → 双蒸馏 | ⏸ 待用户完成夸克授权后补测（Skill 已装） |
 | D | Cangjie WAITING_USER 断点恢复 | ✅ PASS |
 | E | 跨来源同 PDF 去重复用 | ✅ 机制实证（跨 Job 同 cache key + reused）；云端真实下载待 C 后补测 |
-| F | 媒体失败阻断 | ✅ PASS（单元级：`media_failed` → BLOCKED，不进蒸馏） |
-| G | verify FAIL 阻断 | ✅ PASS（单元级：`corpus_verify_failed` → BLOCKED，next 不返回蒸馏） |
+| F | 媒体失败阻断 | ✅ PASS（`test_preprocess_cli.py::test_media_failure_blocks`：BLOCKED，不进蒸馏） |
+| G | verify FAIL 阻断 | ✅ PASS（`test_preprocess_cli.py::test_verify_fail_blocks`：BLOCKED，next 不返回蒸馏） |
 | H | 百度普通网盘范围限制 | ✅ PASS |
 | I | 敏感信息扫描 | ✅ PASS（rg 零命中） |
 | J | 完整测试套件 + doctor | ✅ PASS（86 测试全绿；doctor 14 项无 FAIL） |
@@ -87,7 +87,7 @@ rg -c -i 'access[_-]?token|refresh[_-]?token|cookie|authorization|password|secre
 ## Case J：完整测试套件
 
 ```text
-uv run pytest -q                          → 全部通过
+uv run pytest -q                          → 全部通过（111 项）
 uv run knowledge-ingest doctor --config … → 14 项检查，无 FAIL
 ```
 
@@ -105,3 +105,23 @@ uv run knowledge-ingest doctor --config … → 14 项检查，无 FAIL
 - 完成 bdpan 登录（`bash ~/.agents/skills/baidu-drive/scripts/login.sh`）后：
   Case A 的云端版（/apps/bdpan 内 PDF）+ Case E 的跨来源真实下载。
 - 完成夸克授权后：Case C 混合课程双蒸馏全流程。
+
+## 评审修复轮（v0.1.1，2026-09-06）
+
+按 `requesting-code-review` skill 派独立评审代理对 62772d7..59991e0 全量复核
+（无 Critical、10 项 Important），全部修复并复验：
+
+| # | 修复 | commit |
+|---|---|---|
+| 2/6 | source register 完成门（schema/download_completed/provider/local_path）+ 百度路径正则边界、全路径规范 | 1b7a4b7 |
+| 3/4 | gate 拒绝后链式进入剩余 target；`target complete --pipeline-state` 登记 Cangjie 断点文件 | 2c4a798 |
+| 7 | 缓存索引原子写入 + 损坏自愈 | 7b81e16 |
+| 5 | raw_prompt 入库前与报告渲染双脱敏 | c9d8bce |
+| 1/8/9/10 | split 切换到 spawn/poll（长任务约束落地）+ 30s 进度事件；split/symlink 失败收敛为 BLOCKED；同名 stem 冲突门；MediaOutput 目录级 provenance；新增 `test_preprocess_cli.py` 6 项编排测试 | a497c85 |
+| Minor | collection 先建目录、safe_argv 支持 `--k=v`、main 捕获 ValueError、test_resume 走合法跃迁、SKILL/README 补 `target start`、recovery.md 补 4 类恢复策略、handoff-contracts 定稿百度全路径规范 | 本提交 |
+
+修复后真实链路复验：新 md 源 cache miss → 真实 docchunk split 经 spawn/poll
+执行成功（5.3s）；事件日志出现 `docchunk_split_started` / `corpus_verified`；
+m4a 新 Job 双缓存命中 + 二次调用幂等（already CORPUS_READY）。
+已声明不采纳的评审项：doctor 增加 bdpan 登录检查（避免运行 bdpan 命令或读取
+认证配置，保持 Skill 触发纪律与安全边界；登录状态在 runtime-inventory 人工跟踪）。

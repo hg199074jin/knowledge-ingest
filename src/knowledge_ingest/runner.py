@@ -41,6 +41,11 @@ def safe_argv(argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
         kept.append(item)
         if SECRET_FLAG.search(item) and not item.startswith("-"):
             continue
+        if item.startswith("--") and "=" in item:
+            flag, _, value = item.partition("=")
+            if SECRET_FLAG.search(flag):
+                kept[-1] = f"{flag}=[REDACTED]"
+                continue
         if SECRET_FLAG.search(item) and item.startswith("--"):
             skip_next = True
     return tuple(kept)

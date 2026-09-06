@@ -6,6 +6,7 @@ from pathlib import Path
 from knowledge_ingest.manifest_store import ManifestStore
 from knowledge_ingest.models import JobManifest, JobRequest
 from knowledge_ingest.next_action import gate_enter, next_action
+from knowledge_ingest.state_machine import transition_to
 
 
 def test_resume_after_cangjie_waiting_user(tmp_path: Path):
@@ -56,5 +57,6 @@ def test_resume_mid_preprocess_keeps_completed_stages(tmp_path: Path):
 
 
 def transition_through(manifest: JobManifest, status: str) -> None:
+    """仅当跃迁合法时使用状态机；此处 CORPUS_READY→DISTILLING_CANGJIE 合法。"""
     manifest.updated_at = datetime.now(timezone.utc)
-    manifest.status = status
+    transition_to(manifest, status)

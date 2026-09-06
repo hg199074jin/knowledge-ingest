@@ -38,6 +38,11 @@ A. app_path：文件已在“我的应用数据/bdpan”内
 B. share_link：用户提供百度分享链接，baidu-drive 转存到应用目录后下载
 ```
 
+**路径规范（V1.1 修订）**：handoff 的 `remote.path` 必须是应用目录全路径
+（`/apps/bdpan/<相对路径>`）；bdpan CLI 返回的普通文件路径均以 `/apps/bdpan/`
+为前缀，照抄即可。裸相对路径（如 `审计/课程.pdf`）无法与普通网盘目录区分，
+一律按越界处理。
+
 用户要求搜索普通百度网盘其它目录时：
 
 ```text

@@ -73,9 +73,11 @@ knowledge-ingest route JOB [--exclude PATH ...]
 knowledge-ingest preprocess JOB          # 长任务：放后台跑，轮询 status
 knowledge-ingest status JOB [--json]
 knowledge-ingest next JOB --json
+knowledge-ingest target start JOB --target cangjie   # CORPUS_READY -> DISTILLING_*
 knowledge-ingest gate enter JOB --target cangjie --name GATE
 knowledge-ingest gate resolve JOB --target cangjie --name GATE --decision confirmed|rejected
-knowledge-ingest target complete JOB --target cangjie --output-path PATH
+knowledge-ingest target complete JOB --target cangjie --output-path PATH \
+  [--pipeline-state PATH]                              # cangjie: 登记断点文件
 knowledge-ingest report JOB
 ```
 

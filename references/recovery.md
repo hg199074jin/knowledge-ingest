@@ -36,6 +36,10 @@
 | `unsupported_inputs` | 与用户确认排除清单 → `route JOB --exclude PATH ...` 重新路由；状态机允许 BLOCKED→ROUTING |
 | `media_failed` | 修复来源/重试该媒体；用户明确排除该文件后 `route --exclude` 重跑 |
 | `corpus_verify_failed` | 排查 docchunk 输出（`docchunk doctor` / `docchunk status`）；必要时删除坏 corpus 后重跑 preprocess |
+| `docchunk_split_failed` | 查看 job logs/docchunk-split.log 与 `docchunk doctor`；修复后重跑 preprocess（状态机允许 DOCCHUNKING→BLOCKED→DOCCHUNKING） |
+| `media_stem_conflict` | 集合内存在同名 stem（如 A/01.mp4 与 B/01.mp4）：重命名源文件或经用户排除其一后重跑 |
+| `collection_build_failed` | 检查源文件是否被移动/删除（symlink 失败）；恢复来源后重跑 |
+| `source_incomplete` / `source_missing` / `provider_mismatch` / `invalid_handoff_schema` | Source Handoff 未达完成门：重新完成下载并生成合规 handoff 后再 register |
 | `baidu_scope_limited` | 两种恢复：把文件移到"我的应用数据/bdpan"，或提供分享链接 |
 | `collection_incomplete` | 补齐缺失转写/文档，或用户明确排除后重跑 |
 

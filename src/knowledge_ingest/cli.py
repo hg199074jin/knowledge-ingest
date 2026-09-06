@@ -650,7 +650,7 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_status(config, args)
         if args.command == "report":
             return _cmd_report(config, args)
-    except InvalidTransition as exc:
+    except (InvalidTransition, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
