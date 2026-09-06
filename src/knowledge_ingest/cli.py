@@ -18,6 +18,28 @@ from knowledge_ingest.state_machine import InvalidTransition, transition_to
 BAIDU_APP_PREFIXES = ("apps/bdpan", "/apps/bdpan")
 
 
+def _log(config: AppConfig, manifest, event: str, **fields) -> None:
+    from knowledge_ingest.report import EventLog
+
+    job_dir = _store(config).job_dir(manifest.job_id)
+    EventLog(job_dir / "logs" / "events.jsonl").log(
+        event, job_id=manifest.job_id, **fields)
+
+
+def _source_fingerprint(path: Path) -> str | None:
+    from knowledge_ingest.fingerprint import (
+        fingerprint_collection,
+        fingerprint_file,
+    )
+
+    path = Path(path)
+    if not path.exists():
+        return None
+    if path.is_dir():
+        return fingerprint_collection(path).sha256
+    return fingerprint_file(path)
+
+
 def _jobs_root(config: AppConfig) -> Path:
     return config.pipeline_root / "jobs"
 
@@ -119,6 +141,14 @@ def _build_parser() -> argparse.ArgumentParser:
                              choices=["cangjie", "personal"])
     target_done.add_argument("--output-path", required=True)
 
+    status = sub.add_parser("status", help="human-readable job status")
+    status.add_argument("job_id")
+    status.add_argument("--json", dest="json_output", action="store_true",
+                        help="emit machine-readable JSON")
+
+    report = sub.add_parser("report", help="render reports/final.md")
+    report.add_argument("job_id")
+
     return parser
 
 
@@ -156,6 +186,13 @@ def _cmd_source_register(config: AppConfig, args) -> int:
     handoff_path = Path(args.handoff).expanduser()
     handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
     manifest.source = handoff
+    fingerprint = _source_fingerprint(
+        Path(handoff.get("local_path") or manifest.request.source))
+    if fingerprint:
+        manifest.source["source_fingerprint"] = fingerprint
+    _log(config, manifest, "source_registered",
+         provider=manifest.request.provider,
+         fingerprint=fingerprint)
 
     remote = handoff.get("remote") or {}
     if manifest.request.provider == "baidu":
@@ -419,6 +456,34 @@ def _cmd_target_complete(config: AppConfig, args) -> int:
     return 0
 
 
+def _cmd_status(config: AppConfig, args) -> int:
+    from knowledge_ingest.report import build_status
+
+    manifest = _load_job(_store(config), args.job_id)
+    status = build_status(manifest)
+    if args.json_output:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+    else:
+        print(f"Job            {status['job_id']}")
+        print(f"Source         {status['source']}")
+        print(f"Transcribe     {status['transcribe']}")
+        print(f"DocChunk       {status['docchunk']}")
+        print(f"Cangjie        {status['cangjie']}")
+        print(f"Personal       {status['personal']}")
+        print(f"Overall        {status['overall']}")
+    return 0
+
+
+def _cmd_report(config: AppConfig, args) -> int:
+    from knowledge_ingest.report import write_report
+
+    store = _store(config)
+    manifest = _load_job(store, args.job_id)
+    path = write_report(manifest, store.job_dir(manifest.job_id))
+    print(path)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -446,6 +511,10 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_gate(config, args)
         if args.command == "target" and args.target_command == "complete":
             return _cmd_target_complete(config, args)
+        if args.command == "status":
+            return _cmd_status(config, args)
+        if args.command == "report":
+            return _cmd_report(config, args)
     except InvalidTransition as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
