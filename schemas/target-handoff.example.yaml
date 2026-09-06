@@ -1,0 +1,16 @@
+# Target Handoff 示例（总控 → 蒸馏 Skill）
+# 实际文件由总控写入 jobs/<job-id>/handoff/target-<target>.yaml
+job_id: 20260906-120000-quark-guarantee-course
+target: cangjie            # cangjie | personal
+corpus_path: /Volumes/ORICO/LongDocCorpus/融资担保课程-3f786850e387
+source:
+  provider: quark
+  title: 融资担保课程
+  author_or_speaker: null   # 缺失保持 null，禁止猜测
+  publication_date: null
+first_pilot: true           # cangjie：是否首次试点
+depth: null                 # personal：A/B/C；null = 原 Skill 默认（实测默认 C）
+obsidian_vault: /Volumes/ORICO/Obsidian/Skill_Library   # personal 专用（override Skill 内写死的 E:\）
+purpose: 把这套融资担保课程学习掉，做成可执行的 Agent Skill 并沉淀到个人能力库
+provenance_manifest: /Volumes/ORICO/KnowledgePipeline/jobs/20260906-120000-quark-guarantee-course/job.yaml
+output_preference: auto
