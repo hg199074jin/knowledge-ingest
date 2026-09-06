@@ -68,12 +68,36 @@ def test_gate_resolve_confirmed_resumes():
     assert manifest.gate_history[-1]["decision"] == "confirmed"
 
 
-def test_gate_resolve_rejected_completes_with_record():
-    manifest = make_manifest(status="DISTILLING_CANGJIE")
+def test_gate_resolve_rejected_single_target_completes():
+    manifest = make_manifest(targets=("cangjie",),
+                             status="DISTILLING_CANGJIE")
     gate_enter(manifest, "cangjie", "stage0_overview")
     gate_resolve(manifest, "cangjie", "stage0_overview", "rejected")
     assert manifest.status == "COMPLETED"
     assert any(e.get("reason") == "target_rejected" for e in manifest.errors)
+
+
+def test_gate_rejected_chains_to_remaining_target():
+    """双 target 时拒绝 cangjie 不得静默吞掉 personal。"""
+    manifest = make_manifest(targets=("cangjie", "personal"),
+                             status="DISTILLING_CANGJIE")
+    gate_enter(manifest, "cangjie", "stage0_overview")
+    gate_resolve(manifest, "cangjie", "stage0_overview", "rejected")
+    assert manifest.cangjie.status == "skipped"
+    assert manifest.status == "DISTILLING_PERSONAL"
+    # 剩余 target 继续被拒后才 COMPLETED
+    gate_enter(manifest, "personal", "inventory_reviewed")
+    gate_resolve(manifest, "personal", "inventory_reviewed", "rejected")
+    assert manifest.status == "COMPLETED"
+    assert manifest.personal.status == "skipped"
+
+
+def test_target_complete_records_pipeline_state():
+    manifest = make_manifest(status="DISTILLING_CANGJIE")
+    state_file = Path("/tmp/books/x/PIPELINE_STATE.md")
+    target_complete(manifest, "cangjie", Path("/tmp/out/cangjie"),
+                    pipeline_state=state_file)
+    assert manifest.cangjie.pipeline_state == state_file
 
 
 def test_gate_resolve_wrong_gate_rejected():

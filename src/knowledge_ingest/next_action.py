@@ -136,7 +136,16 @@ def gate_resolve(
         manifest.errors.append({
             "reason": "target_rejected", "target": target, "gate": name,
         })
-        transition_to(manifest, "COMPLETED")
+        # 链式继续：只要还有 pending target 就进入它的蒸馏态，绝不静默丢弃
+        remaining = [t for t in manifest.request.targets
+                     if _target_state(manifest, t).status in
+                     {"pending", "running"}]
+        if remaining:
+            transition_to(manifest, "DISTILLING_CANGJIE"
+                          if remaining[0] == "cangjie"
+                          else "DISTILLING_PERSONAL")
+        else:
+            transition_to(manifest, "COMPLETED")
 
 
 def target_start(manifest: JobManifest, target: str) -> None:
@@ -160,10 +169,15 @@ def target_start(manifest: JobManifest, target: str) -> None:
     })
 
 
-def target_complete(manifest: JobManifest, target: str, output_path: Path) -> None:
+def target_complete(
+    manifest: JobManifest, target: str, output_path: Path,
+    pipeline_state: Path | None = None,
+) -> None:
     state = _target_state(manifest, target)
     state.status = "success"
     state.output_path = Path(output_path)
+    if pipeline_state is not None:
+        state.pipeline_state = Path(pipeline_state)
     if target == "cangjie" and "personal" in manifest.request.targets \
             and manifest.personal.status in {"pending", "running"}:
         transition_to(manifest, "DISTILLING_PERSONAL")

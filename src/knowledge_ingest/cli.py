@@ -153,6 +153,9 @@ def _build_parser() -> argparse.ArgumentParser:
     target_done.add_argument("--target", required=True,
                              choices=["cangjie", "personal"])
     target_done.add_argument("--output-path", required=True)
+    target_done.add_argument(
+        "--pipeline-state", default=None,
+        help="cangjie: path to books/<slug>/PIPELINE_STATE.md for resume")
 
     status = sub.add_parser("status", parents=[common],
                         help="human-readable job status")
@@ -495,7 +498,10 @@ def _cmd_target_complete(config: AppConfig, args) -> int:
         print(f"error: output path does not exist: {output_path}",
               file=sys.stderr)
         return 2
-    target_complete(manifest, args.target, output_path)
+    pipeline_state = (Path(args.pipeline_state).expanduser().resolve()
+                      if args.pipeline_state else None)
+    target_complete(manifest, args.target, output_path,
+                    pipeline_state=pipeline_state)
     store.save(manifest)
     print(f"{args.target} complete: {output_path}")
     print(f"status: {manifest.status}")
