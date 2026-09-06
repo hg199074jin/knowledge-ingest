@@ -88,6 +88,37 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     preprocess.add_argument("job_id")
 
+    nxt = sub.add_parser("next", help="next action for this job")
+    nxt.add_argument("job_id")
+    nxt.add_argument("--json", dest="json_output", action="store_true",
+                     default=True, help="emit JSON (default)")
+
+    gate = sub.add_parser("gate", help="human confirmation gates")
+    gate_sub = gate.add_subparsers(dest="gate_command", required=True)
+    gate_enter_cmd = gate_sub.add_parser("enter",
+                                         help="record that a gate is now open")
+    gate_enter_cmd.add_argument("job_id")
+    gate_enter_cmd.add_argument("--target", required=True,
+                                choices=["cangjie", "personal"])
+    gate_enter_cmd.add_argument("--name", required=True)
+    gate_resolve_cmd = gate_sub.add_parser(
+        "resolve", help="record a REAL user decision (never fabricate)")
+    gate_resolve_cmd.add_argument("job_id")
+    gate_resolve_cmd.add_argument("--target", required=True,
+                                  choices=["cangjie", "personal"])
+    gate_resolve_cmd.add_argument("--name", required=True)
+    gate_resolve_cmd.add_argument("--decision", required=True,
+                                  choices=["confirmed", "rejected"])
+
+    target = sub.add_parser("target", help="target skill operations")
+    target_sub = target.add_subparsers(dest="target_command", required=True)
+    target_done = target_sub.add_parser(
+        "complete", help="register a distillation target's final output")
+    target_done.add_argument("job_id")
+    target_done.add_argument("--target", required=True,
+                             choices=["cangjie", "personal"])
+    target_done.add_argument("--output-path", required=True)
+
     return parser
 
 
@@ -346,6 +377,48 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
     return 1
 
 
+def _cmd_next(config: AppConfig, args) -> int:
+    from knowledge_ingest.next_action import next_action
+
+    store = _store(config)
+    manifest = _load_job(store, args.job_id)
+    print(json.dumps(next_action(manifest), ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_gate(config: AppConfig, args) -> int:
+    from knowledge_ingest.next_action import gate_enter, gate_resolve
+
+    store = _store(config)
+    manifest = _load_job(store, args.job_id)
+    if args.gate_command == "enter":
+        gate_enter(manifest, args.target, args.name)
+        store.save(manifest)
+        print(f"WAITING_USER: {args.target}:{args.name}")
+        return 0
+    gate_resolve(manifest, args.target, args.name, args.decision)
+    store.save(manifest)
+    print(f"gate resolved ({args.decision}): status={manifest.status}")
+    return 0
+
+
+def _cmd_target_complete(config: AppConfig, args) -> int:
+    from knowledge_ingest.next_action import target_complete
+
+    store = _store(config)
+    manifest = _load_job(store, args.job_id)
+    output_path = Path(args.output_path).expanduser().resolve()
+    if not output_path.exists():
+        print(f"error: output path does not exist: {output_path}",
+              file=sys.stderr)
+        return 2
+    target_complete(manifest, args.target, output_path)
+    store.save(manifest)
+    print(f"{args.target} complete: {output_path}")
+    print(f"status: {manifest.status}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -367,6 +440,12 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_route(config, args)
         if args.command == "preprocess":
             return _cmd_preprocess(config, args)
+        if args.command == "next":
+            return _cmd_next(config, args)
+        if args.command == "gate":
+            return _cmd_gate(config, args)
+        if args.command == "target" and args.target_command == "complete":
+            return _cmd_target_complete(config, args)
     except InvalidTransition as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
