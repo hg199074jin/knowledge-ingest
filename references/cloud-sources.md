@@ -66,6 +66,11 @@ reason=baidu_scope_limited
 
 - 不把 Quark CLI 内部命令写死进 Python；CLI 由 Skill 自己安装/升级
   （`node scripts/quark-drive.cjs`）。
+- **环境标记（2026-09-06 实测）**：CLI 按环境变量识别宿主 Agent
+  （`CLAUDECODE=1` / `CODEX_ENV=1` / `AI_AGENT` 等），裸终端调用直接报
+  `code -104 无法识别当前 Agent 环境`。本机约定：**所有 quark CLI 调用统一带
+  `CLAUDECODE=1` 前缀**，授权与 Search/Browse Artifact 均落在
+  `~/.agents/skills/quarkclouddrive/claudecode/` 配置桶；换标记会读到空授权。
 - 搜索文件夹：Search dir；枚举直接子项：Browse all；
   **Search/Browse 完整结果以 Artifact 为准**，最多 5 条的预览绝不当全部候选。
 - Session/OAuth 参数由 Skill 自维护；总控 Manifest 可存非敏感的 remote fid/路径/名称，
