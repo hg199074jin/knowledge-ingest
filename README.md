@@ -75,14 +75,15 @@ exec uv run knowledge-ingest "$@"
 
 ```bash
 knowledge-ingest job create --provider local --source /path/book.pdf --target cangjie
-knowledge-ingest source register JOB --handoff source.json   # after cloud download
+knowledge-ingest source init JOB --local-path DIR [--remote-path ...]  # builds handoff
+knowledge-ingest source register JOB --handoff .../handoff/source.json
 knowledge-ingest route JOB
-knowledge-ingest preprocess JOB       # long task: run in background, poll status
-knowledge-ingest status JOB
+knowledge-ingest preprocess JOB       # long task: background; per-file progress in status
+knowledge-ingest status JOB / resume  # N/M progress; resume = next step for every job
 knowledge-ingest next JOB --json
+knowledge-ingest distill prepare JOB --target cangjie   # scaffolds distill workspace
 knowledge-ingest target start JOB --target cangjie
-knowledge-ingest gate enter JOB --target cangjie --name GATE
-knowledge-ingest gate resolve JOB --target cangjie --name GATE --decision confirmed
+knowledge-ingest gate enter|resolve JOB --target cangjie --name GATE [--decision ...]
 knowledge-ingest target complete JOB --target cangjie --output-path PATH
 knowledge-ingest report JOB
 ```
@@ -101,6 +102,21 @@ the ingestion task"*, *"where is that job at?"* — see [SKILL.md](SKILL.md).
 | `schemas/` | Source/Target handoff contract examples |
 | `docs/` | Design v1.1, implementation plan v1.1, runtime inventory, acceptance record |
 | `tests/` | Unit + integration tests (TDD throughout) |
+
+## v0.2.0 — evolved from the first production run
+
+The first end-to-end job (11 GB / 32 videos / two overnight reboots) drove five upgrades:
+
+- **Per-file progress persistence**: `status` shows real N/M during hours-long ASR;
+  every file emits a `media_transcribed` event (survives crashes).
+- **`resume` command**: one call reports the next action for every job and
+  `--exec` continues the first resumable one — reboot survival is built-in.
+- **Shipped watchdog**: `ops/ki-resume.sh` + LaunchAgent plist (generic, no hardcoded
+  job ids) — the hand-built script from the production run, productized.
+- **`job amend --add-target`**: guarded by a pidfile lock so manifest edits are
+  refused (not silently lost) while preprocess holds its in-memory copy.
+- **`source init` / `distill prepare`**: handoff JSON and distill-workspace
+  scaffolding are generated, not hand-authored.
 
 ## Docs
 

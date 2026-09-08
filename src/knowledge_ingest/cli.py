@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
+import os
 import re
 import sys
 from dataclasses import asdict
@@ -39,6 +41,54 @@ def _source_fingerprint(path: Path) -> str | None:
     if path.is_dir():
         return fingerprint_collection(path).sha256
     return fingerprint_file(path)
+
+
+LOCK_NAME = ".preprocess.lock"
+
+
+def _write_lock(lock_path: Path) -> None:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    Path(lock_path).write_text(str(os.getpid()), encoding="utf-8")
+
+
+def _release_lock(lock_path: Path) -> None:
+    try:
+        Path(lock_path).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _lock_alive(lock: Path) -> bool:
+    """锁存在且持有进程仍存活；陈旧锁（进程已死）不算活。"""
+    lock = Path(lock)
+    if not lock.is_file():
+        return False
+    try:
+        pid = int(lock.read_text(encoding="utf-8").strip() or "0")
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _locked(fn):
+    """preprocess 独占锁：运行期间禁止 amend 等修改 manifest 的操作。"""
+    @functools.wraps(fn)
+    def wrapper(config: AppConfig, args) -> int:
+        lock = _store(config).job_dir(args.job_id) / LOCK_NAME
+        _write_lock(lock)
+        try:
+            return fn(config, args)
+        finally:
+            _release_lock(lock)
+    return wrapper
 
 
 def _jobs_root(config: AppConfig) -> Path:
@@ -93,6 +143,12 @@ def _build_parser() -> argparse.ArgumentParser:
                             required=True, choices=["cangjie", "personal"])
     create_cmd.add_argument("--prompt", default="",
                             help="raw user request text for provenance")
+    amend_cmd = job_sub.add_parser(
+        "amend", parents=[common],
+        help="modify a job (refused while preprocess holds the lock)")
+    amend_cmd.add_argument("job_id")
+    amend_cmd.add_argument("--add-target", required=True,
+                           choices=["cangjie", "personal"])
 
     register = sub.add_parser("source", parents=[common], help="source operations")
     source_sub = register.add_subparsers(dest="source_command", required=True)
@@ -101,6 +157,17 @@ def _build_parser() -> argparse.ArgumentParser:
     register_cmd.add_argument("job_id")
     register_cmd.add_argument("--handoff", required=True,
                               help="path to source.json handoff file")
+    init_cmd = source_sub.add_parser(
+        "init", parents=[common],
+        help="generate handoff/source.json (from local path or template)")
+    init_cmd.add_argument("job_id")
+    init_cmd.add_argument("--remote-path", default="",
+                          help="cloud path (baidu: full apps/bdpan/... path)")
+    init_cmd.add_argument("--name", default=None, help="source display name")
+    init_cmd.add_argument("--local-path", default=None,
+                          help="downloaded local path; verified if given")
+    init_cmd.add_argument("--note", dest="note", action="append", default=[],
+                          help="source note (repeatable)")
 
     route = sub.add_parser("route", parents=[common],
                        help="classify source files (documents/media)")
@@ -166,6 +233,23 @@ def _build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser("report", parents=[common],
                         help="render reports/final.md")
     report.add_argument("job_id")
+
+    resume = sub.add_parser(
+        "resume", parents=[common],
+        help="list/continue resumable jobs (reboot-survival entry)")
+    resume.add_argument("--job", default=None, help="limit to one job")
+    resume.add_argument("--exec", dest="exec_run", action="store_true",
+                        help="run preprocess on the first resumable job")
+
+    distill = sub.add_parser("distill", parents=[common],
+                             help="distillation workspace operations")
+    distill_sub = distill.add_subparsers(dest="distill_command", required=True)
+    distill_prep = distill_sub.add_parser(
+        "prepare", parents=[common],
+        help="scaffold distill cwd + target handoff for a target")
+    distill_prep.add_argument("job_id")
+    distill_prep.add_argument("--target", required=True,
+                              choices=["cangjie", "personal"])
 
     return parser
 
@@ -301,6 +385,7 @@ def _cmd_route(config: AppConfig, args) -> int:
     return 0
 
 
+@_locked
 def _cmd_preprocess(config: AppConfig, args) -> int:
     from datetime import datetime, timezone
 
@@ -389,6 +474,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
                 timestamp=config.processing.media_timestamp,
                 glossary=None, hotwords=None)
             entry = cache.lookup(key)
+            cache_hit = entry is not None
             if entry is None:
                 try:
                     result = media_adapter.transcribe(
@@ -421,6 +507,10 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
                 metadata=entry.metadata_path,
                 cache_key=entry.cache_key,
             ))
+            # 每文件即落盘：长 ASR 期间 status 可见真实进度，中断零丢失
+            store.save(manifest)
+            _log(config, manifest, "media_transcribed",
+                 source=rel_name, cache_hit=cache_hit)
         manifest.media.status = "success"
         manifest.media.completed_at = datetime.now(timezone.utc)
 
@@ -589,6 +679,155 @@ def _cmd_target_start(config: AppConfig, args) -> int:
     return 0
 
 
+RESUMABLE_STATUSES = {"ROUTING", "TRANSCRIBING", "DOCCHUNKING", "VERIFYING"}
+
+
+def _cmd_resume(config: AppConfig, args) -> int:
+    store = _store(config)
+    job_ids = [args.job] if args.job else store.list_jobs()
+    resumable: list[tuple[str, str]] = []
+    for jid in job_ids:
+        try:
+            manifest = store.load(jid)
+        except FileNotFoundError:
+            if args.job:
+                print(f"error: job not found: {jid}", file=sys.stderr)
+                return 2
+            continue
+        if _lock_alive(store.job_dir(jid) / LOCK_NAME):
+            print(f"{jid}: running (preprocess holds lock) — skip")
+            continue
+        status = manifest.status
+        if status in RESUMABLE_STATUSES:
+            resumable.append((jid, status))
+        elif status in {"CREATED", "DISCOVERING", "DOWNLOADING"}:
+            print(f"{jid}: {status} — needs cloud skill / source register "
+                  f"(not auto-resumable)")
+        elif status == "DOWNLOADED":
+            print(f"{jid}: DOWNLOADED — run 'knowledge-ingest route {jid}'")
+        elif status == "CORPUS_READY":
+            print(f"{jid}: CORPUS_READY — run 'next --json' to invoke target")
+        elif status == "WAITING_USER":
+            gate = (manifest.cangjie.waiting_for or
+                    manifest.personal.waiting_for or "?")
+            print(f"{jid}: WAITING_USER ({gate}) — ask the user, "
+                  f"then 'gate resolve'")
+        elif status == "BLOCKED":
+            reason = (manifest.errors[-1].get("reason")
+                      if manifest.errors else "unknown")
+            print(f"{jid}: BLOCKED ({reason}) — see references/recovery.md")
+    for jid, status in resumable:
+        print(f"resumable: {jid} ({status})")
+    if not args.exec_run:
+        return 0
+    if not resumable:
+        print("nothing to resume")
+        return 0
+    jid, status = resumable[0]
+    print(f"resuming {jid} (was {status})")
+    return _cmd_preprocess(config, argparse.Namespace(job_id=jid))
+
+
+def _cmd_job_amend(config: AppConfig, args) -> int:
+    store = _store(config)
+    manifest = _load_job(store, args.job_id)
+    if _lock_alive(store.job_dir(manifest.job_id) / LOCK_NAME):
+        print("error: preprocess is running and holds the manifest "
+              "(memory copy would overwrite your change); "
+              "retry after it exits", file=sys.stderr)
+        return 2
+    if args.add_target not in manifest.request.targets:
+        manifest.request.targets.append(args.add_target)
+        store.save(manifest)
+    print(f"targets: {manifest.request.targets}")
+    return 0
+
+
+def _cmd_source_init(config: AppConfig, args) -> int:
+    store = _store(config)
+    manifest = _load_job(store, args.job_id)
+    remote_path = args.remote_path or ""
+    name = args.name or (Path(remote_path).name if remote_path
+                         else manifest.job_id)
+    handoff = {
+        "schema_version": 1,
+        "provider": manifest.request.provider,
+        "remote": {"id": None, "path": remote_path, "name": name,
+                   "size_bytes": None, "mtime": None},
+        "local_path": None,
+        "download_completed": False,
+        "source_notes": list(args.note or []),
+    }
+    if args.local_path:
+        local = Path(args.local_path).expanduser().resolve()
+        if not local.exists():
+            print(f"error: local path does not exist: {local}",
+                  file=sys.stderr)
+            return 2
+        handoff["local_path"] = str(local)
+        handoff["download_completed"] = True
+        fingerprint = _source_fingerprint(local)
+        if fingerprint:
+            handoff["source_fingerprint"] = fingerprint
+    dest = store.job_dir(manifest.job_id) / "handoff" / "source.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(handoff, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    print(f"handoff written: {dest}")
+    print(f"next: knowledge-ingest source register {manifest.job_id} "
+          f"--handoff {dest}")
+    return 0
+
+
+def _cmd_distill_prepare(config: AppConfig, args) -> int:
+    store = _store(config)
+    manifest = _load_job(store, args.job_id)
+    if manifest.status not in {"CORPUS_READY", "DISTILLING_CANGJIE",
+                               "DISTILLING_PERSONAL", "WAITING_USER"}:
+        print(f"error: distill prepare expects CORPUS_READY or later, "
+              f"got {manifest.status}", file=sys.stderr)
+        return 2
+    target = args.target
+    root = config.pipeline_root / "distill" / manifest.job_id / target
+    (root / "books" if target == "cangjie" else root).mkdir(
+        parents=True, exist_ok=True)
+    state = root / "PIPELINE_STATE.md"
+    if not state.exists():
+        state.write_text(
+            f"# PIPELINE_STATE — {manifest.job_id} / {target}\n\n"
+            f"- job: {manifest.job_id}\n"
+            f"- corpus: {manifest.docchunk.corpus_path}\n"
+            f"- created: distill prepare (knowledge-ingest v0.2.0)\n",
+            encoding="utf-8")
+    handoff_path = (store.job_dir(manifest.job_id) / "handoff"
+                    / f"target-{target}.yaml")
+    if not handoff_path.exists():
+        title = ((manifest.source.get("remote") or {}).get("name")
+                 or Path(manifest.request.source).name)
+        lines = [
+            f"job_id: {manifest.job_id}",
+            f"target: {target}",
+            f"corpus_path: {manifest.docchunk.corpus_path}",
+            "source:",
+            f"  provider: {manifest.request.provider}",
+            f"  title: {title}",
+            "  author_or_speaker: null",
+            "  publication_date: null",
+            f"purpose: {manifest.request.raw_prompt}",
+            f"provenance_manifest: "
+            f"{store.job_dir(manifest.job_id) / 'job.yaml'}",
+        ]
+        if target == "cangjie":
+            lines.insert(2, "first_pilot: false")
+        if target == "personal":
+            lines.append("depth: null")
+            lines.append("obsidian_vault: /Volumes/ORICO/Obsidian/Skill_Library")
+        handoff_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"distill workspace: {root}")
+    print(f"target handoff: {handoff_path}")
+    return 0
+
+
 def _cmd_status(config: AppConfig, args) -> int:
     from knowledge_ingest.report import build_status
 
@@ -650,6 +889,14 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_status(config, args)
         if args.command == "report":
             return _cmd_report(config, args)
+        if args.command == "resume":
+            return _cmd_resume(config, args)
+        if args.command == "job" and args.job_command == "amend":
+            return _cmd_job_amend(config, args)
+        if args.command == "source" and args.source_command == "init":
+            return _cmd_source_init(config, args)
+        if args.command == "distill" and args.distill_command == "prepare":
+            return _cmd_distill_prepare(config, args)
     except (InvalidTransition, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
