@@ -31,22 +31,22 @@ Python CLI（`knowledge-ingest`）负责状态、指纹、路由、调用 media-
 
 ```text
 1.  doctor                       # 环境检查：knowledge-ingest doctor [--config]
-2.  查找可恢复 Job               # 扫描 /Volumes/ORICO/KnowledgePipeline/jobs/*/job.yaml
-3.  create / resume              # 无 Job → job create；有未完成 Job → next --json 恢复
-4.  source acquire / register    # 云盘 Skill 下载 → 生成 source.json → source register
+2.  resume                       # knowledge-ingest resume：列出全部 Job 的下一步
+3.  create / next                # 无 Job → job create；未完成 Job → next --json 恢复
+4.  source acquire / init+register   # 云盘 Skill 下载 → source init 生成 handoff → register
 5.  route                        # 文件类型分流（documents/media/unsupported）
-6.  preprocess                   # 媒体转写 → Document Set → docchunk split → verify
-7.  确认 docchunk verify PASS    # 硬门；FAIL 一律 BLOCKED，禁止蒸馏
-8.  next JOB --json              # 获取下一步动作
+6.  preprocess（后台）           # 媒体转写 → Document Set → docchunk split → verify
+7.  🔴 STOP：确认 docchunk verify PASS  # 硬门；FAIL 一律 BLOCKED，禁止蒸馏
+8.  distill prepare + target start    # 脚手架 distill 工作区 → CORPUS_READY → DISTILLING_*
 9.  invoke target skill          # 按 references/handoff-contracts.md 传 target handoff
-10. gate enter / 用户确认 / gate resolve   # 确认门映射见 references/target-gates.md
-11. target complete
+10. 🔴 CHECKPOINT：gate enter / 真实用户确认 / gate resolve   # 确认门映射见 references/target-gates.md
+11. target complete [--pipeline-state PATH]
 12. next                         # 双 target 时先 Cangjie 后 Personal
 13. final report                 # knowledge-ingest report JOB → reports/final.md
 ```
 
-每次会话开始时：先 `doctor`，再扫描未完成 Job；有则按 `references/recovery.md` 恢复，
-绝不重跑已完成阶段。
+每次会话开始时：先 `doctor`，再 `resume`（一条命令给出全部 Job 的下一步）；
+有未完成 Job 按 `references/recovery.md` 恢复，绝不重跑已完成阶段。
 
 ## 绝对禁止行为
 
@@ -68,9 +68,13 @@ Python CLI（`knowledge-ingest`）负责状态、指纹、路由、调用 media-
 ```bash
 knowledge-ingest doctor --config ./config.yaml [--json]
 knowledge-ingest job create --provider local|baidu|quark --source "..." --target cangjie [--target personal] --prompt "..."
+knowledge-ingest resume [--job JOB] [--exec]   # 全部 Job 的下一步；--exec 自动续跑第一个
+knowledge-ingest source init JOB --provider来源自动 [--remote-path ...] [--local-path DIR] [--note ...]
 knowledge-ingest source register JOB --handoff source.json
+knowledge-ingest job amend JOB --add-target cangjie|personal   # preprocess 运行中会被锁拒绝
 knowledge-ingest route JOB [--exclude PATH ...]
-knowledge-ingest preprocess JOB          # 长任务：放后台跑，轮询 status
+knowledge-ingest preprocess JOB          # 长任务：放后台跑，轮询 status（每文件实时落盘）
+knowledge-ingest distill prepare JOB --target cangjie|personal  # 脚手架 distill 工作区 + handoff
 knowledge-ingest status JOB [--json]
 knowledge-ingest next JOB --json
 knowledge-ingest target start JOB --target cangjie   # CORPUS_READY -> DISTILLING_*
@@ -86,6 +90,22 @@ knowledge-ingest report JOB
 - `docchunk split` 处理 PDF 时走 MinerU，可达 10–20+ 分钟：
   **`preprocess` 必须放后台执行并轮询 `status` / `next`**，不同步阻塞会话。
 - 转写与 docchunk 产物都有缓存（内容指纹 + 工具 HEAD），重复请求不会重复算力。
+- 转写**逐文件落盘**：`status` 的 N/M 与 `logs/events.jsonl` 的 `media_transcribed`
+  事件实时反映进度（32 条视频跑了 5 小时的真实场景验证）。
+- 重启/断电后：`com.sandro.ki-resume` watchdog（模板在仓库 `ops/`）每 15 分钟自动
+  `resume --exec`；preprocess 持 pidfile 锁，绝不与运行中进程重叠。
+
+## 失败模式速查（if-then）
+
+| 症状 | 一线修复 | 仍失败兜底 |
+|---|---|---|
+| preprocess 被重启/断电杀掉 | `knowledge-ingest resume --exec`（锁保护下自动续跑） | 手动 `status` 定位阶段后重跑 preprocess；缓存保证零重复转写 |
+| 想加 distill target 但 amend 被锁拒绝 | 等 preprocess 退出再 `job amend --add-target personal` | 用 `next` 确认顺序；complete 后链式也能接上 |
+| `status` 长时间 "running 0/N" | 正常——逐文件落盘后看 events.jsonl 的 media_transcribed 计数 | 若 events 也停滞：检查 MediaTranscriber output 目录增长 |
+| source.json 手写易错 | `source init --local-path DIR --remote-path apps/bdpan/...`（校验存在+算指纹） | register 的完成门会拦下坏 handoff，按报错修字段 |
+| quark CLI 报 code -104 | 所有 quark 调用加 `CLAUDECODE=1` 前缀（配置按 Agent 身份分桶） | 见 references/cloud-sources.md |
+| distill 工作区/断点文件遗漏 | `distill prepare JOB --target X`（幂等，不覆盖已有 PIPELINE_STATE） | 手工补 books/ 目录与 handoff，契约见 handoff-contracts.md |
+| doctor FAIL | 按检查项修环境（ORICO/项目/Skill） | FAIL 未清零前禁止起 Job
 
 ## 详细参考
 
