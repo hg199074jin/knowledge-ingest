@@ -6,10 +6,13 @@ import pytest
 
 from knowledge_ingest import next_action as na
 from knowledge_ingest.models import (
-    ACTIVE_TARGET_STATUSES, JobManifest, JobRequest, TargetState,
+    ACTIVE_TARGET_STATUSES,
+    JobManifest,
+    TargetState,
 )
 from knowledge_ingest.state_machine import (
-    InvalidTransition, transition_to,
+    InvalidTransition,
+    transition_to,
 )
 
 
@@ -31,9 +34,10 @@ def make_manifest(targets, status="TARGET_RUNNING", active=None):
 
 def test_c2_budget_deny_in_corpus_ready_blocks_overall(tmp_path, monkeypatch):
     """C2: budget acquire in CORPUS_READY denied -> overall becomes BLOCKED."""
+    from knowledge_ingest import budget as budget_mod
+    from knowledge_ingest import cli
     from knowledge_ingest.config import AppConfig
     from knowledge_ingest.manifest_store import ManifestStore
-    from knowledge_ingest import cli, budget as budget_mod
 
     config = AppConfig.model_validate({
         "pipeline_root": str(tmp_path / "kp"),
