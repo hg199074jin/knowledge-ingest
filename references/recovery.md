@@ -17,9 +17,11 @@
 - `resume --exec`：锁保护下自动续跑第一个可续跑 Job（ROUTING/TRANSCRIBING/
   DOCCHUNKING/VERIFYING）；preprocess 持 `.preprocess.lock`（pid 文件），
   运行中的 Job 自动跳过，陈旧锁不阻塞。
-- 仓库 `ops/ki-resume.sh` + `ops/com.sandro.ki-resume.plist`：LaunchAgent 模板
-  （RunAtLoad + 每 15 分钟触发；等 ORICO 挂载后 resume --exec）。
-  首次生产运行（跨两次凌晨 3 点重启）已实战验证该机制。
+- `knowledge-ingest watchdog install|status|uninstall`（v0.3.0）：按当前环境
+  动态生成 ki-resume.sh + LaunchAgent plist（RunAtLoad + 每 15 分钟触发；
+  等卷挂载后 resume --exec），路径零硬编码；`watchdog status` 可随时核对；
+  doctor 含 `watchdog_installed`（WARN 级）。首次生产运行（跨两次凌晨 3 点
+  重启）已实战验证该机制。
 - 转写逐文件落盘：中断后已完成的文件零丢失，`status` 与 events.jsonl 可核对。
 
 ## 各状态的恢复语义

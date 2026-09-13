@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
+<!-- v0.3.0 起 watchdog 由 `knowledge-ingest watchdog install` 按环境动态生成；本文件仅作存档样本，勿手改部署。 -->
 <dict>
   <key>Label</key>
   <string>com.sandro.ki-resume</string>

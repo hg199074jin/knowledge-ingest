@@ -92,7 +92,7 @@ knowledge-ingest report JOB
 - 转写与 docchunk 产物都有缓存（内容指纹 + 工具 HEAD），重复请求不会重复算力。
 - 转写**逐文件落盘**：`status` 的 N/M 与 `logs/events.jsonl` 的 `media_transcribed`
   事件实时反映进度（32 条视频跑了 5 小时的真实场景验证）。
-- 重启/断电后：`com.sandro.ki-resume` watchdog（模板在仓库 `ops/`）每 15 分钟自动
+- 重启/断电后：watchdog（`knowledge-ingest watchdog install` 安装的 LaunchAgent）每 15 分钟自动
   `resume --exec`；preprocess 持 pidfile 锁，绝不与运行中进程重叠。
 
 ## 失败模式速查（if-then）

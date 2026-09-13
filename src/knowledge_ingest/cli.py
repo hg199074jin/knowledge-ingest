@@ -254,6 +254,16 @@ def _build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--exec", dest="exec_run", action="store_true",
                         help="run preprocess on the first resumable job")
 
+    wd = sub.add_parser(
+        "watchdog", parents=[common],
+        help="reboot watchdog (LaunchAgent) install/status/uninstall")
+    wd_sub = wd.add_subparsers(dest="watchdog_command", required=True)
+    for _action, _help in (
+            ("install", "generate + load the reboot watchdog (idempotent)"),
+            ("status", "report watchdog installation state"),
+            ("uninstall", "unload and remove the watchdog (logs kept)")):
+        wd_sub.add_parser(_action, parents=[common], help=_help)
+
     distill = sub.add_parser("distill", parents=[common],
                              help="distillation workspace operations")
     distill_sub = distill.add_subparsers(dest="distill_command", required=True)
@@ -983,6 +993,10 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_report(config, args)
         if args.command == "resume":
             return _cmd_resume(config, args)
+        if args.command == "watchdog":
+            from knowledge_ingest import watchdog
+
+            return getattr(watchdog, args.watchdog_command)(config)
         if args.command == "job" and args.job_command == "amend":
             return _cmd_job_amend(config, args)
         if args.command == "source" and args.source_command == "init":

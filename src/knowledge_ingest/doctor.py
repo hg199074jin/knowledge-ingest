@@ -166,7 +166,24 @@ def run_doctor(config: AppConfig) -> list[DoctorCheck]:
                 name=f"skill:{skill_name}", status=FAIL,
                 detail=f"not found in skill roots ({resolved_roots})"))
 
+    checks.append(_watchdog_check())
     return checks
+
+
+def _watchdog_check() -> DoctorCheck:
+    if sys.platform != "darwin":
+        return DoctorCheck(name="watchdog_installed", status=WARN,
+                           detail="watchdog check is darwin-only")
+    from knowledge_ingest import watchdog
+
+    plist_dst = watchdog.plist_install_path()
+    if plist_dst.exists() and watchdog.is_loaded():
+        return DoctorCheck(name="watchdog_installed", status=PASS,
+                           detail=str(plist_dst))
+    return DoctorCheck(
+        name="watchdog_installed", status=WARN,
+        detail="not installed; reboot-resume safety net inactive "
+               "(run `knowledge-ingest watchdog install`)")
 
 
 def has_fail(checks: list[DoctorCheck]) -> bool:

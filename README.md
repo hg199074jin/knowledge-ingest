@@ -111,7 +111,7 @@ The first end-to-end job (11 GB / 32 videos / two overnight reboots) drove five 
   every file emits a `media_transcribed` event (survives crashes).
 - **`resume` command**: one call reports the next action for every job and
   `--exec` continues the first resumable one — reboot survival is built-in.
-- **Shipped watchdog**: `ops/ki-resume.sh` + LaunchAgent plist (generic, no hardcoded
+- **Watchdog installer**: `knowledge-ingest watchdog install|status|uninstall` generates the reboot watchdog (ki-resume.sh + LaunchAgent plist) with dynamic paths from your environment; ops/ templates remain as archived samples
   job ids) — the hand-built script from the production run, productized.
 - **`job amend --add-target`**: guarded by a pidfile lock so manifest edits are
   refused (not silently lost) while preprocess holds its in-memory copy.
