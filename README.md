@@ -74,7 +74,8 @@ exec uv run knowledge-ingest "$@"
 ## Quick start
 
 ```bash
-knowledge-ingest job create --provider local --source /path/book.pdf --target cangjie
+knowledge-ingest job create --provider local --source /path/book.pdf \
+  --target cangjie [--with-router [family_router]]
 knowledge-ingest source init JOB --local-path DIR [--remote-path ...]  # builds handoff
 knowledge-ingest source register JOB --handoff .../handoff/source.json
 knowledge-ingest route JOB
@@ -84,8 +85,12 @@ knowledge-ingest next JOB --json
 knowledge-ingest distill prepare JOB --target cangjie   # scaffolds distill workspace
 knowledge-ingest target start JOB --target cangjie
 knowledge-ingest gate enter|resolve JOB --target cangjie --name GATE [--decision ...]
-knowledge-ingest target complete JOB --target cangjie --output-path PATH
-knowledge-ingest report JOB
+knowledge-ingest gate preauthorize JOB --target cangjie --name GATE --value VALUE  # whitelisted gates only
+knowledge-ingest budget acquire|outcome|amend JOB --target T [...]    # two-phase external-call budget
+knowledge-ingest target checkpoint|resume JOB --target T [...]        # checkpoints / explicit BLOCKED recovery
+knowledge-ingest target complete JOB --target cangjie --output-path PATH [--pipeline-state PATH]
+knowledge-ingest watchdog install|status|uninstall                    # reboot watchdog (LaunchAgent)
+knowledge-ingest report JOB           # includes the audit section
 ```
 
 As an Agent Skill, the natural-language entry points are: *"turn this Baidu
@@ -111,12 +116,41 @@ The first end-to-end job (11 GB / 32 videos / two overnight reboots) drove five 
   every file emits a `media_transcribed` event (survives crashes).
 - **`resume` command**: one call reports the next action for every job and
   `--exec` continues the first resumable one — reboot survival is built-in.
-- **Shipped watchdog**: `ops/ki-resume.sh` + LaunchAgent plist (generic, no hardcoded
-  job ids) — the hand-built script from the production run, productized.
+- **Watchdog installer**: `knowledge-ingest watchdog install|status|uninstall` generates the reboot watchdog (ki-resume.sh + LaunchAgent plist) with dynamic paths from your environment — the hand-built script from the production run, productized; ops/ templates remain as archived samples.
 - **`job amend --add-target`**: guarded by a pidfile lock so manifest edits are
   refused (not silently lost) while preprocess holds its in-memory copy.
 - **`source init` / `distill prepare`**: handoff JSON and distill-workspace
   scaffolding are generated, not hand-authored.
+
+## v0.3.0 — generic target runtime + budget guard
+
+- **Generic Target Runtime**: targets are data, not code paths. `cangjie`,
+  `personal`, and the new `family_router` (depends_on `[cangjie]`) register in
+  one registry; the dependency graph, serial scheduling, per-target
+  checkpoints, and transactional output manifests are uniform.
+- **Budget Guard** (protocol-level, cooperative): two-phase
+  `budget acquire` / `budget outcome` with idempotent permits, per-target
+  quotas, per-host breakers, and per-case retry caps. KI does not intercept
+  arbitrary host-side external calls; a BLOCKED target is only ever lifted by
+  an explicit `target resume` — `budget amend` never auto-restores.
+- **Gate preauthorization**: whitelisted operational gates (cangjie
+  `stage5_install_location`, family_router `cost_budget_confirmed`) accept
+  day-time grants (`gate preauthorize`) that overnight runs reference with
+  `gate resolve --preauthorization` — values still come from the real user.
+  Knowledge gates stay live-only and reject grants by design.
+- **Three-bucket transcription accounting**: every media output records
+  `transcribed` / `cache_reused` / `unknown`; v1-era history stays `unknown`
+  and is never back-filled.
+- **Strict UTF-8 encoding preflight**: text files are streamed and verified
+  before preprocess; violations BLOCK with the detected encoding — KI never
+  transcodes or guesses.
+- **Watchdog installer**: `watchdog install|status|uninstall` productizes the
+  reboot watchdog with fully dynamic paths (now also documented in the
+  Chinese README).
+- **Audit report section**: `report` renders a 运行审计 section — stage
+  durations, transcription accounting, budget usage, and honest
+  "unknown / not instrumented" markers, all sourced from existing manifest
+  fields (v1-migrated manifests render safely).
 
 ## Docs
 

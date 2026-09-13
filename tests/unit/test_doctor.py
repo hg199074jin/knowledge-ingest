@@ -30,6 +30,7 @@ def config(tmp_path: Path) -> AppConfig:
         "quarkclouddrive",
         "cangjie-skill",
         "personal-capability-distiller",
+        "family-router-builder",
     ):
         (skills / name).mkdir(parents=True, exist_ok=True)
         (skills / name / "SKILL.md").write_text("x", encoding="utf-8")
@@ -112,6 +113,8 @@ def test_skill_roots_dedupe_views(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 
 def test_doctor_check_is_frozen():
+    import dataclasses
+
     check = DoctorCheck(name="x", status="PASS", detail="")
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         check.status = "FAIL"  # type: ignore[misc]

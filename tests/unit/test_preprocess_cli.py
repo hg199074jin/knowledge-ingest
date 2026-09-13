@@ -5,10 +5,8 @@ split failure, corpus reuse, stem conflict, provenance relative paths.
 """
 
 from argparse import Namespace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-
-import pytest
 
 import knowledge_ingest.adapters.docchunk as docchunk_module
 import knowledge_ingest.adapters.media as media_module
@@ -64,7 +62,7 @@ class FakeDocchunk:
             argv=("docchunk", "split"), cwd=self.project,
             log_path=Path(log_path or "/tmp/fake.log"),
             popen=None,  # type: ignore[arg-type]
-            started_at=datetime.now(timezone.utc))
+            started_at=datetime.now(UTC))
         task._fake_corpus = corpus  # type: ignore[attr-defined]
         return task
 
@@ -83,7 +81,7 @@ def fake_poll_factory(docchunk: FakeDocchunk, fail: bool):
             argv=task.argv, returncode=1 if fail else 0,
             stdout=str(corpus), stderr="",
             started_at=task.started_at,
-            ended_at=datetime.now(timezone.utc))
+            ended_at=datetime.now(UTC))
     return fake_poll
 
 

@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -8,13 +9,12 @@ from knowledge_ingest.adapters.docchunk import (
     resolve_corpus_path,
 )
 from knowledge_ingest.runner import CommandResult
-from datetime import datetime, timezone
 
 PROJECT = Path("/Volumes/ORICO/Projects/docchunk")
 
 
 def make_result(stdout: str = "", stderr: str = "") -> CommandResult:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return CommandResult(argv=("docchunk",), returncode=0, stdout=stdout,
                          stderr=stderr, started_at=now, ended_at=now)
 

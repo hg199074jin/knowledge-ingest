@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from knowledge_ingest.config import AppConfig
+from knowledge_ingest.targets import REGISTRY
 
 PASS = "PASS"
 WARN = "WARN"
@@ -18,8 +19,10 @@ FAIL = "FAIL"
 
 ORICO_ROOT = Path("/Volumes/ORICO")
 
-# 缺失即阻断的下游 Skill；云端 Skill 缺失只降级为 WARN
-CORE_SKILL_KEYS = ("cangjie", "personal_distiller")
+# 缺失即阻断的下游 Skill（从 target registry 派生）；
+# 云端 Skill 缺失只降级为 WARN
+CORE_SKILL_KEYS = tuple(
+    dict.fromkeys(rt.skill_config_key for rt in REGISTRY.values()))
 CLOUD_SKILL_KEYS = ("baidu", "quark")
 
 _RUN_TIMEOUT = 300
@@ -166,7 +169,24 @@ def run_doctor(config: AppConfig) -> list[DoctorCheck]:
                 name=f"skill:{skill_name}", status=FAIL,
                 detail=f"not found in skill roots ({resolved_roots})"))
 
+    checks.append(_watchdog_check())
     return checks
+
+
+def _watchdog_check() -> DoctorCheck:
+    if sys.platform != "darwin":
+        return DoctorCheck(name="watchdog_installed", status=WARN,
+                           detail="watchdog check is darwin-only")
+    from knowledge_ingest import watchdog
+
+    plist_dst = watchdog.plist_install_path()
+    if plist_dst.exists() and watchdog.is_loaded():
+        return DoctorCheck(name="watchdog_installed", status=PASS,
+                           detail=str(plist_dst))
+    return DoctorCheck(
+        name="watchdog_installed", status=WARN,
+        detail="not installed; reboot-resume safety net inactive "
+               "(run `knowledge-ingest watchdog install`)")
 
 
 def has_fail(checks: list[DoctorCheck]) -> bool:

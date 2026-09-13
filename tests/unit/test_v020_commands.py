@@ -8,7 +8,9 @@ Real-run friction → feature:
 - distill scaffolding manual → `distill prepare`
 """
 
+import fcntl
 import json
+import os
 from argparse import Namespace
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from knowledge_ingest.config import AppConfig
 from knowledge_ingest.manifest_store import ManifestStore
 from knowledge_ingest.models import JobRequest
 
+from .test_locks_v03 import hold_flock
 from .test_preprocess_cli import (
     FakeDocchunk,
     FakeMedia,
@@ -62,13 +65,13 @@ def test_media_transcribed_events_persisted_per_file(tmp_path, monkeypatch):
         json.loads(line)
         for line in (store.job_dir(job_id) / "logs" / "events.jsonl")
         .read_text(encoding="utf-8").splitlines() if line.strip()]
-    media_events = [e for e in events if e["event"] == "media_transcribed"]
+    media_events = [e for e in events if e["event"] == "media_output_ready"]
     assert len(media_events) == 2
 
 
 def test_manifest_persisted_mid_transcription(tmp_path, monkeypatch):
     """转写循环内每个文件完成即落盘（不等阶段结束）。"""
-    config, store, job_id = make_media_job(tmp_path, {"01.mp4": b"v"})
+    config, _store, job_id = make_media_job(tmp_path, {"01.mp4": b"v"})
     seen_during = []
 
     real_save = ManifestStore.save
@@ -109,9 +112,14 @@ def test_amend_idempotent(tmp_path):
 def test_amend_blocked_while_preprocess_running(tmp_path):
     config, store, job_id = make_doc_job(tmp_path, status="TRANSCRIBING")
     lock = store.job_dir(job_id) / ".preprocess.lock"
-    lock.write_text(str(1), encoding="utf-8")  # pid 1 永远存活
-    rc = _cmd_job_amend(config, Namespace(job_id=job_id,
-                                          add_target="personal"))
+    # v0.3：判活改为 flock 探测——测试必须真正持有锁（pid 1 内容不再决定判活）
+    fd = hold_flock(lock)
+    try:
+        rc = _cmd_job_amend(config, Namespace(job_id=job_id,
+                                              add_target="personal"))
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
     assert rc == 2
     assert "personal" not in store.load(job_id).request.targets
 
@@ -119,7 +127,7 @@ def test_amend_blocked_while_preprocess_running(tmp_path):
 def test_amend_allows_stale_lock(tmp_path):
     config, store, job_id = make_doc_job(tmp_path)
     lock = store.job_dir(job_id) / ".preprocess.lock"
-    lock.write_text("99999999", encoding="utf-8")  # 不存在的 pid = 陈旧锁
+    lock.write_text("99999999", encoding="utf-8")  # 内容已过时且无人持有 flock
     rc = _cmd_job_amend(config, Namespace(job_id=job_id,
                                           add_target="personal"))
     assert rc == 0
@@ -142,8 +150,13 @@ def test_resume_lists_resumable_and_skips_done(tmp_path, capsys):
 
 def test_resume_skips_locked_job(tmp_path, capsys):
     config, store, job_id = make_doc_job(tmp_path, status="TRANSCRIBING")
-    (store.job_dir(job_id) / ".preprocess.lock").write_text("1", encoding="utf-8")
-    rc = _cmd_resume(config, Namespace(job=None, exec_run=False))
+    # v0.3：判活改为 flock 探测——测试必须真正持有锁
+    fd = hold_flock(store.job_dir(job_id) / ".preprocess.lock")
+    try:
+        _cmd_resume(config, Namespace(job=None, exec_run=False))
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
     out = capsys.readouterr().out
     assert "running" in out  # 报告为运行中，不列入可续跑
 
@@ -234,7 +247,7 @@ def test_distill_prepare_idempotent(tmp_path):
 
 
 def test_distill_prepare_requires_corpus(tmp_path):
-    config, store, job_id = make_doc_job(tmp_path, status="TRANSCRIBING")
+    config, _store, job_id = make_doc_job(tmp_path, status="TRANSCRIBING")
     rc = _cmd_distill_prepare(config, Namespace(job_id=job_id,
                                                 target="cangjie"))
     assert rc == 2

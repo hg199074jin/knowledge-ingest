@@ -16,6 +16,7 @@ skills:
   quark: quarkclouddrive
   cangjie: cangjie-skill
   personal_distiller: personal-capability-distiller
+  family_router: family-router-builder
 
 processing:
   media_device: auto

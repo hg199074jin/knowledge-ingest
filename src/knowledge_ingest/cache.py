@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from pydantic import BaseModel
 
 from knowledge_ingest.fingerprint import fingerprint_file
-from knowledge_ingest.manifest_store import atomic_write_text
+from knowledge_ingest.manifest_store import (
+    MANIFEST_LOCK_TIMEOUT as CACHE_LOCK_TIMEOUT,
+)
+from knowledge_ingest.manifest_store import atomic_write_text, flock_ctx
 
 
 def _sha256_of_payload(payload: dict) -> str:
@@ -56,6 +59,32 @@ def build_transcript_cache_key(
     return _sha256_of_payload(payload)
 
 
+def build_media_cache_key(
+    source_sha256: str,
+    mt_head: str,
+    config_sha: str | None,
+    device: str,
+    timestamp: str,
+    glossary: str | None,
+    hotwords: str | None,
+) -> str:
+    """Transcript 缓存键的唯一入口（v0.3 A3）。
+
+    cli.py 查询侧与 adapters/media.py put 侧都必须经由本函数取键；
+    payload 与 build_transcript_cache_key 完全一致——统一不得改变现有键
+    （characterization 测试锁定），否则现有缓存会整体失效。
+    """
+    return build_transcript_cache_key(
+        source_sha256=source_sha256,
+        mt_head=mt_head,
+        config_sha=config_sha,
+        device=device,
+        timestamp=timestamp,
+        glossary=glossary,
+        hotwords=hotwords,
+    )
+
+
 def build_corpus_cache_key(
     handoff_fingerprint: str,
     docchunk_revision: str,
@@ -81,6 +110,14 @@ class TranscriptCache:
     def __init__(self, index_path: Path) -> None:
         self.index_path = Path(index_path)
 
+    @property
+    def lock_path(self) -> Path:
+        """cache-index 一致性锁（独立于 index 文件——index 走 atomic replace 会换 inode）。
+
+        EXCLUSIVE + blocking（有界等待，默认 30 秒）；禁止与 manifest 锁嵌套获取。
+        """
+        return self.index_path.with_name(self.index_path.name + ".lock")
+
     def _read(self) -> dict:
         return _load_index(self.index_path)
 
@@ -88,9 +125,12 @@ class TranscriptCache:
         _save_index(self.index_path, data)
 
     def put(self, entry: TranscriptCacheEntry) -> None:
-        data = self._read()
-        data[entry.cache_key] = entry.model_dump(mode="json")
-        self._write(data)
+        # read-modify-write 必须整体在 cache-index flock 临界区内（v0.3 A3），
+        # 并发 put 不丢条目
+        with flock_ctx(self.lock_path, timeout=CACHE_LOCK_TIMEOUT):
+            data = self._read()
+            data[entry.cache_key] = entry.model_dump(mode="json")
+            self._write(data)
 
     def lookup(self, key: str) -> TranscriptCacheEntry | None:
         raw = self._read().get(key)

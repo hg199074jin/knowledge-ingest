@@ -38,8 +38,12 @@ def build_document_set(
     document_paths: list[Path],
     media_paths: list[Path],
     transcripts: dict[str, str],
-    excluded: set[str],
 ) -> DocumentSetResult:
+    """Build the provenance-preserving handoff set.
+
+    v0.3: callers pass *effective* paths (exclusions already applied at
+    route time); no per-call excluded filtering happens here anymore.
+    """
     handoff_dir = Path(handoff_dir)
     source_root = Path(source_root).resolve()
 
@@ -51,11 +55,9 @@ def build_document_set(
 
     entries: list[dict] = []
 
-    # 完整性硬门：任何未排除的媒体缺转写即失败，不静默继续
+    # 完整性硬门：任何媒体缺转写即失败，不静默继续
     for media in sorted(media_paths, key=lambda p: _natural_key(str(p))):
         media_str = str(Path(media).resolve())
-        if media_str in excluded or str(media) in excluded:
-            continue
         transcript = transcripts.get(media_str)
         if not transcript or not Path(transcript).is_file():
             raise CollectionIncomplete(
@@ -64,9 +66,6 @@ def build_document_set(
     sources = []
     for media in sorted(media_paths, key=lambda p: _natural_key(str(p))):
         media_resolved = Path(media).resolve()
-        if media_resolved.as_posix() in {Path(e).resolve().as_posix()
-                                         for e in excluded}:
-            continue
         sources.append(("transcript", media_resolved,
                         Path(transcripts[media_resolved.as_posix()])))
     for doc in sorted(document_paths, key=lambda p: _natural_key(str(p))):

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 SECRET_FLAG = re.compile(
@@ -25,7 +26,7 @@ class CommandResult:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def safe_argv(argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -42,7 +43,7 @@ def safe_argv(argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
         if SECRET_FLAG.search(item) and not item.startswith("-"):
             continue
         if item.startswith("--") and "=" in item:
-            flag, _, value = item.partition("=")
+            flag, _, _ = item.partition("=")
             if SECRET_FLAG.search(flag):
                 kept[-1] = f"{flag}=[REDACTED]"
                 continue
@@ -127,3 +128,50 @@ def poll(task: RunningTask) -> CommandResult | None:
         started_at=task.started_at,
         ended_at=_now(),
     )
+
+
+def _file_sha256_hex(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while block := f.read(8 * 1024 * 1024):
+            h.update(block)
+    return h.hexdigest()
+
+
+def worktree_revision(project: Path, *, label: str = "git",
+                      timeout: int = 60) -> str:
+    """git 工作区修订（v0.3 冻结规格 11）：clean → 纯 HEAD；dirty → HEAD-dirty-<fp>。
+
+    worktree_fingerprint = sha256( `git diff --binary HEAD` 输出
+        + sorted( untracked_relative_path + sha256(untracked_file_bytes) ) )，
+    untracked 由 `git ls-files --others --exclude-standard` 发现。
+    clean 时返回值与 v0.2 的纯 HEAD 完全一致（缓存零失效）；
+    dirty 时键不同 → 自然 miss 重算，禁止任何 legacy fallback。
+    """
+    project = Path(project)
+    head = run_checked(["git", "rev-parse", "HEAD"], cwd=project,
+                       timeout=timeout)
+    if head.returncode != 0:
+        raise RuntimeError(f"cannot resolve {label} git HEAD")
+    head_sha = head.stdout.strip()
+    diff = run_checked(["git", "diff", "--binary", "HEAD"], cwd=project,
+                       timeout=timeout)
+    if diff.returncode != 0:
+        raise RuntimeError(f"cannot diff {label} worktree against HEAD")
+    others = run_checked(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=project, timeout=timeout)
+    if others.returncode != 0:
+        raise RuntimeError(f"cannot list {label} untracked files")
+    untracked = sorted(
+        line for line in others.stdout.splitlines() if line.strip())
+    if not diff.stdout and not untracked:
+        return head_sha
+    digest = hashlib.sha256()
+    digest.update(diff.stdout.encode("utf-8"))
+    for rel in untracked:
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"+")
+        digest.update(_file_sha256_hex(project / rel).encode("utf-8"))
+        digest.update(b"\n")
+    return f"HEAD-dirty-{digest.hexdigest()}"

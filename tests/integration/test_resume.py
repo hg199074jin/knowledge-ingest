@@ -1,6 +1,6 @@
 """Resume semantics: reload from disk and continue at the exact breakpoint."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from knowledge_ingest.manifest_store import ManifestStore
@@ -11,7 +11,6 @@ from knowledge_ingest.state_machine import transition_to
 
 def test_resume_after_cangjie_waiting_user(tmp_path: Path):
     store = ManifestStore(jobs_root=tmp_path / "jobs")
-    now = datetime.now(timezone.utc)
     manifest = store.create(JobRequest(
         raw_prompt="混合课程", provider="local", source="/tmp/course",
         targets=["cangjie", "personal"]))
@@ -26,7 +25,7 @@ def test_resume_after_cangjie_waiting_user(tmp_path: Path):
 
     # 蒸馏开始后进入 Cangjie 骨架确认门
     loaded = store.load(manifest.job_id)
-    transition_through(loaded, "DISTILLING_CANGJIE")
+    transition_through(loaded, "TARGET_RUNNING")
     gate_enter(loaded, "cangjie", "stage0_overview")
     store.save(loaded)
 
@@ -57,6 +56,6 @@ def test_resume_mid_preprocess_keeps_completed_stages(tmp_path: Path):
 
 
 def transition_through(manifest: JobManifest, status: str) -> None:
-    """仅当跃迁合法时使用状态机；此处 CORPUS_READY→DISTILLING_CANGJIE 合法。"""
-    manifest.updated_at = datetime.now(timezone.utc)
+    """仅当跃迁合法时使用状态机；此处 CORPUS_READY→TARGET_RUNNING 合法。"""
+    manifest.updated_at = datetime.now(UTC)
     transition_to(manifest, status)
