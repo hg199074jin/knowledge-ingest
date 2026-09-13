@@ -101,7 +101,8 @@ knowledge-ingest report JOB
 |---|---|---|
 | preprocess 被重启/断电杀掉 | `knowledge-ingest resume --exec`（锁保护下自动续跑） | 手动 `status` 定位阶段后重跑 preprocess；缓存保证零重复转写 |
 | 想加 distill target 但 amend 被锁拒绝 | 等 preprocess 退出再 `job amend --add-target personal` | 用 `next` 确认顺序；complete 后链式也能接上 |
-| `status` 长时间 "running 0/N" | 正常——逐文件落盘后看 events.jsonl 的 media_transcribed 计数 | 若 events 也停滞：检查 MediaTranscriber output 目录增长 |
+| `status` 长时间 "running 0/N" | 正常——逐文件落盘后看 events.jsonl 的 media_output_ready 计数（按 run_id/outcome 统计） | 若 events 也停滞：检查 MediaTranscriber output 目录增长 |
+| `BLOCKED: text_encoding_unsupported` | 文档非 UTF-8（detected_encoding 见 errors）：转码或 `route --exclude` 后重新 route | KI 不转码不猜编码（规格 14） |
 | source.json 手写易错 | `source init --local-path DIR --remote-path apps/bdpan/...`（校验存在+算指纹） | register 的完成门会拦下坏 handoff，按报错修字段 |
 | quark CLI 报 code -104 | 所有 quark 调用加 `CLAUDECODE=1` 前缀（配置按 Agent 身份分桶） | 见 references/cloud-sources.md |
 | distill 工作区/断点文件遗漏 | `distill prepare JOB --target X`（幂等，不覆盖已有 PIPELINE_STATE） | 手工补 books/ 目录与 handoff，契约见 handoff-contracts.md |

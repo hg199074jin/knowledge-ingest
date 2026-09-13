@@ -16,6 +16,7 @@ from pathlib import Path
 
 from knowledge_ingest.config import AppConfig
 from knowledge_ingest.doctor import has_fail, run_doctor
+from knowledge_ingest.encoding import TEXT_SUFFIXES, preflight_utf8
 from knowledge_ingest.manifest_store import LockHeld, ManifestStore, flock_ctx
 from knowledge_ingest.models import JobRequest
 from knowledge_ingest.router import effective_paths, route_source
@@ -125,8 +126,10 @@ def _advance(manifest, statuses: list[str]) -> None:
         transition_to(manifest, status)
 
 
-def _block(manifest, reason: str) -> None:
-    manifest.errors.append({"reason": reason})
+def _block(manifest, reason: str, **fields) -> None:
+    entry = {"reason": reason}
+    entry.update(fields)
+    manifest.errors.append(entry)
     transition_to(manifest, "BLOCKED")
 
 
@@ -419,6 +422,25 @@ def _cmd_route(config: AppConfig, args) -> int:
                 print(f"unsupported (exclude explicitly to continue): {p}")
             print("BLOCKED: unsupported_source")
             return 1
+        # v0.3 冻结规格 14：流式全文件严格 UTF-8 预检（.txt/.md/.markdown）
+        for doc in result.documents:
+            if doc.suffix.lower() not in TEXT_SUFFIXES:
+                continue
+            detected = preflight_utf8(doc)
+            if detected is not None:
+                _block(manifest, "text_encoding_unsupported",
+                       path=str(doc), detected_encoding=detected,
+                       remediation="convert the file to UTF-8, "
+                                   "then re-run route")
+                store.save(manifest)
+                _log(config, manifest, "blocked",
+                     reason="text_encoding_unsupported", path=str(doc),
+                     detected_encoding=detected)
+                print(f"BLOCKED: text_encoding_unsupported ({doc}, "
+                      f"detected_encoding={detected})")
+                print("remediation: convert the file to UTF-8, "
+                      "then re-run route")
+                return 1
         _log(config, manifest, "routed",
              effective_documents=len(result.documents),
              effective_media=len(result.media),

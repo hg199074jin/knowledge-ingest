@@ -46,6 +46,8 @@
 | reason | 恢复方式 |
 |---|---|
 | `unsupported_inputs` | 与用户确认排除清单 → `route JOB --exclude PATH ...` 重新路由；状态机允许 BLOCKED→ROUTING |
+| `unsupported_source` | 同上（v0.3 改名）：与用户确认排除清单 → `route JOB --exclude PATH ...` 重新路由 |
+| `text_encoding_unsupported` | errors 里带 path/detected_encoding/remediation；把该文件转为 UTF-8（或 `route --exclude` 排除）后重新 route；KI 不做转码（规格 14/16） |
 | `media_failed` | 修复来源/重试该媒体；用户明确排除该文件后 `route --exclude` 重跑 |
 | `corpus_verify_failed` | 排查 docchunk 输出（`docchunk doctor` / `docchunk status`）；必要时删除坏 corpus 后重跑 preprocess |
 | `docchunk_split_failed` | 查看 job logs/docchunk-split.log 与 `docchunk doctor`；修复后重跑 preprocess（状态机允许 DOCCHUNKING→BLOCKED→DOCCHUNKING） |
