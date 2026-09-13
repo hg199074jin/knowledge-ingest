@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -186,3 +187,6 @@ class EventLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # v0.3 A2：崩溃/SIGKILL 后事件不丢（append + flush + fsync）
+            f.flush()
+            os.fsync(f.fileno())

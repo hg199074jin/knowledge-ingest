@@ -40,6 +40,9 @@ class MediaOutput(BaseModel):
     transcript_sha256: str
     metadata: Path
     cache_key: str | None = None
+    # v0.3 规格：transcribed | cache_reused | unknown
+    # （V1 历史 manifest 读入即 unknown，禁反推）
+    outcome: str = "unknown"
 
 
 class MediaState(StageState):

@@ -8,6 +8,8 @@ import json
 import os
 import re
 import sys
+import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 
@@ -314,6 +316,7 @@ def _cmd_source_register(config: AppConfig, args) -> int:
     if validation_error:
         _block(manifest, validation_error)
         store.save(manifest)
+        _log(config, manifest, "blocked", reason=validation_error)
         print(f"BLOCKED: {validation_error}")
         return 1
 
@@ -333,6 +336,7 @@ def _cmd_source_register(config: AppConfig, args) -> int:
             manifest.source["scope_violation"] = True
             _block(manifest, "baidu_scope_limited")
             store.save(manifest)
+            _log(config, manifest, "blocked", reason="baidu_scope_limited")
             print(f"BLOCKED: baidu_scope_limited ({remote_path or '<empty>'})")
             return 1
 
@@ -378,11 +382,26 @@ def _cmd_route(config: AppConfig, args) -> int:
             str(p) for p in result.unsupported]
         _block(manifest, "unsupported_source")
         store.save(manifest)
+        _log(config, manifest, "routed",
+             effective_documents=len(result.documents),
+             effective_media=len(result.media),
+             effective_unsupported=len(result.unsupported),
+             excluded_documents=len(result.excluded_documents),
+             excluded_media=len(result.excluded_media),
+             excluded_unsupported=len(result.excluded_unsupported),
+             blocked_reason="unsupported_source")
         for p in result.unsupported:
             print(f"unsupported (exclude explicitly to continue): {p}")
         print("BLOCKED: unsupported_source")
         return 1
     store.save(manifest)
+    _log(config, manifest, "routed",
+         effective_documents=len(result.documents),
+         effective_media=len(result.media),
+         effective_unsupported=len(result.unsupported),
+         excluded_documents=len(result.excluded_documents),
+         excluded_media=len(result.excluded_media),
+         excluded_unsupported=len(result.excluded_unsupported))
     print(
         f"routed: discovered documents={len(result.discovered_documents)} "
         f"media={len(result.discovered_media)} "
@@ -429,204 +448,248 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
               file=sys.stderr)
         return 2
 
-    routing = manifest.routing
-    document_paths = effective_paths(routing, "documents")
-    media_paths = effective_paths(routing, "media")
-    if not document_paths and not media_paths:
-        print("error: nothing to preprocess (all inputs excluded?)",
-              file=sys.stderr)
-        return 2
+    # v0.3 A2：run_id 贯穿本次 preprocess 的事件闭环
+    # （started/finished 同 run_id；media_* 事件同 run_id；失败点先写 state 再 return）
+    run_id = uuid.uuid4().hex
+    state = {"outcome": "completed", "reason": ""}
+    _log(config, manifest, "preprocess_started", run_id=run_id)
+    try:
+        routing = manifest.routing
+        document_paths = effective_paths(routing, "documents")
+        media_paths = effective_paths(routing, "media")
+        if not document_paths and not media_paths:
+            state["outcome"] = "failed"
+            state["reason"] = "nothing_to_preprocess"
+            print("error: nothing to preprocess (all inputs excluded?)",
+                  file=sys.stderr)
+            return 2
 
-    job_dir = store.job_dir(manifest.job_id)
-    handoff_dir = job_dir / "handoff" / "document-set"
-    source_root = Path(manifest.source.get("local_path") or
-                       manifest.request.source)
+        job_dir = store.job_dir(manifest.job_id)
+        handoff_dir = job_dir / "handoff" / "document-set"
+        source_root = Path(manifest.source.get("local_path") or
+                           manifest.request.source)
 
-    transcripts: dict[str, str] = {}
-    if media_paths:
-        seen_stems: dict[str, Path] = {}
-        for media in media_paths:
-            stem = media.stem.lower()
-            if stem in seen_stems:
-                # media-transcriber 产物按 stem 落盘，同名 stem 会互相覆盖/混淆
-                _block(manifest, "media_stem_conflict")
-                store.save(manifest)
-                _log(config, manifest, "blocked", reason="media_stem_conflict",
-                     first=str(seen_stems[stem]), second=str(media))
-                print(f"BLOCKED: media_stem_conflict "
-                      f"({seen_stems[stem]} vs {media})")
-                return 1
-            seen_stems[stem] = media
-        if manifest.status == "ROUTING":
-            tsm(manifest, "TRANSCRIBING")
-        manifest.media.status = "running"
-        manifest.media.started_at = manifest.media.started_at or \
-            datetime.now(timezone.utc)
-        manifest.media.outputs = []   # 重入时重建（缓存让重建零成本）
-        store.save(manifest)
-
-        media_adapter = MediaAdapter(
-            project=config.media_project, output_root=config.media_output_root)
-        cache = TranscriptCache(
-            config.pipeline_root / "cache" / "transcript-index.json")
-        mt_head = media_adapter.head()
-
-        for media in media_paths:
-            media_resolved = media.resolve()
-            source_sha = fingerprint_file(media_resolved)
-            key = build_transcript_cache_key(
-                source_sha256=source_sha, mt_head=mt_head, config_sha=None,
-                device=config.processing.media_device,
-                timestamp=config.processing.media_timestamp,
-                glossary=None, hotwords=None)
-            entry = cache.lookup(key)
-            cache_hit = entry is not None
-            if entry is None:
-                try:
-                    result = media_adapter.transcribe(
-                        media_resolved,
-                        device=config.processing.media_device,
-                        timestamp=config.processing.media_timestamp)
-                except (RuntimeError, OSError) as exc:
-                    manifest.media.status = "failed"
-                    manifest.media.error = f"{media}: {exc}"
-                    _block(manifest, "media_failed")
+        transcripts: dict[str, str] = {}
+        if media_paths:
+            seen_stems: dict[str, Path] = {}
+            for media in media_paths:
+                stem = media.stem.lower()
+                if stem in seen_stems:
+                    # media-transcriber 产物按 stem 落盘，同名 stem 会互相覆盖/混淆
+                    state["outcome"] = "failed"
+                    state["reason"] = "media_stem_conflict"
+                    _block(manifest, "media_stem_conflict")
                     store.save(manifest)
-                    print(f"BLOCKED: media_failed ({media})")
+                    _log(config, manifest, "blocked",
+                         reason="media_stem_conflict",
+                         first=str(seen_stems[stem]), second=str(media))
+                    print(f"BLOCKED: media_stem_conflict "
+                          f"({seen_stems[stem]} vs {media})")
                     return 1
-                entry = TranscriptCacheEntry(
-                    cache_key=result.cache_key, source_path=media_resolved,
-                    markdown_path=result.markdown_path,
-                    metadata_path=result.metadata_path,
-                    transcript_sha256=result.transcript_sha256)
-                cache.put(entry)
-            transcripts[media_resolved.as_posix()] = str(entry.markdown_path)
-            try:
-                rel_name = media_resolved.relative_to(source_root).as_posix()
-            except (ValueError, OSError):
-                rel_name = media.name
-            manifest.media.outputs.append(MediaOutput(
-                source_relative_path=rel_name,
-                source_sha256=source_sha,
-                transcript=entry.markdown_path,
-                transcript_sha256=entry.transcript_sha256,
-                metadata=entry.metadata_path,
-                cache_key=entry.cache_key,
-            ))
-            # 每文件即落盘：长 ASR 期间 status 可见真实进度，中断零丢失
+                seen_stems[stem] = media
+            if manifest.status == "ROUTING":
+                tsm(manifest, "TRANSCRIBING")
+            manifest.media.status = "running"
+            manifest.media.started_at = manifest.media.started_at or \
+                datetime.now(timezone.utc)
+            manifest.media.outputs = []   # 重入时重建（缓存让重建零成本）
             store.save(manifest)
-            _log(config, manifest, "media_transcribed",
-                 source=rel_name, cache_hit=cache_hit)
-        manifest.media.status = "success"
-        manifest.media.completed_at = datetime.now(timezone.utc)
 
-    if manifest.status in {"ROUTING", "TRANSCRIBING"}:
-        tsm(manifest, "DOCCHUNKING")
-    manifest.docchunk.status = "running"
-    store.save(manifest)
+            media_adapter = MediaAdapter(
+                project=config.media_project,
+                output_root=config.media_output_root)
+            cache = TranscriptCache(
+                config.pipeline_root / "cache" / "transcript-index.json")
+            mt_head = media_adapter.head()
 
-    clear_handoff(handoff_dir)
-    try:
-        built = build_document_set(
-            handoff_dir=handoff_dir, source_root=source_root,
-            document_paths=document_paths, media_paths=media_paths,
-            transcripts=transcripts)
-    except CollectionIncomplete as exc:
-        _block(manifest, "collection_incomplete")
+            for media in media_paths:
+                media_resolved = media.resolve()
+                source_sha = fingerprint_file(media_resolved)
+                try:
+                    rel_name = media_resolved.relative_to(
+                        source_root).as_posix()
+                except (ValueError, OSError):
+                    rel_name = media.name
+                key = build_transcript_cache_key(
+                    source_sha256=source_sha, mt_head=mt_head, config_sha=None,
+                    device=config.processing.media_device,
+                    timestamp=config.processing.media_timestamp,
+                    glossary=None, hotwords=None)
+                entry = cache.lookup(key)
+                cache_hit = entry is not None
+                duration_ms = 0
+                if entry is None:
+                    perf_t0 = time.perf_counter()
+                    try:
+                        result = media_adapter.transcribe(
+                            media_resolved,
+                            device=config.processing.media_device,
+                            timestamp=config.processing.media_timestamp)
+                    except (RuntimeError, OSError) as exc:
+                        state["outcome"] = "failed"
+                        state["reason"] = "media_failed"
+                        manifest.media.status = "failed"
+                        manifest.media.error = f"{media}: {exc}"
+                        _log(config, manifest, "media_failed",
+                             run_id=run_id, source=rel_name,
+                             error=str(exc), attempt=1)
+                        _block(manifest, "media_failed")
+                        store.save(manifest)
+                        print(f"BLOCKED: media_failed ({media})")
+                        return 1
+                    duration_ms = int((time.perf_counter() - perf_t0) * 1000)
+                    entry = TranscriptCacheEntry(
+                        cache_key=result.cache_key, source_path=media_resolved,
+                        markdown_path=result.markdown_path,
+                        metadata_path=result.metadata_path,
+                        transcript_sha256=result.transcript_sha256)
+                    cache.put(entry)
+                transcripts[media_resolved.as_posix()] = \
+                    str(entry.markdown_path)
+                manifest.media.outputs.append(MediaOutput(
+                    source_relative_path=rel_name,
+                    source_sha256=source_sha,
+                    transcript=entry.markdown_path,
+                    transcript_sha256=entry.transcript_sha256,
+                    metadata=entry.metadata_path,
+                    cache_key=entry.cache_key,
+                    outcome="cache_reused" if cache_hit else "transcribed",
+                ))
+                # 每文件即落盘：长 ASR 期间 status 可见真实进度，中断零丢失
+                store.save(manifest)
+                _log(config, manifest, "media_output_ready",
+                     run_id=run_id,
+                     outcome="cache_reused" if cache_hit else "transcribed",
+                     source=rel_name, source_sha256=source_sha,
+                     cache_key=entry.cache_key, duration_ms=duration_ms,
+                     attempt=1)
+            manifest.media.status = "success"
+            manifest.media.completed_at = datetime.now(timezone.utc)
+
+        if manifest.status in {"ROUTING", "TRANSCRIBING"}:
+            tsm(manifest, "DOCCHUNKING")
+        manifest.docchunk.status = "running"
         store.save(manifest)
-        _log(config, manifest, "blocked", reason="collection_incomplete",
-             detail=str(exc)[-300:])
-        print(f"BLOCKED: collection_incomplete ({exc})")
+
+        clear_handoff(handoff_dir)
+        try:
+            built = build_document_set(
+                handoff_dir=handoff_dir, source_root=source_root,
+                document_paths=document_paths, media_paths=media_paths,
+                transcripts=transcripts)
+        except CollectionIncomplete as exc:
+            state["outcome"] = "failed"
+            state["reason"] = "collection_incomplete"
+            _block(manifest, "collection_incomplete")
+            store.save(manifest)
+            _log(config, manifest, "blocked", reason="collection_incomplete",
+                 detail=str(exc)[-300:])
+            print(f"BLOCKED: collection_incomplete ({exc})")
+            return 1
+        except OSError as exc:
+            state["outcome"] = "failed"
+            state["reason"] = "collection_build_failed"
+            _block(manifest, "collection_build_failed")
+            store.save(manifest)
+            _log(config, manifest, "blocked", reason="collection_build_failed",
+                 detail=str(exc)[-300:])
+            print(f"BLOCKED: collection_build_failed ({exc})")
+            return 1
+        manifest.routing["document_set_map"] = str(built.map_path)
+        store.save(manifest)
+
+        docchunk_adapter = DocchunkAdapter(project=config.docchunk_project)
+        from knowledge_ingest.adapters.docchunk import resolve_corpus_path
+        from knowledge_ingest.cache import CorpusCache, build_corpus_cache_key
+        from knowledge_ingest.fingerprint import fingerprint_collection
+        from knowledge_ingest.runner import poll as poll_task
+
+        try:
+            handoff_fp = fingerprint_collection(handoff_dir)
+            # 说明：此分量是本次调用的配置文件指纹（默认 no-config）；
+            # docchunk 自身配置由 docchunk_revision（可编辑安装的 git HEAD）覆盖
+            config_fp = (fingerprint_file(Path(args.config).expanduser())
+                         if getattr(args, "config", None) else "no-config")
+            corpus_cache = CorpusCache(
+                config.pipeline_root / "cache" / "corpus-index.json")
+            corpus_key = build_corpus_cache_key(
+                handoff_fingerprint=handoff_fp.sha256,
+                docchunk_revision=docchunk_adapter.head(),
+                config_fingerprint=config_fp)
+            manifest.docchunk.cache_key = corpus_key
+
+            reused_corpus = corpus_cache.lookup(corpus_key,
+                                                docchunk_adapter.verify)
+            if reused_corpus is not None:
+                corpus = reused_corpus
+                manifest.docchunk.reused = True
+                _log(config, manifest, "corpus_reused", corpus=str(corpus))
+                print(f"corpus reused (verified): {corpus}")
+            else:
+                manifest.docchunk.reused = False
+                _log(config, manifest, "docchunk_split_started")
+                task = docchunk_adapter.split_task(
+                    handoff_dir, log_path=job_dir / "logs"
+                    / "docchunk-split.log")
+                started = time.monotonic()
+                poll_round = 0
+                while True:
+                    finished = poll_task(task)
+                    if finished is not None:
+                        break
+                    poll_round += 1
+                    if poll_round % 6 == 0:  # 每 30 秒记录一次进度事件
+                        _log(config, manifest, "docchunk_progress",
+                             elapsed_seconds=round(
+                                 time.monotonic() - started))
+                    time.sleep(5)
+                if finished.returncode != 0:
+                    raise RuntimeError(
+                        f"docchunk split exited {finished.returncode}: "
+                        f"{finished.stdout.strip()[-300:]}")
+                corpus = resolve_corpus_path(finished)
+                corpus_cache.put(corpus_key, corpus)
+        except (RuntimeError, OSError) as exc:
+            state["outcome"] = "failed"
+            state["reason"] = "docchunk_split_failed"
+            _block(manifest, "docchunk_split_failed")
+            store.save(manifest)
+            _log(config, manifest, "blocked", reason="docchunk_split_failed",
+                 detail=str(exc)[-300:])
+            print(f"BLOCKED: docchunk_split_failed ({exc})")
+            return 1
+
+        if manifest.status != "VERIFYING":
+            tsm(manifest, "VERIFYING")
+        store.save(manifest)
+        verified = docchunk_adapter.verify(corpus)
+
+        manifest.docchunk.corpus_path = corpus
+        manifest.docchunk.verify = "PASS" if verified else "FAIL"
+        manifest.docchunk.status = "verified" if verified else "failed"
+        if verified:
+            tsm(manifest, "CORPUS_READY")
+            store.save(manifest)
+            _log(config, manifest, "corpus_verified", corpus=str(corpus),
+                 reused=bool(manifest.docchunk.reused))
+            print(f"corpus verified: {corpus}")
+            print(f"status: {manifest.status}")
+            return 0
+        state["outcome"] = "failed"
+        state["reason"] = "corpus_verify_failed"
+        _log(config, manifest, "blocked", reason="corpus_verify_failed")
+        _block(manifest, "corpus_verify_failed")
+        store.save(manifest)
+        print("BLOCKED: corpus_verify_failed")
         return 1
-    except OSError as exc:
-        _block(manifest, "collection_build_failed")
-        store.save(manifest)
-        _log(config, manifest, "blocked", reason="collection_build_failed",
-             detail=str(exc)[-300:])
-        print(f"BLOCKED: collection_build_failed ({exc})")
-        return 1
-    manifest.routing["document_set_map"] = str(built.map_path)
-    store.save(manifest)
-
-    docchunk_adapter = DocchunkAdapter(project=config.docchunk_project)
-    from knowledge_ingest.adapters.docchunk import resolve_corpus_path
-    from knowledge_ingest.cache import CorpusCache, build_corpus_cache_key
-    from knowledge_ingest.fingerprint import fingerprint_collection
-    from knowledge_ingest.runner import poll as poll_task
-
-    import time as _time
-
-    try:
-        handoff_fp = fingerprint_collection(handoff_dir)
-        # 说明：此分量是本次调用的配置文件指纹（默认 no-config）；
-        # docchunk 自身配置由 docchunk_revision（可编辑安装的 git HEAD）覆盖
-        config_fp = (fingerprint_file(Path(args.config).expanduser())
-                     if getattr(args, "config", None) else "no-config")
-        corpus_cache = CorpusCache(
-            config.pipeline_root / "cache" / "corpus-index.json")
-        corpus_key = build_corpus_cache_key(
-            handoff_fingerprint=handoff_fp.sha256,
-            docchunk_revision=docchunk_adapter.head(),
-            config_fingerprint=config_fp)
-        manifest.docchunk.cache_key = corpus_key
-
-        reused_corpus = corpus_cache.lookup(corpus_key, docchunk_adapter.verify)
-        if reused_corpus is not None:
-            corpus = reused_corpus
-            manifest.docchunk.reused = True
-            _log(config, manifest, "corpus_reused", corpus=str(corpus))
-            print(f"corpus reused (verified): {corpus}")
-        else:
-            manifest.docchunk.reused = False
-            _log(config, manifest, "docchunk_split_started")
-            task = docchunk_adapter.split_task(
-                handoff_dir, log_path=job_dir / "logs" / "docchunk-split.log")
-            started = _time.monotonic()
-            poll_round = 0
-            while True:
-                finished = poll_task(task)
-                if finished is not None:
-                    break
-                poll_round += 1
-                if poll_round % 6 == 0:  # 每 30 秒记录一次进度事件
-                    _log(config, manifest, "docchunk_progress",
-                         elapsed_seconds=round(_time.monotonic() - started))
-                _time.sleep(5)
-            if finished.returncode != 0:
-                raise RuntimeError(
-                    f"docchunk split exited {finished.returncode}: "
-                    f"{finished.stdout.strip()[-300:]}")
-            corpus = resolve_corpus_path(finished)
-            corpus_cache.put(corpus_key, corpus)
-    except (RuntimeError, OSError) as exc:
-        _block(manifest, "docchunk_split_failed")
-        store.save(manifest)
-        _log(config, manifest, "blocked", reason="docchunk_split_failed",
-             detail=str(exc)[-300:])
-        print(f"BLOCKED: docchunk_split_failed ({exc})")
-        return 1
-
-    if manifest.status != "VERIFYING":
-        tsm(manifest, "VERIFYING")
-    store.save(manifest)
-    verified = docchunk_adapter.verify(corpus)
-
-    manifest.docchunk.corpus_path = corpus
-    manifest.docchunk.verify = "PASS" if verified else "FAIL"
-    manifest.docchunk.status = "verified" if verified else "failed"
-    if verified:
-        tsm(manifest, "CORPUS_READY")
-        store.save(manifest)
-        _log(config, manifest, "corpus_verified", corpus=str(corpus),
-             reused=bool(manifest.docchunk.reused))
-        print(f"corpus verified: {corpus}")
-        print(f"status: {manifest.status}")
-        return 0
-    _log(config, manifest, "blocked", reason="corpus_verify_failed")
-    _block(manifest, "corpus_verify_failed")
-    store.save(manifest)
-    print("BLOCKED: corpus_verify_failed")
-    return 1
+    except BaseException as exc:
+        # 未捕获异常 → interrupted + 异常摘要（SIGKILL 无法覆盖，不做承诺）
+        state["outcome"] = "interrupted"
+        state["reason"] = f"{type(exc).__name__}: {exc}"[:300]
+        raise
+    finally:
+        _log(config, manifest, "preprocess_finished", run_id=run_id,
+             outcome=state["outcome"], reason=state["reason"])
 
 
 def _cmd_next(config: AppConfig, args) -> int:

@@ -62,7 +62,7 @@ def test_media_transcribed_events_persisted_per_file(tmp_path, monkeypatch):
         json.loads(line)
         for line in (store.job_dir(job_id) / "logs" / "events.jsonl")
         .read_text(encoding="utf-8").splitlines() if line.strip()]
-    media_events = [e for e in events if e["event"] == "media_transcribed"]
+    media_events = [e for e in events if e["event"] == "media_output_ready"]
     assert len(media_events) == 2
 
 
