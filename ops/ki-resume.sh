@@ -2,6 +2,8 @@
 # knowledge-ingest 断点续跑守候（通用版 v2，替代硬编码 job 的 v1）
 # 由 LaunchAgent 在登录时及每 15 分钟触发；幂等——锁在则退出，无可续跑则静默。
 # 安装：cp 至 ~/.local/bin/ki-resume.sh；plist 模板见 ops/com.sandro.ki-resume.plist
+# launchd 环境无用户 PATH；knowledge-ingest 启动器依赖 uv（Homebrew）
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 KI="/Users/sandro/.local/bin/knowledge-ingest"
 REPO="/Volumes/ORICO/Projects/knowledge-ingest"
 LOG_ROOT="/Volumes/ORICO/KnowledgePipeline/jobs"
