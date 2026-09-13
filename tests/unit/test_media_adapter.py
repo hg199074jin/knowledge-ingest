@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from knowledge_ingest.adapters.media import MediaAdapter, build_transcript_cache_key
+from knowledge_ingest.adapters.media import MediaAdapter
+from knowledge_ingest.cache import build_transcript_cache_key
 
 PROJECT = Path("/Volumes/ORICO/Projects/media-transcriber")
 

@@ -6,9 +6,9 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from knowledge_ingest.cache import build_transcript_cache_key
+from knowledge_ingest.cache import build_media_cache_key
 from knowledge_ingest.fingerprint import fingerprint_file
-from knowledge_ingest.runner import run_checked
+from knowledge_ingest.runner import run_checked, worktree_revision
 
 
 class TranscriptResult(BaseModel):
@@ -26,11 +26,9 @@ class MediaAdapter:
         self.output_root = Path(output_root)
 
     def head(self, timeout: int = 60) -> str:
-        result = run_checked(["git", "rev-parse", "HEAD"], cwd=self.project,
-                             timeout=timeout)
-        if result.returncode != 0:
-            raise RuntimeError("cannot resolve media-transcriber git HEAD")
-        return result.stdout.strip()
+        # v0.3 冻结规格 11：dirty 工作区 → HEAD-dirty-<fingerprint>（禁 legacy fallback）
+        return worktree_revision(self.project, label="media-transcriber",
+                                 timeout=timeout)
 
     def _file_sha(self, path: Path) -> str | None:
         if path is not None and Path(path).is_file():
@@ -78,7 +76,7 @@ class MediaAdapter:
             )
 
         source_sha = fingerprint_file(source)
-        key = build_transcript_cache_key(
+        key = build_media_cache_key(
             source_sha256=source_sha,
             mt_head=self.head(),
             config_sha=self._file_sha(config_file),

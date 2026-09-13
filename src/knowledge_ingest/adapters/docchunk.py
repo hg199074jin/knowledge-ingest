@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from knowledge_ingest.runner import CommandResult, run_checked
+from knowledge_ingest.runner import CommandResult, run_checked, worktree_revision
 
 ABSOLUTE_PATH = re.compile(r"(/Volumes/[^\s'\"]+|/Users/[^\s'\"]+|/private/var/[^\s'\"]+|/tmp[^\s'\"]*)")
 
@@ -45,11 +45,9 @@ class DocchunkAdapter:
                            timeout=timeout)
 
     def head(self, timeout: int = 60) -> str:
-        result = run_checked(["git", "rev-parse", "HEAD"], cwd=self.project,
-                             timeout=timeout)
-        if result.returncode != 0:
-            raise RuntimeError("cannot resolve docchunk git HEAD")
-        return result.stdout.strip()
+        # v0.3 冻结规格 11：dirty 工作区 → HEAD-dirty-<fingerprint>（禁 legacy fallback）
+        return worktree_revision(self.project, label="docchunk",
+                                 timeout=timeout)
 
     def split(
         self,

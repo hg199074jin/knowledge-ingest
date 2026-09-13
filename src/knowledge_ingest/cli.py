@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import fcntl
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from pathlib import Path
 
 from knowledge_ingest.config import AppConfig
 from knowledge_ingest.doctor import has_fail, run_doctor
-from knowledge_ingest.manifest_store import ManifestStore
+from knowledge_ingest.manifest_store import LockHeld, ManifestStore, flock_ctx
 from knowledge_ingest.models import JobRequest
 from knowledge_ingest.router import effective_paths, route_source
 from knowledge_ingest.state_machine import InvalidTransition, transition_to
@@ -48,48 +49,58 @@ def _source_fingerprint(path: Path) -> str | None:
 LOCK_NAME = ".preprocess.lock"
 
 
-def _write_lock(lock_path: Path) -> None:
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    Path(lock_path).write_text(str(os.getpid()), encoding="utf-8")
+def _flock_ctx(lock_path: Path):
+    """preprocess 业务互斥：EXCLUSIVE + NON-BLOCKING（拿不到立即放弃，不等待）。"""
+    return flock_ctx(lock_path, blocking=False)
 
 
-def _release_lock(lock_path: Path) -> None:
+def _lock_holder(lock: Path) -> str:
+    """锁文件里的 PID+时间戳诊断（仅展示用，不作为判活依据）。"""
     try:
-        Path(lock_path).unlink()
-    except FileNotFoundError:
-        pass
+        content = Path(lock).read_text(encoding="utf-8").strip()
+    except OSError:
+        return "<no diagnostic>"
+    return content or "<no diagnostic>"
 
 
 def _lock_alive(lock: Path) -> bool:
-    """锁存在且持有进程仍存活；陈旧锁（进程已死）不算活。"""
+    """flock 探测判活：实际尝试对该锁文件非阻塞 flock——能拿到=无活进程。
+
+    锁文件内容（PID/时间戳）仅作诊断展示；文件存在但无人持有 = 陈旧锁，不算活。
+    """
     lock = Path(lock)
     if not lock.is_file():
         return False
     try:
-        pid = int(lock.read_text(encoding="utf-8").strip() or "0")
-    except ValueError:
-        return False
-    if pid <= 0:
+        fd = os.open(lock, os.O_RDWR)
+    except OSError:
         return False
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True  # 有活进程持有
+        fcntl.flock(fd, fcntl.LOCK_UN)
         return False
-    except PermissionError:
-        return True
+    finally:
+        os.close(fd)
 
 
 def _locked(fn):
-    """preprocess 独占锁：运行期间禁止 amend 等修改 manifest 的操作。"""
+    """preprocess 独占锁（业务互斥）：运行期间禁止第二个 preprocess。
+
+    EXCLUSIVE + NON-BLOCKING：拿不到锁 → 打印诊断并返回退出码 3（不重试不等待）。
+    """
     @functools.wraps(fn)
     def wrapper(config: AppConfig, args) -> int:
         lock = _store(config).job_dir(args.job_id) / LOCK_NAME
-        _write_lock(lock)
         try:
-            return fn(config, args)
-        finally:
-            _release_lock(lock)
+            with _flock_ctx(lock):
+                return fn(config, args)
+        except LockHeld:
+            print(f"another preprocess holds this job: {_lock_holder(lock)}",
+                  file=sys.stderr)
+            return 3
     return wrapper
 
 
@@ -306,114 +317,117 @@ def _handoff_validation_error(manifest, handoff: dict) -> str | None:
 
 def _cmd_source_register(config: AppConfig, args) -> int:
     store = _store(config)
-    manifest = _load_job(store, args.job_id)
+    if not store.manifest_path(args.job_id).is_file():
+        print(f"error: job not found: {args.job_id}", file=sys.stderr)
+        return 2
     handoff_path = Path(args.handoff).expanduser()
     handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
-    manifest.source = handoff
+    # 事务式 mutate：read-modify-write 整体在 manifest 锁临界区内
+    with store.edit(args.job_id) as manifest:
+        manifest.source = handoff
 
-    _advance(manifest, ["DISCOVERING"])
-    validation_error = _handoff_validation_error(manifest, handoff)
-    if validation_error:
-        _block(manifest, validation_error)
-        store.save(manifest)
-        _log(config, manifest, "blocked", reason=validation_error)
-        print(f"BLOCKED: {validation_error}")
-        return 1
-
-    fingerprint = _source_fingerprint(
-        Path(handoff.get("local_path") or manifest.request.source))
-    if fingerprint:
-        manifest.source["source_fingerprint"] = fingerprint
-    _log(config, manifest, "source_registered",
-         provider=manifest.request.provider,
-         fingerprint=fingerprint)
-
-    remote = handoff.get("remote") or {}
-    if manifest.request.provider == "baidu":
-        remote_path = str(remote.get("path") or "")
-        # 规范：remote.path 必须是应用目录全路径（/apps/bdpan/... 或 apps/bdpan/...）
-        if not BAIDU_APP_PATH.match(remote_path):
-            manifest.source["scope_violation"] = True
-            _block(manifest, "baidu_scope_limited")
-            store.save(manifest)
-            _log(config, manifest, "blocked", reason="baidu_scope_limited")
-            print(f"BLOCKED: baidu_scope_limited ({remote_path or '<empty>'})")
+        _advance(manifest, ["DISCOVERING"])
+        validation_error = _handoff_validation_error(manifest, handoff)
+        if validation_error:
+            _block(manifest, validation_error)
+            _log(config, manifest, "blocked", reason=validation_error)
+            print(f"BLOCKED: {validation_error}")
             return 1
 
-    _advance(manifest, ["DOWNLOADING", "DOWNLOADED"])
-    store.save(manifest)
-    print(f"source registered: {handoff.get('local_path')}")
-    print(f"status: {manifest.status}")
-    return 0
+        fingerprint = _source_fingerprint(
+            Path(handoff.get("local_path") or manifest.request.source))
+        if fingerprint:
+            manifest.source["source_fingerprint"] = fingerprint
+        _log(config, manifest, "source_registered",
+             provider=manifest.request.provider,
+             fingerprint=fingerprint)
+
+        remote = handoff.get("remote") or {}
+        if manifest.request.provider == "baidu":
+            remote_path = str(remote.get("path") or "")
+            # 规范：remote.path 必须是应用目录全路径（/apps/bdpan/... 或 apps/bdpan/...）
+            if not BAIDU_APP_PATH.match(remote_path):
+                manifest.source["scope_violation"] = True
+                _block(manifest, "baidu_scope_limited")
+                _log(config, manifest, "blocked", reason="baidu_scope_limited")
+                print(f"BLOCKED: baidu_scope_limited ({remote_path or '<empty>'})")
+                return 1
+
+        _advance(manifest, ["DOWNLOADING", "DOWNLOADED"])
+        print(f"source registered: {handoff.get('local_path')}")
+        print(f"status: {manifest.status}")
+        return 0
 
 
 def _cmd_route(config: AppConfig, args) -> int:
     store = _store(config)
-    manifest = _load_job(store, args.job_id)
-    local_path = Path(manifest.source.get("local_path") or
-                      manifest.request.source)
-    if not local_path.exists():
-        print(f"error: source path missing: {local_path}", file=sys.stderr)
+    if not store.manifest_path(args.job_id).is_file():
+        print(f"error: job not found: {args.job_id}", file=sys.stderr)
         return 2
-    _advance(manifest, ["ROUTING"])
-    result = route_source(local_path, excludes=args.excludes)
-    manifest.routing = {
-        "collection": result.is_collection,
-        "discovered": {
-            "documents": [str(p) for p in result.discovered_documents],
-            "media": [str(p) for p in result.discovered_media],
-            "unsupported": [str(p) for p in result.discovered_unsupported],
-        },
-        "excluded": {
-            "documents": [str(p) for p in result.excluded_documents],
-            "media": [str(p) for p in result.excluded_media],
-            "unsupported": [str(p) for p in result.excluded_unsupported],
-        },
-        "effective": {
-            "documents": [str(p) for p in result.documents],
-            "media": [str(p) for p in result.media],
-            "unsupported": [str(p) for p in result.unsupported],
-        },
-        "excluded_raw": list(args.excludes),
-    }
-    # v0.3 冻结规格 1：unsupported 检查先于编码预检（Part B 在此之后插入）
-    if result.unsupported:
-        manifest.routing["blocked_unsupported"] = [
-            str(p) for p in result.unsupported]
-        _block(manifest, "unsupported_source")
-        store.save(manifest)
+    # 事务式 mutate：read-modify-write 整体在 manifest 锁临界区内
+    with store.edit(args.job_id) as manifest:
+        local_path = Path(manifest.source.get("local_path") or
+                          manifest.request.source)
+        if not local_path.exists():
+            print(f"error: source path missing: {local_path}", file=sys.stderr)
+            return 2
+        _advance(manifest, ["ROUTING"])
+        result = route_source(local_path, excludes=args.excludes)
+        manifest.routing = {
+            "collection": result.is_collection,
+            "discovered": {
+                "documents": [str(p) for p in result.discovered_documents],
+                "media": [str(p) for p in result.discovered_media],
+                "unsupported": [str(p) for p in result.discovered_unsupported],
+            },
+            "excluded": {
+                "documents": [str(p) for p in result.excluded_documents],
+                "media": [str(p) for p in result.excluded_media],
+                "unsupported": [str(p) for p in result.excluded_unsupported],
+            },
+            "effective": {
+                "documents": [str(p) for p in result.documents],
+                "media": [str(p) for p in result.media],
+                "unsupported": [str(p) for p in result.unsupported],
+            },
+            "excluded_raw": list(args.excludes),
+        }
+        # v0.3 冻结规格 1：unsupported 检查先于编码预检（Part B 在此之后插入）
+        if result.unsupported:
+            manifest.routing["blocked_unsupported"] = [
+                str(p) for p in result.unsupported]
+            _block(manifest, "unsupported_source")
+            _log(config, manifest, "routed",
+                 effective_documents=len(result.documents),
+                 effective_media=len(result.media),
+                 effective_unsupported=len(result.unsupported),
+                 excluded_documents=len(result.excluded_documents),
+                 excluded_media=len(result.excluded_media),
+                 excluded_unsupported=len(result.excluded_unsupported),
+                 blocked_reason="unsupported_source")
+            for p in result.unsupported:
+                print(f"unsupported (exclude explicitly to continue): {p}")
+            print("BLOCKED: unsupported_source")
+            return 1
         _log(config, manifest, "routed",
              effective_documents=len(result.documents),
              effective_media=len(result.media),
              effective_unsupported=len(result.unsupported),
              excluded_documents=len(result.excluded_documents),
              excluded_media=len(result.excluded_media),
-             excluded_unsupported=len(result.excluded_unsupported),
-             blocked_reason="unsupported_source")
-        for p in result.unsupported:
-            print(f"unsupported (exclude explicitly to continue): {p}")
-        print("BLOCKED: unsupported_source")
-        return 1
-    store.save(manifest)
-    _log(config, manifest, "routed",
-         effective_documents=len(result.documents),
-         effective_media=len(result.media),
-         effective_unsupported=len(result.unsupported),
-         excluded_documents=len(result.excluded_documents),
-         excluded_media=len(result.excluded_media),
-         excluded_unsupported=len(result.excluded_unsupported))
-    print(
-        f"routed: discovered documents={len(result.discovered_documents)} "
-        f"media={len(result.discovered_media)} "
-        f"unsupported={len(result.discovered_unsupported)}; "
-        f"excluded documents={len(result.excluded_documents)} "
-        f"media={len(result.excluded_media)} "
-        f"unsupported={len(result.excluded_unsupported)}; "
-        f"effective documents={len(result.documents)} "
-        f"media={len(result.media)} collection={result.is_collection}"
-    )
-    print(f"status: {manifest.status}")
-    return 0
+             excluded_unsupported=len(result.excluded_unsupported))
+        print(
+            f"routed: discovered documents={len(result.discovered_documents)} "
+            f"media={len(result.discovered_media)} "
+            f"unsupported={len(result.discovered_unsupported)}; "
+            f"excluded documents={len(result.excluded_documents)} "
+            f"media={len(result.excluded_media)} "
+            f"unsupported={len(result.excluded_unsupported)}; "
+            f"effective documents={len(result.documents)} "
+            f"media={len(result.media)} collection={result.is_collection}"
+        )
+        print(f"status: {manifest.status}")
+        return 0
 
 
 @_locked
@@ -425,7 +439,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
     from knowledge_ingest.cache import (
         TranscriptCache,
         TranscriptCacheEntry,
-        build_transcript_cache_key,
+        build_media_cache_key,
     )
     from knowledge_ingest.collection import (
         CollectionIncomplete,
@@ -479,7 +493,8 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
                     state["outcome"] = "failed"
                     state["reason"] = "media_stem_conflict"
                     _block(manifest, "media_stem_conflict")
-                    store.save(manifest)
+                    store.save_section(manifest,
+                                       ["media", "errors", "status"])
                     _log(config, manifest, "blocked",
                          reason="media_stem_conflict",
                          first=str(seen_stems[stem]), second=str(media))
@@ -493,7 +508,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
             manifest.media.started_at = manifest.media.started_at or \
                 datetime.now(timezone.utc)
             manifest.media.outputs = []   # 重入时重建（缓存让重建零成本）
-            store.save(manifest)
+            store.save_section(manifest, ["status", "media"])
 
             media_adapter = MediaAdapter(
                 project=config.media_project,
@@ -510,7 +525,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
                         source_root).as_posix()
                 except (ValueError, OSError):
                     rel_name = media.name
-                key = build_transcript_cache_key(
+                key = build_media_cache_key(
                     source_sha256=source_sha, mt_head=mt_head, config_sha=None,
                     device=config.processing.media_device,
                     timestamp=config.processing.media_timestamp,
@@ -534,7 +549,8 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
                              run_id=run_id, source=rel_name,
                              error=str(exc), attempt=1)
                         _block(manifest, "media_failed")
-                        store.save(manifest)
+                        store.save_section(manifest,
+                                           ["media", "errors", "status"])
                         print(f"BLOCKED: media_failed ({media})")
                         return 1
                     duration_ms = int((time.perf_counter() - perf_t0) * 1000)
@@ -556,7 +572,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
                     outcome="cache_reused" if cache_hit else "transcribed",
                 ))
                 # 每文件即落盘：长 ASR 期间 status 可见真实进度，中断零丢失
-                store.save(manifest)
+                store.save_section(manifest, ["media"])
                 _log(config, manifest, "media_output_ready",
                      run_id=run_id,
                      outcome="cache_reused" if cache_hit else "transcribed",
@@ -569,7 +585,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
         if manifest.status in {"ROUTING", "TRANSCRIBING"}:
             tsm(manifest, "DOCCHUNKING")
         manifest.docchunk.status = "running"
-        store.save(manifest)
+        store.save_section(manifest, ["media", "status", "docchunk"])
 
         clear_handoff(handoff_dir)
         try:
@@ -581,7 +597,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
             state["outcome"] = "failed"
             state["reason"] = "collection_incomplete"
             _block(manifest, "collection_incomplete")
-            store.save(manifest)
+            store.save_section(manifest, ["errors", "status"])
             _log(config, manifest, "blocked", reason="collection_incomplete",
                  detail=str(exc)[-300:])
             print(f"BLOCKED: collection_incomplete ({exc})")
@@ -590,13 +606,13 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
             state["outcome"] = "failed"
             state["reason"] = "collection_build_failed"
             _block(manifest, "collection_build_failed")
-            store.save(manifest)
+            store.save_section(manifest, ["errors", "status"])
             _log(config, manifest, "blocked", reason="collection_build_failed",
                  detail=str(exc)[-300:])
             print(f"BLOCKED: collection_build_failed ({exc})")
             return 1
         manifest.routing["document_set_map"] = str(built.map_path)
-        store.save(manifest)
+        store.save_section(manifest, ["routing"])
 
         docchunk_adapter = DocchunkAdapter(project=config.docchunk_project)
         from knowledge_ingest.adapters.docchunk import resolve_corpus_path
@@ -653,7 +669,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
             state["outcome"] = "failed"
             state["reason"] = "docchunk_split_failed"
             _block(manifest, "docchunk_split_failed")
-            store.save(manifest)
+            store.save_section(manifest, ["errors", "status"])
             _log(config, manifest, "blocked", reason="docchunk_split_failed",
                  detail=str(exc)[-300:])
             print(f"BLOCKED: docchunk_split_failed ({exc})")
@@ -661,7 +677,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
 
         if manifest.status != "VERIFYING":
             tsm(manifest, "VERIFYING")
-        store.save(manifest)
+        store.save_section(manifest, ["docchunk", "status"])
         verified = docchunk_adapter.verify(corpus)
 
         manifest.docchunk.corpus_path = corpus
@@ -669,7 +685,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
         manifest.docchunk.status = "verified" if verified else "failed"
         if verified:
             tsm(manifest, "CORPUS_READY")
-            store.save(manifest)
+            store.save_section(manifest, ["docchunk", "status"])
             _log(config, manifest, "corpus_verified", corpus=str(corpus),
                  reused=bool(manifest.docchunk.reused))
             print(f"corpus verified: {corpus}")
@@ -679,7 +695,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
         state["reason"] = "corpus_verify_failed"
         _log(config, manifest, "blocked", reason="corpus_verify_failed")
         _block(manifest, "corpus_verify_failed")
-        store.save(manifest)
+        store.save_section(manifest, ["docchunk", "errors", "status"])
         print("BLOCKED: corpus_verify_failed")
         return 1
     except BaseException as exc:
@@ -705,23 +721,26 @@ def _cmd_gate(config: AppConfig, args) -> int:
     from knowledge_ingest.next_action import gate_enter, gate_resolve
 
     store = _store(config)
-    manifest = _load_job(store, args.job_id)
-    if args.gate_command == "enter":
-        gate_enter(manifest, args.target, args.name)
-        store.save(manifest)
-        print(f"WAITING_USER: {args.target}:{args.name}")
+    if not store.manifest_path(args.job_id).is_file():
+        print(f"error: job not found: {args.job_id}", file=sys.stderr)
+        return 2
+    with store.edit(args.job_id) as manifest:
+        if args.gate_command == "enter":
+            gate_enter(manifest, args.target, args.name)
+            print(f"WAITING_USER: {args.target}:{args.name}")
+            return 0
+        gate_resolve(manifest, args.target, args.name, args.decision)
+        print(f"gate resolved ({args.decision}): status={manifest.status}")
         return 0
-    gate_resolve(manifest, args.target, args.name, args.decision)
-    store.save(manifest)
-    print(f"gate resolved ({args.decision}): status={manifest.status}")
-    return 0
 
 
 def _cmd_target_complete(config: AppConfig, args) -> int:
     from knowledge_ingest.next_action import target_complete
 
     store = _store(config)
-    manifest = _load_job(store, args.job_id)
+    if not store.manifest_path(args.job_id).is_file():
+        print(f"error: job not found: {args.job_id}", file=sys.stderr)
+        return 2
     output_path = Path(args.output_path).expanduser().resolve()
     if not output_path.exists():
         print(f"error: output path does not exist: {output_path}",
@@ -729,23 +748,25 @@ def _cmd_target_complete(config: AppConfig, args) -> int:
         return 2
     pipeline_state = (Path(args.pipeline_state).expanduser().resolve()
                       if args.pipeline_state else None)
-    target_complete(manifest, args.target, output_path,
-                    pipeline_state=pipeline_state)
-    store.save(manifest)
-    print(f"{args.target} complete: {output_path}")
-    print(f"status: {manifest.status}")
-    return 0
+    with store.edit(args.job_id) as manifest:
+        target_complete(manifest, args.target, output_path,
+                        pipeline_state=pipeline_state)
+        print(f"{args.target} complete: {output_path}")
+        print(f"status: {manifest.status}")
+        return 0
 
 
 def _cmd_target_start(config: AppConfig, args) -> int:
     from knowledge_ingest.next_action import target_start
 
     store = _store(config)
-    manifest = _load_job(store, args.job_id)
-    target_start(manifest, args.target)
-    store.save(manifest)
-    print(f"{args.target} started: status={manifest.status}")
-    return 0
+    if not store.manifest_path(args.job_id).is_file():
+        print(f"error: job not found: {args.job_id}", file=sys.stderr)
+        return 2
+    with store.edit(args.job_id) as manifest:
+        target_start(manifest, args.target)
+        print(f"{args.target} started: status={manifest.status}")
+        return 0
 
 
 RESUMABLE_STATUSES = {"ROUTING", "TRANSCRIBING", "DOCCHUNKING", "VERIFYING"}
@@ -799,16 +820,18 @@ def _cmd_resume(config: AppConfig, args) -> int:
 
 def _cmd_job_amend(config: AppConfig, args) -> int:
     store = _store(config)
-    manifest = _load_job(store, args.job_id)
-    if _lock_alive(store.job_dir(manifest.job_id) / LOCK_NAME):
+    if not store.manifest_path(args.job_id).is_file():
+        print(f"error: job not found: {args.job_id}", file=sys.stderr)
+        return 2
+    if _lock_alive(store.job_dir(args.job_id) / LOCK_NAME):
         print("error: preprocess is running and holds the manifest "
               "(memory copy would overwrite your change); "
               "retry after it exits", file=sys.stderr)
         return 2
-    if args.add_target not in manifest.request.targets:
-        manifest.request.targets.append(args.add_target)
-        store.save(manifest)
-    print(f"targets: {manifest.request.targets}")
+    with store.edit(args.job_id) as manifest:
+        if args.add_target not in manifest.request.targets:
+            manifest.request.targets.append(args.add_target)
+        print(f"targets: {manifest.request.targets}")
     return 0
 
 
