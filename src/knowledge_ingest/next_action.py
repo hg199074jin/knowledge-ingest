@@ -473,4 +473,6 @@ def target_resume(manifest: JobManifest, target: str) -> str:
         "ts": _now_iso(), "target": target, "action": "resume",
         "target_status": state.status,
     })
+    # 评审 I3：resume 后 propagate + 聚合判定，让阻塞传播到 Job 整体
+    settle(manifest)
     return state.status

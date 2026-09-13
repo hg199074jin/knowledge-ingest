@@ -1006,7 +1006,11 @@ def _cmd_budget(config: AppConfig, args) -> int:
                     {"allowed": True, "permit_id": result["permit_id"],
                      "call_no": result["call_no"]}, ensure_ascii=False))
                 return 0
-            # 不允许 → target=BLOCKED、overall=BLOCKED、active_target=null
+            # 规格 9 Blocker 1 修订：budget acquire denied 时
+            # target=BLOCKED、overall=BLOCKED、active_target=null
+            # 整体必须迁移到 BLOCKED 状态，无论当前 overall 是什么
+            # （CORPUS_READY 下的预检 BLOCKED 同样合理：某个 target
+            # 预启动时被预算拒绝，Job 整体进入 BLOCKED 等用户处置）
             state = manifest.targets[args.target]
             state.status = "BLOCKED"
             state.reason = result["reason"]
@@ -1016,7 +1020,8 @@ def _cmd_budget(config: AppConfig, args) -> int:
                 "reason": result["reason"], "target": args.target,
                 "scope": "budget",
             })
-            if manifest.status in {"TARGET_RUNNING", "WAITING_USER"}:
+            if manifest.status not in {"COMPLETED", "PARTIAL", "FAILED",
+                                        "BLOCKED"}:
                 transition_to(manifest, "BLOCKED")
             _log(config, manifest, "blocked", reason=result["reason"],
                  target=args.target, scope="budget")

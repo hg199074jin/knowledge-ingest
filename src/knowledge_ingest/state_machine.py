@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from knowledge_ingest.models import (
+    ACTIVE_TARGET_STATUSES,
     TERMINAL_TARGET_STATUSES,
     JobManifest,
     OverallStatus,
@@ -21,7 +22,7 @@ TRANSITIONS: dict[str, set[str]] = {
     "DOCCHUNKING": {"VERIFYING", "FAILED", "BLOCKED"},
     "VERIFYING": {"CORPUS_READY", "BLOCKED"},
     # 规格 2/8：DISTILLING_* 合并为 TARGET_RUNNING（active_target 区分谁在跑）
-    "CORPUS_READY": {"TARGET_RUNNING", "COMPLETED"},
+    "CORPUS_READY": {"TARGET_RUNNING", "COMPLETED", "BLOCKED"},
     # TARGET_RUNNING→TARGET_RUNNING 自转换受守卫（见 transition_to）
     "TARGET_RUNNING": {"WAITING_USER", "TARGET_RUNNING", "COMPLETED",
                        "PARTIAL", "FAILED", "BLOCKED"},
@@ -72,6 +73,14 @@ def transition_to(
             raise InvalidTransition(
                 f"self-transition target {new_active_target!r} has "
                 f"non-COMPLETED dependencies: {unmet}")
+        # C3 守卫：当前 RUNNING 的 target 与新 active_target 不一致时拒绝
+        # （否则并发回放可能让两个 target 同时 ACTIVE）
+        for other_name, other_state in manifest.targets.items():
+            if (other_name != new_active_target
+                    and other_state.status in ACTIVE_TARGET_STATUSES):
+                raise InvalidTransition(
+                    f"self-transition: {other_name!r} is already "
+                    f"{other_state.status}; only one ACTIVE target allowed")
         manifest.active_target = new_active_target
     manifest.status = new_status
     manifest.updated_at = datetime.now(UTC)
