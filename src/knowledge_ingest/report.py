@@ -43,6 +43,15 @@ def redact_deep(value):
     return value
 
 
+def _target_line(state) -> str:
+    line = state.status
+    if state.reason:
+        line += f" ({state.reason})"
+    if state.waiting_for:
+        line += f": {state.waiting_for}"
+    return line
+
+
 def build_status(manifest: JobManifest) -> dict:
     media_out = len(manifest.media.outputs)
     # 分母三级回退：v0.3 effective → v0.2 media_paths → v0.2 计数键
@@ -56,23 +65,23 @@ def build_status(manifest: JobManifest) -> dict:
     docchunk = (f"{manifest.docchunk.status}"
                 + (f" {manifest.docchunk.verify}"
                    if manifest.docchunk.verify else ""))
-    cangjie = manifest.cangjie.status + (
-        f": {manifest.cangjie.waiting_for}"
-        if manifest.cangjie.waiting_for else "")
-    personal = manifest.personal.status + (
-        f": {manifest.personal.waiting_for}"
-        if manifest.personal.waiting_for else "")
-    return {
+    # v0.3：per-target 分组行（声明顺序），保留 cangjie/personal 兼容键
+    targets = {name: _target_line(state)
+               for name, state in manifest.targets.items()}
+    status = {
         "job_id": manifest.job_id,
         "source": ("success" if source_status else
                    manifest.source.get("provider", "pending")),
         "transcribe": transcribe,
         "docchunk": docchunk,
-        "cangjie": cangjie,
-        "personal": personal,
+        "targets": targets,
         "overall": manifest.status,
         "errors": redact_deep(manifest.errors),
     }
+    for legacy in ("cangjie", "personal"):
+        if legacy in targets:
+            status[legacy] = targets[legacy]
+    return status
 
 
 def render_report(manifest: JobManifest) -> str:
@@ -120,14 +129,37 @@ def render_report(manifest: JobManifest) -> str:
     lines.append(f"- 复用缓存：{manifest.docchunk.reused}")
     lines.append(f"- cache_key：{manifest.docchunk.cache_key}")
     lines.append("")
-    lines.append("## Cangjie 输出")
-    lines.append(f"- 状态：{manifest.cangjie.status}")
-    lines.append(f"- 产物：{manifest.cangjie.output_path}")
-    lines.append(f"- 断点文件：{manifest.cangjie.pipeline_state}")
-    lines.append("")
-    lines.append("## Personal 输出")
-    lines.append(f"- 状态：{manifest.personal.status}")
-    lines.append(f"- 产物：{manifest.personal.output_path}")
+    # v0.3：Cangjie/Personal 固定段改为 per-target 循环（display_name）
+    from knowledge_ingest.targets import REGISTRY
+
+    lines.append("## Targets")
+    for name, state in manifest.targets.items():
+        runtime = REGISTRY.get(name)
+        label = runtime.display_name if runtime else name
+        lines.append(f"### {label}")
+        status_line = state.status
+        if state.reason:
+            status_line += f"（{state.reason}）"
+        if state.waiting_for:
+            status_line += f"：等待 {state.waiting_for}"
+        lines.append(f"- 状态：{status_line}")
+        lines.append(f"- 产物：{state.output_path}")
+        if state.pipeline_state:
+            lines.append(f"- 断点文件：{state.pipeline_state}")
+        if state.output_manifest:
+            lines.append(f"- 输出清单：{state.output_manifest}")
+        if state.depends_on:
+            lines.append(f"- 依赖：{', '.join(state.depends_on)}")
+        lines.append("")
+    completed_outputs = {name: state.output_path
+                         for name, state in manifest.targets.items()
+                         if state.output_path}
+    lines.append("## target_outputs")
+    if completed_outputs:
+        for name, out in completed_outputs.items():
+            lines.append(f"- {name}: {out}")
+    else:
+        lines.append("- 无")
     lines.append("")
     lines.append("## 显式排除项")
     excluded = routing.get("excluded")
@@ -152,9 +184,10 @@ def render_report(manifest: JobManifest) -> str:
     lines.append("")
     lines.append("## 可恢复信息")
     status = build_status(manifest)
-    for key in ("source", "transcribe", "docchunk", "cangjie", "personal",
-                "overall"):
+    for key in ("source", "transcribe", "docchunk", "overall"):
         lines.append(f"- {key}: {status[key]}")
+    for name, line in status["targets"].items():
+        lines.append(f"- target:{name}: {line}")
     if manifest.gate_history:
         lines.append("- gate 历史：")
         for gate in manifest.gate_history:

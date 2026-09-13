@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from knowledge_ingest.config import AppConfig
+from knowledge_ingest.targets import REGISTRY
 
 PASS = "PASS"
 WARN = "WARN"
@@ -18,8 +19,10 @@ FAIL = "FAIL"
 
 ORICO_ROOT = Path("/Volumes/ORICO")
 
-# 缺失即阻断的下游 Skill；云端 Skill 缺失只降级为 WARN
-CORE_SKILL_KEYS = ("cangjie", "personal_distiller")
+# 缺失即阻断的下游 Skill（从 target registry 派生）；
+# 云端 Skill 缺失只降级为 WARN
+CORE_SKILL_KEYS = tuple(
+    dict.fromkeys(rt.skill_config_key for rt in REGISTRY.values()))
 CLOUD_SKILL_KEYS = ("baidu", "quark")
 
 _RUN_TIMEOUT = 300

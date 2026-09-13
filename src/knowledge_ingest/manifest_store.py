@@ -6,6 +6,7 @@ import fcntl
 import os
 import re
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -95,6 +96,58 @@ def _slugify(name: str) -> str:
     return slug[:32] or "job"
 
 
+# 规格 15：job_id 追加 6 位 uuid hex（同秒同 provider 同 slug 不碰撞）
+JOB_ID_SUFFIX_LEN = 6
+V1_BACKUP_SUFFIX = ".bak-v1"
+
+
+class V1BackupError(RuntimeError):
+    """v1 备份已存在但与待备份原始字节不一致（fail-fast，绝不覆盖）。"""
+
+
+def _read_raw_if_v1(path: Path) -> bytes | None:
+    """磁盘文件是 v1 manifest 时返回原始 bytes，否则 None。"""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        data = yaml.safe_load(raw.decode("utf-8"))
+    except (yaml.YAMLError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    # v1：schema_version != 2（含缺失）；v2 文件恒为 2
+    if data.get("schema_version") == 2:
+        return None
+    return raw
+
+
+def backup_v1_manifest(path: Path, raw: bytes) -> None:
+    """规格（V1→V2 迁移）：首次持久化前把原始 bytes 用 O_CREAT|O_EXCL 写
+    job.yaml.bak-v1 并 fsync；EEXIST → 校验已有备份完整（可解析且与预期
+    逐字节一致），不一致 fail-fast，绝不覆盖。"""
+    backup = path.with_name(path.name + V1_BACKUP_SUFFIX)
+    try:
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        existing = backup.read_bytes()
+        try:
+            parsed = yaml.safe_load(existing.decode("utf-8"))
+        except (yaml.YAMLError, UnicodeDecodeError):
+            parsed = None
+        if not isinstance(parsed, dict) or existing != raw:
+            raise V1BackupError(
+                f"existing v1 backup is incomplete or divergent, "
+                f"refusing to touch: {backup}") from None
+        return
+    try:
+        os.write(fd, raw)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class ManifestStore:
     def __init__(self, jobs_root: Path) -> None:
         self.jobs_root = Path(jobs_root)
@@ -112,7 +165,8 @@ class ManifestStore:
     def create(self, request: JobRequest) -> JobManifest:
         now = _now()
         stem = Path(request.source.replace("\\", "/")).name or "source"
-        job_id = f"{now:%Y%m%d-%H%M%S}-{request.provider}-{_slugify(stem)}"
+        job_id = (f"{now:%Y%m%d-%H%M%S}-{request.provider}"
+                  f"-{_slugify(stem)}-{uuid.uuid4().hex[:JOB_ID_SUFFIX_LEN]}")
         manifest = JobManifest(
             job_id=job_id, created_at=now, updated_at=now, request=request
         )
@@ -132,10 +186,17 @@ class ManifestStore:
         return JobManifest.model_validate(data)
 
     def save(self, manifest: JobManifest) -> None:
+        path = self.manifest_path(manifest.job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 规格（V1→V2 迁移）：首次 v1→v2 持久化前，原 job.yaml 原始 bytes
+        # → job.yaml.bak-v1（O_CREAT|O_EXCL + fsync）；绝不覆盖。
+        raw_v1 = _read_raw_if_v1(path)
+        if raw_v1 is not None:
+            backup_v1_manifest(path, raw_v1)
         manifest.updated_at = _now()
         payload = manifest.model_dump(mode="json")
         text = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
-        atomic_write_text(self.manifest_path(manifest.job_id), text)
+        atomic_write_text(path, text)
 
     def _manifest_lock(self, job_id: str) -> Path:
         return self.job_dir(job_id) / MANIFEST_LOCK_NAME

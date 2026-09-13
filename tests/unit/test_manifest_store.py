@@ -86,10 +86,19 @@ def test_datetimes_and_paths_roundtrip(
 ):
     manifest = store.create(job_request)
     manifest.docchunk.corpus_path = Path("/tmp/corpus")
-    manifest.cangjie.waiting_for = "stage0_overview"
+    manifest.targets["cangjie"].waiting_for = "stage0_overview"
     store.save(manifest)
     loaded = store.load(manifest.job_id)
     assert isinstance(loaded.created_at, datetime)
     assert loaded.docchunk.corpus_path == Path("/tmp/corpus")
-    assert loaded.cangjie.waiting_for == "stage0_overview"
+    assert loaded.targets["cangjie"].waiting_for == "stage0_overview"
     assert isinstance(loaded, JobManifest)
+
+
+def test_create_job_id_has_uuid_suffix(store: ManifestStore, job_request):
+    """规格 15：job_id 追加 6 位 uuid hex（同秒同 provider 同 slug 不碰撞）。"""
+    first = store.create(job_request)
+    second = store.create(job_request)
+    assert first.job_id != second.job_id
+    assert first.job_id.split("-")[-1] != second.job_id.split("-")[-1]
+    assert len(first.job_id.rsplit("-", 1)[-1]) == 6

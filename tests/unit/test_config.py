@@ -16,6 +16,7 @@ def make_config_dict(tmp_path: Path) -> dict:
             "quark": "quarkclouddrive",
             "cangjie": "cangjie-skill",
             "personal_distiller": "personal-capability-distiller",
+            "family_router": "family-router-builder",
         },
         "processing": {
             "media_device": "auto",

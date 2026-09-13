@@ -26,7 +26,7 @@ def test_resume_after_cangjie_waiting_user(tmp_path: Path):
 
     # 蒸馏开始后进入 Cangjie 骨架确认门
     loaded = store.load(manifest.job_id)
-    transition_through(loaded, "DISTILLING_CANGJIE")
+    transition_through(loaded, "TARGET_RUNNING")
     gate_enter(loaded, "cangjie", "stage0_overview")
     store.save(loaded)
 
@@ -57,6 +57,6 @@ def test_resume_mid_preprocess_keeps_completed_stages(tmp_path: Path):
 
 
 def transition_through(manifest: JobManifest, status: str) -> None:
-    """仅当跃迁合法时使用状态机；此处 CORPUS_READY→DISTILLING_CANGJIE 合法。"""
+    """仅当跃迁合法时使用状态机；此处 CORPUS_READY→TARGET_RUNNING 合法。"""
     manifest.updated_at = datetime.now(timezone.utc)
     transition_to(manifest, status)

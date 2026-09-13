@@ -21,6 +21,10 @@ from knowledge_ingest.manifest_store import LockHeld, ManifestStore, flock_ctx
 from knowledge_ingest.models import JobRequest
 from knowledge_ingest.router import effective_paths, route_source
 from knowledge_ingest.state_machine import InvalidTransition, transition_to
+from knowledge_ingest.targets import (
+    get as get_target,
+    target_choices,
+)
 
 BAIDU_APP_PREFIXES = ("apps/bdpan", "/apps/bdpan")
 
@@ -156,15 +160,21 @@ def _build_parser() -> argparse.ArgumentParser:
     create_cmd.add_argument("--source", required=True,
                             help="cloud path, share link, or local path")
     create_cmd.add_argument("--target", dest="targets", action="append",
-                            required=True, choices=["cangjie", "personal"])
+                            required=True, choices=target_choices())
     create_cmd.add_argument("--prompt", default="",
                             help="raw user request text for provenance")
+    create_cmd.add_argument(
+        "--with-router", dest="with_router", nargs="?",
+        const="family_router", default=None, metavar="TARGET",
+        help="also request a router target (default: family_router); "
+             "auto-ensures its direct depends_on entry (no recursion, "
+             "no auto-start); fail-fast if a dependency is unregistered")
     amend_cmd = job_sub.add_parser(
         "amend", parents=[common],
         help="modify a job (refused while preprocess holds the lock)")
     amend_cmd.add_argument("job_id")
     amend_cmd.add_argument("--add-target", required=True,
-                           choices=["cangjie", "personal"])
+                           choices=target_choices())
 
     register = sub.add_parser("source", parents=[common], help="source operations")
     source_sub = register.add_subparsers(dest="source_command", required=True)
@@ -209,36 +219,101 @@ def _build_parser() -> argparse.ArgumentParser:
                                          help="record that a gate is now open")
     gate_enter_cmd.add_argument("job_id")
     gate_enter_cmd.add_argument("--target", required=True,
-                                choices=["cangjie", "personal"])
+                                choices=target_choices())
     gate_enter_cmd.add_argument("--name", required=True)
     gate_resolve_cmd = gate_sub.add_parser(
         "resolve", parents=[common],
         help="record a REAL user decision (never fabricate)")
     gate_resolve_cmd.add_argument("job_id")
     gate_resolve_cmd.add_argument("--target", required=True,
-                                  choices=["cangjie", "personal"])
+                                  choices=target_choices())
     gate_resolve_cmd.add_argument("--name", required=True)
     gate_resolve_cmd.add_argument("--decision", required=True,
                                   choices=["confirmed", "rejected"])
+    gate_resolve_cmd.add_argument(
+        "--preauthorization", default=None, metavar="GRANT_ID",
+        help="reference a preauthorization grant (pa_*) instead of a live "
+             "answer; the granted value must not be repeated here")
+    gate_preauthorize_cmd = gate_sub.add_parser(
+        "preauthorize", parents=[common],
+        help="grant a preauthorization for a preauthorizable gate (spec 10)")
+    gate_preauthorize_cmd.add_argument("job_id")
+    gate_preauthorize_cmd.add_argument("--target", required=True,
+                                       choices=target_choices())
+    gate_preauthorize_cmd.add_argument("--name", required=True)
+    gate_preauthorize_cmd.add_argument("--value", required=True)
+
+    budget = sub.add_parser("budget", parents=[common],
+                            help="external-call budget guard (spec 9)")
+    budget_sub = budget.add_subparsers(dest="budget_command", required=True)
+    budget_acquire_cmd = budget_sub.add_parser(
+        "acquire", parents=[common],
+        help="phase 1: request an external-call permit (idempotent by "
+             "request_id)")
+    budget_acquire_cmd.add_argument("job_id")
+    budget_acquire_cmd.add_argument("--target", required=True,
+                                    choices=target_choices())
+    budget_acquire_cmd.add_argument("--host", required=True)
+    budget_acquire_cmd.add_argument("--case-id", dest="case_id",
+                                    required=True)
+    budget_acquire_cmd.add_argument("--request-id", dest="request_id",
+                                    required=True)
+    budget_outcome_cmd = budget_sub.add_parser(
+        "outcome", parents=[common],
+        help="phase 2: report a permit outcome (idempotent; conflicts exit 2)")
+    budget_outcome_cmd.add_argument("job_id")
+    budget_outcome_cmd.add_argument("--permit", required=True)
+    budget_outcome_cmd.add_argument(
+        "--result", required=True, choices=["success", "empty", "rate_limit"])
+    budget_amend_cmd = budget_sub.add_parser(
+        "amend", parents=[common],
+        help="change budget limits only; never auto-restores BLOCKED state")
+    budget_amend_cmd.add_argument("job_id")
+    budget_amend_cmd.add_argument("--target", required=True,
+                                  choices=target_choices())
+    budget_amend_cmd.add_argument("--max-external-calls",
+                                  dest="max_external_calls", type=int,
+                                  default=None)
+    budget_amend_cmd.add_argument("--max-retries-per-case",
+                                  dest="max_retries_per_case", type=int,
+                                  default=None)
 
     target = sub.add_parser("target", parents=[common], help="target skill operations")
     target_sub = target.add_subparsers(dest="target_command", required=True)
     target_start_cmd = target_sub.add_parser(
         "start", parents=[common],
-        help="begin distillation for a target (CORPUS_READY -> DISTILLING_*)")
+        help="begin distillation for a target (requires dependencies COMPLETED)")
     target_start_cmd.add_argument("job_id")
     target_start_cmd.add_argument("--target", required=True,
-                                  choices=["cangjie", "personal"])
+                                  choices=target_choices())
     target_done = target_sub.add_parser(
         "complete", parents=[common],
         help="register a distillation target's final output")
     target_done.add_argument("job_id")
     target_done.add_argument("--target", required=True,
-                             choices=["cangjie", "personal"])
+                             choices=target_choices())
     target_done.add_argument("--output-path", required=True)
     target_done.add_argument(
         "--pipeline-state", default=None,
         help="cangjie: path to books/<slug>/PIPELINE_STATE.md for resume")
+    target_checkpoint_cmd = target_sub.add_parser(
+        "checkpoint", parents=[common],
+        help="record a transactional checkpoint (spec 15; no heartbeat)")
+    target_checkpoint_cmd.add_argument("job_id")
+    target_checkpoint_cmd.add_argument("--target", required=True,
+                                       choices=target_choices())
+    target_checkpoint_cmd.add_argument("--phase", required=True)
+    target_checkpoint_cmd.add_argument("--checkpoint", default=None,
+                                       help="path to the checkpoint artifact")
+    target_checkpoint_cmd.add_argument("--evidence", dest="evidence",
+                                       default=None,
+                                       help="path to the evidence directory")
+    target_resume_cmd = target_sub.add_parser(
+        "resume", parents=[common],
+        help="explicitly restore a BLOCKED target (spec 9 blocker 1)")
+    target_resume_cmd.add_argument("job_id")
+    target_resume_cmd.add_argument("--target", required=True,
+                                   choices=target_choices())
 
     status = sub.add_parser("status", parents=[common],
                         help="human-readable job status")
@@ -275,7 +350,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="scaffold distill cwd + target handoff for a target")
     distill_prep.add_argument("job_id")
     distill_prep.add_argument("--target", required=True,
-                              choices=["cangjie", "personal"])
+                              choices=target_choices())
 
     return parser
 
@@ -299,12 +374,31 @@ def _cmd_doctor(config: AppConfig, args) -> int:
 def _cmd_job_create(config: AppConfig, args) -> int:
     from knowledge_ingest.report import redact_text
 
+    targets = list(dict.fromkeys(args.targets))
+    with_router = getattr(args, "with_router", None)
+    if with_router:
+        # 规格 4：--with-router [family_router]——自动确保 router entry +
+        # 其直接 depends_on entry（model validator 补建）；不自动启动、
+        # 不递归补；依赖未注册 → fail-fast。
+        try:
+            runtime = get_target(with_router)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        unregistered = [dep for dep in runtime.depends_on
+                        if dep not in target_choices()]
+        if unregistered:
+            print(f"error: cannot ensure dependencies for "
+                  f"{runtime.name}: {unregistered}", file=sys.stderr)
+            return 2
+        if runtime.name not in targets:
+            targets.append(runtime.name)
     request = JobRequest(
         # prompt 是自由文本，可能携带敏感串——落盘前脱敏（硬约束：Token 不入 Manifest）
         raw_prompt=redact_text(args.prompt or args.source),
         provider=args.provider,
         source=args.source,
-        targets=list(args.targets),
+        targets=targets,
     )
     manifest = _store(config).create(request)
     print(manifest.job_id)
@@ -750,7 +844,11 @@ def _cmd_next(config: AppConfig, args) -> int:
 
 
 def _cmd_gate(config: AppConfig, args) -> int:
-    from knowledge_ingest.next_action import gate_enter, gate_resolve
+    from knowledge_ingest.next_action import (
+        gate_enter,
+        gate_preauthorize,
+        gate_resolve,
+    )
 
     store = _store(config)
     if not store.manifest_path(args.job_id).is_file():
@@ -761,13 +859,26 @@ def _cmd_gate(config: AppConfig, args) -> int:
             gate_enter(manifest, args.target, args.name)
             print(f"WAITING_USER: {args.target}:{args.name}")
             return 0
-        gate_resolve(manifest, args.target, args.name, args.decision)
+        if args.gate_command == "preauthorize":
+            grant = gate_preauthorize(manifest, args.target, args.name,
+                                      args.value)
+            print(f"preauthorized: {grant['grant_id']} "
+                  f"({args.target}:{args.name})")
+            return 0
+        gate_resolve(manifest, args.target, args.name, args.decision,
+                     preauthorization=args.preauthorization)
         print(f"gate resolved ({args.decision}): status={manifest.status}")
         return 0
 
 
 def _cmd_target_complete(config: AppConfig, args) -> int:
+    import os as _os
+
     from knowledge_ingest.next_action import target_complete
+    from knowledge_ingest.output_manifest import (
+        build_output_manifest,
+        render_output_manifest,
+    )
 
     store = _store(config)
     if not store.manifest_path(args.job_id).is_file():
@@ -780,11 +891,143 @@ def _cmd_target_complete(config: AppConfig, args) -> int:
         return 2
     pipeline_state = (Path(args.pipeline_state).expanduser().resolve()
                       if args.pipeline_state else None)
+    runtime = get_target(args.target)
+    # 锁外：扫描产物 + 生成决定性 manifest 内容 → tmp
+    # （锁内校验通过后才 rename，事务失败则 TargetState 不变）
+    tmp_path: Path | None = None
+    final_path: Path | None = None
+    if runtime.output_manifest:
+        handoff_dir = store.job_dir(args.job_id) / "handoff"
+        handoff_dir.mkdir(parents=True, exist_ok=True)
+        final_path = handoff_dir / runtime.output_manifest
+        tmp_path = handoff_dir / f".{runtime.output_manifest}.tmp"
+        tmp_path.write_text(
+            render_output_manifest(build_output_manifest(output_path)),
+            encoding="utf-8")
+    try:
+        with store.edit(args.job_id) as manifest:
+            # 先校验 target 仍允许 complete（锁内），再 rename，最后推进状态：
+            # 任一步失败 → 事务放弃，TargetState 不变
+            state = manifest.targets.get(args.target)
+            if state is None or state.status != "RUNNING":
+                raise ValueError(
+                    f"target {args.target} not completable "
+                    f"(status={getattr(state, 'status', None)})")
+            if tmp_path is not None and final_path is not None:
+                _os.replace(tmp_path, final_path)
+            target_complete(manifest, args.target, output_path,
+                            pipeline_state=pipeline_state,
+                            output_manifest=final_path)
+            print(f"{args.target} complete: {output_path}")
+            print(f"status: {manifest.status}")
+            return 0
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _cmd_target_checkpoint(config: AppConfig, args) -> int:
+    from knowledge_ingest.next_action import target_checkpoint
+
+    store = _store(config)
+    if not store.manifest_path(args.job_id).is_file():
+        print(f"error: job not found: {args.job_id}", file=sys.stderr)
+        return 2
+    checkpoint_path = (Path(args.checkpoint).expanduser()
+                       if args.checkpoint else None)
+    evidence_dir = (Path(args.evidence).expanduser()
+                    if args.evidence else None)
     with store.edit(args.job_id) as manifest:
-        target_complete(manifest, args.target, output_path,
-                        pipeline_state=pipeline_state)
-        print(f"{args.target} complete: {output_path}")
+        record = target_checkpoint(
+            manifest, args.target, args.phase,
+            checkpoint_path=checkpoint_path, evidence_dir=evidence_dir)
+        _log(config, manifest, "target_checkpointed", **record)
+        print(f"checkpointed: {args.target} phase={args.phase} "
+              f"attempt={record['attempt']}")
+        return 0
+
+
+def _cmd_target_resume(config: AppConfig, args) -> int:
+    from knowledge_ingest.next_action import target_resume
+
+    store = _store(config)
+    if not store.manifest_path(args.job_id).is_file():
+        print(f"error: job not found: {args.job_id}", file=sys.stderr)
+        return 2
+    with store.edit(args.job_id) as manifest:
+        target_status = target_resume(manifest, args.target)
+        print(f"{args.target} resumed: {target_status}")
         print(f"status: {manifest.status}")
+        return 0
+
+
+def _cmd_budget(config: AppConfig, args) -> int:
+    import json as _json
+
+    from knowledge_ingest import budget
+
+    store = _store(config)
+    if not store.manifest_path(args.job_id).is_file():
+        print(f"error: job not found: {args.job_id}", file=sys.stderr)
+        return 2
+    job_dir = store.job_dir(args.job_id)
+    if args.budget_command == "amend":
+        # 规格 9 Blocker 1：修改预算 ≠ 自动恢复 BLOCKED
+        with store.edit(args.job_id) as manifest:
+            if args.target not in manifest.targets:
+                raise ValueError(
+                    f"target not present in this job: {args.target}")
+            amended = budget.amend(
+                job_dir, args.target,
+                max_external_calls=args.max_external_calls,
+                max_retries_per_case=args.max_retries_per_case)
+        print(f"budget amended for {args.target}: "
+              f"{_json.dumps(amended, ensure_ascii=False, sort_keys=True)}")
+        print("note: budget amend never restores BLOCKED state — "
+              "use 'target resume' (see references/recovery.md)")
+        return 0
+    with store.edit(args.job_id) as manifest:
+        if args.budget_command == "acquire":
+            if args.target not in manifest.targets:
+                raise ValueError(
+                    f"target not present in this job: {args.target}")
+            result = budget.acquire(
+                manifest, job_dir, target=args.target, host=args.host,
+                case_id=args.case_id, request_id=args.request_id)
+            if result["allowed"]:
+                if not result.get("replay"):
+                    _log(config, manifest, "external_call_acquired",
+                         permit_id=result["permit_id"], target=args.target,
+                         host=args.host, case_id=args.case_id)
+                print(_json.dumps(
+                    {"allowed": True, "permit_id": result["permit_id"],
+                     "call_no": result["call_no"]}, ensure_ascii=False))
+                return 0
+            # 不允许 → target=BLOCKED、overall=BLOCKED、active_target=null
+            state = manifest.targets[args.target]
+            state.status = "BLOCKED"
+            state.reason = result["reason"]
+            if manifest.active_target == args.target:
+                manifest.active_target = None
+            manifest.errors.append({
+                "reason": result["reason"], "target": args.target,
+                "scope": "budget",
+            })
+            if manifest.status in {"TARGET_RUNNING", "WAITING_USER"}:
+                transition_to(manifest, "BLOCKED")
+            _log(config, manifest, "blocked", reason=result["reason"],
+                 target=args.target, scope="budget")
+            print(_json.dumps({"allowed": False,
+                               "reason": result["reason"]},
+                              ensure_ascii=False))
+            return 1
+        # outcome
+        result = budget.outcome(manifest, permit_id=args.permit,
+                                result=args.result)
+        if not result["noop"]:
+            _log(config, manifest, "external_call_outcome",
+                 permit_id=args.permit, result=args.result)
+        print(_json.dumps(result, ensure_ascii=False))
         return 0
 
 
@@ -830,8 +1073,11 @@ def _cmd_resume(config: AppConfig, args) -> int:
         elif status == "CORPUS_READY":
             print(f"{jid}: CORPUS_READY — run 'next --json' to invoke target")
         elif status == "WAITING_USER":
-            gate = (manifest.cangjie.waiting_for or
-                    manifest.personal.waiting_for or "?")
+            waiting = [(name, state.waiting_for)
+                       for name, state in manifest.targets.items()
+                       if state.status == "WAITING_USER" and state.waiting_for]
+            gate = (f"{waiting[0][0]}:{waiting[0][1]}"
+                    if waiting else "?")
             print(f"{jid}: WAITING_USER ({gate}) — ask the user, "
                   f"then 'gate resolve'")
         elif status == "BLOCKED":
@@ -851,6 +1097,10 @@ def _cmd_resume(config: AppConfig, args) -> int:
 
 
 def _cmd_job_amend(config: AppConfig, args) -> int:
+    from datetime import datetime, timezone
+
+    from knowledge_ingest.next_action import propagate_dependencies
+
     store = _store(config)
     if not store.manifest_path(args.job_id).is_file():
         print(f"error: job not found: {args.job_id}", file=sys.stderr)
@@ -863,6 +1113,22 @@ def _cmd_job_amend(config: AppConfig, args) -> int:
     with store.edit(args.job_id) as manifest:
         if args.add_target not in manifest.request.targets:
             manifest.request.targets.append(args.add_target)
+        # 新 target entry 及其直接依赖 entry（model validator 在 load 时运行，
+        # append 后需显式补建）；再按依赖算 PENDING/READY + 依赖传播
+        manifest.ensure_target_entries()
+        propagate_dependencies(manifest)
+        # 验收 E9：COMPLETED Job 上 amend，若存在新可执行 target →
+        # 显式重入可调度态 CORPUS_READY（active_target=null；
+        # 旧 COMPLETED target 保持 COMPLETED）
+        ready = [name for name, state in manifest.targets.items()
+                 if state.status == "READY"]
+        if manifest.status == "COMPLETED" and ready:
+            manifest.status = "CORPUS_READY"
+            manifest.active_target = None
+            manifest.gate_history.append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "action": "amend_reenter", "target": args.add_target,
+            })
         print(f"targets: {manifest.request.targets}")
     return 0
 
@@ -906,22 +1172,24 @@ def _cmd_source_init(config: AppConfig, args) -> int:
 def _cmd_distill_prepare(config: AppConfig, args) -> int:
     store = _store(config)
     manifest = _load_job(store, args.job_id)
-    if manifest.status not in {"CORPUS_READY", "DISTILLING_CANGJIE",
-                               "DISTILLING_PERSONAL", "WAITING_USER"}:
+    if manifest.status not in {"CORPUS_READY", "TARGET_RUNNING",
+                               "WAITING_USER"}:
         print(f"error: distill prepare expects CORPUS_READY or later, "
               f"got {manifest.status}", file=sys.stderr)
         return 2
-    target = args.target
+    runtime = get_target(args.target)
+    target = runtime.name
     root = config.pipeline_root / "distill" / manifest.job_id / target
-    (root / "books" if target == "cangjie" else root).mkdir(
-        parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
+    for subdir in runtime.workspace_subdirs:
+        (root / subdir).mkdir(parents=True, exist_ok=True)
     state = root / "PIPELINE_STATE.md"
     if not state.exists():
         state.write_text(
             f"# PIPELINE_STATE — {manifest.job_id} / {target}\n\n"
             f"- job: {manifest.job_id}\n"
             f"- corpus: {manifest.docchunk.corpus_path}\n"
-            f"- created: distill prepare (knowledge-ingest v0.2.0)\n",
+            f"- created: distill prepare (knowledge-ingest v0.3.0)\n",
             encoding="utf-8")
     handoff_path = (store.job_dir(manifest.job_id) / "handoff"
                     / f"target-{target}.yaml")
@@ -941,11 +1209,10 @@ def _cmd_distill_prepare(config: AppConfig, args) -> int:
             f"provenance_manifest: "
             f"{store.job_dir(manifest.job_id) / 'job.yaml'}",
         ]
-        if target == "cangjie":
-            lines.insert(2, "first_pilot: false")
-        if target == "personal":
-            lines.append("depth: null")
-            lines.append("obsidian_vault: /Volumes/ORICO/Obsidian/Skill_Library")
+        if runtime.handoff_extra is not None:
+            lines.extend(runtime.handoff_extra(
+                manifest=manifest,
+                job_dir=store.job_dir(manifest.job_id)))
         handoff_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"distill workspace: {root}")
     print(f"target handoff: {handoff_path}")
@@ -964,8 +1231,10 @@ def _cmd_status(config: AppConfig, args) -> int:
         print(f"Source         {status['source']}")
         print(f"Transcribe     {status['transcribe']}")
         print(f"DocChunk       {status['docchunk']}")
-        print(f"Cangjie        {status['cangjie']}")
-        print(f"Personal       {status['personal']}")
+        for name, line in status["targets"].items():
+            runtime = get_target(name)
+            label = runtime.display_name if runtime else name
+            print(f"{label:<15}{line}")
         print(f"Overall        {status['overall']}")
     return 0
 
@@ -1005,10 +1274,16 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_next(config, args)
         if args.command == "gate":
             return _cmd_gate(config, args)
+        if args.command == "budget":
+            return _cmd_budget(config, args)
         if args.command == "target" and args.target_command == "start":
             return _cmd_target_start(config, args)
         if args.command == "target" and args.target_command == "complete":
             return _cmd_target_complete(config, args)
+        if args.command == "target" and args.target_command == "checkpoint":
+            return _cmd_target_checkpoint(config, args)
+        if args.command == "target" and args.target_command == "resume":
+            return _cmd_target_resume(config, args)
         if args.command == "status":
             return _cmd_status(config, args)
         if args.command == "report":

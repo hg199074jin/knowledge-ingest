@@ -19,6 +19,8 @@ class SkillNames(BaseModel):
     quark: str
     cangjie: str
     personal_distiller: str
+    # v0.3：family_router 是最小验证实例；保留旧四键
+    family_router: str = "family-router-builder"
 
 
 class ProcessingConfig(BaseModel):

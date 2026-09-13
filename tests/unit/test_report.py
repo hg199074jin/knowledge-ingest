@@ -33,7 +33,7 @@ def make_manifest() -> "object":
     manifest.docchunk.status = "verified"
     manifest.docchunk.corpus_path = Path("/Volumes/ORICO/LongDocCorpus/x")
     manifest.docchunk.verify = "PASS"
-    manifest.personal.status = "pending"
+    manifest.targets["personal"].status = "PENDING"
     return manifest
 
 
@@ -82,22 +82,38 @@ def test_event_log_appends_and_redacts(tmp_path: Path):
 
 def test_build_status_fields():
     manifest = make_manifest()
-    manifest.cangjie.status = "waiting_user"
-    manifest.cangjie.waiting_for = "stage0_overview"
+    manifest.targets["cangjie"].status = "WAITING_USER"
+    manifest.targets["cangjie"].waiting_for = "stage0_overview"
     status = build_status(manifest)
     assert status["overall"] == "CORPUS_READY"
     assert status["transcribe"] == "success 0/2"
     assert status["docchunk"] == "verified PASS"
-    assert status["cangjie"].startswith("waiting_user: stage0_overview")
-    assert status["personal"] == "pending"
+    assert status["targets"]["cangjie"].startswith(
+        "WAITING_USER: stage0_overview")
+    assert status["targets"]["personal"] == "PENDING"
+    # 兼容键
+    assert status["cangjie"] == status["targets"]["cangjie"]
+    assert status["personal"] == status["targets"]["personal"]
     assert status["source"].startswith("success")
+
+
+def test_build_status_includes_reason():
+    manifest = make_manifest()
+    manifest.targets["family_router"] = type(
+        manifest.targets["cangjie"])(depends_on=["cangjie"])
+    manifest.targets["family_router"].status = "SKIPPED"
+    manifest.targets["family_router"].reason = "dependency_skipped"
+    status = build_status(manifest)
+    assert status["targets"]["family_router"] == \
+        "SKIPPED (dependency_skipped)"
 
 
 def test_render_report_has_required_sections():
     manifest = make_manifest_with_error("boom")
     report = render_report(manifest)
     for marker in ("请求", "来源", "源指纹", "路由统计", "转写产物",
-                   "Corpus", "Cangjie", "Personal", "排除", "失败", "恢复"):
+                   "Corpus", "Cangjie", "Personal", "Targets",
+                   "target_outputs", "排除", "失败", "恢复"):
         assert marker in report, f"missing section: {marker}"
 
 

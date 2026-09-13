@@ -36,10 +36,10 @@
 | DOCCHUNKING | `preprocess`（重建 handoff 后先查 CorpusCache；命中且 verify PASS 即复用） | 重复 OCR/chunk |
 | VERIFYING | `preprocess`（直接对 corpus_path 执行 verify） | 重新 split |
 | CORPUS_READY | `next` → invoke target（从蒸馏开始） | 重新 preprocess |
-| DISTILLING_CANGJIE / DISTILLING_PERSONAL | `next` → invoke target；**先读原 Skill 断点文件**：Cangjie 的 `PIPELINE_STATE.md`（manifest.cangjie.pipeline_state）；Personal 产物 YAML 元数据中的命名状态 | 从原 PDF/视频重新开始 |
+| TARGET_RUNNING（v0.3，替代 DISTILLING_*） | `next` → invoke target（active_target 指明谁在跑）；**先读原 Skill 断点文件**：Cangjie 的 `PIPELINE_STATE.md`（`targets.cangjie.pipeline_state`）或 `target checkpoint` 登记的 checkpoint_path/evidence_dir；Personal 产物 YAML 元数据中的命名状态 | 从原 PDF/视频重新开始 |
 | WAITING_USER | `next` → ask_user；把 gate 问题原样重新展示给用户 | 伪造用户确认 |
-| BLOCKED | `next` → resolve_blocked；读 errors[-1].reason，按下方策略处理 | 静默忽略失败 |
-| FAILED / COMPLETED | 终态；仅报告 | — |
+| BLOCKED | `next` → resolve_blocked；读 errors[-1].reason，按下方策略处理；target 级 BLOCKED（budget/breaker）→ 修复后 `target resume JOB --target T` 显式恢复 | 静默忽略失败 |
+| FAILED / COMPLETED / PARTIAL | 终态；仅报告（COMPLETED Job `job amend --add-target` 可显式重入 CORPUS_READY） | — |
 
 ## BLOCKED 恢复策略
 
@@ -56,6 +56,7 @@
 | `source_incomplete` / `source_missing` / `provider_mismatch` / `invalid_handoff_schema` | Source Handoff 未达完成门：重新完成下载并生成合规 handoff 后再 register |
 | `baidu_scope_limited` | 两种恢复：把文件移到"我的应用数据/bdpan"，或提供分享链接 |
 | `collection_incomplete` | 补齐缺失转写/文档，或用户明确排除后重跑 |
+| `budget_exhausted` / `breaker_open` / `case_retry_exceeded`（target 级，v0.3） | 外部调用预算耗尽 / 熔断器打开 / 单 case 重试超限。修复手段：`budget amend JOB --target T --max-external-calls N`（或 `--max-retries-per-case`）；等限流窗口过后 breaker 由 success 双清零。**注意：修改预算 ≠ 自动恢复**——必须显式 `target resume JOB --target T`（依赖已全 COMPLETED 才 READY，否则 PENDING；overall 恢复为 CORPUS_READY 或 TARGET_RUNNING）。绝不自动恢复 BLOCKED |
 
 ## 状态文件分工
 
