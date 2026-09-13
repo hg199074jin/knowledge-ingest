@@ -8,7 +8,8 @@
 - round-trip 保序（规格 2：声明顺序决定先运行谁，序列化必须保序）
 """
 
-import yaml
+from datetime import UTC
+
 import pytest
 
 from knowledge_ingest.manifest_store import (
@@ -22,9 +23,9 @@ from knowledge_ingest.targets import REGISTRY
 
 
 def make_manifest(targets=("cangjie", "personal"), status="CORPUS_READY"):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return JobManifest(
         job_id="20260913-000000-local-v03",
         created_at=now, updated_at=now, status=status,
@@ -52,9 +53,9 @@ def test_registry_declares_frozen_targets():
 
 
 def test_v1_manifest_migrates_to_targets_dict():
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     v1 = {
         "schema_version": 1,
         "job_id": "20260906-120000-quark-course",
@@ -75,9 +76,9 @@ def test_v1_manifest_migrates_to_targets_dict():
 
 
 def test_v1_distilling_statuses_migrate_to_target_running():
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     base = {
         "schema_version": 1,
         "job_id": "j", "created_at": now, "updated_at": now,
@@ -107,9 +108,9 @@ def test_v1_distilling_statuses_migrate_to_target_running():
 
 
 def test_v1_unknown_target_status_fails_fast():
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     v1 = {
         "schema_version": 1,
         "job_id": "j", "created_at": now, "updated_at": now,
@@ -118,7 +119,9 @@ def test_v1_unknown_target_status_fails_fast():
                     "source": "/tmp/x", "targets": ["cangjie"]},
         "cangjie": {"status": "warp_drive"},
     }
-    with pytest.raises(Exception):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
         JobManifest.model_validate(v1)
 
 

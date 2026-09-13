@@ -9,7 +9,7 @@ from pydantic import BaseModel, field_validator
 from pydantic.fields import Field as pydantic_field
 
 
-def _default_processing() -> "ProcessingConfig":
+def _default_processing() -> ProcessingConfig:
     return ProcessingConfig()
 
 
@@ -57,7 +57,7 @@ class AppConfig(BaseModel):
         return [Path(v).expanduser().resolve() for v in values]
 
     @classmethod
-    def load(cls, path: Path | None) -> "AppConfig":
+    def load(cls, path: Path | None) -> AppConfig:
         if path is None:
             path = _default_config_path()
         return cls.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))

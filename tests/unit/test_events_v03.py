@@ -2,9 +2,7 @@
 
 import json
 
-from knowledge_ingest.cli import _cmd_route
-from tests.unit.test_preprocess_cli import (FakeDocchunk, FakeMedia,
-                                            make_media_job, run_preprocess)
+from tests.unit.test_preprocess_cli import FakeDocchunk, FakeMedia, make_media_job, run_preprocess
 
 
 def _events(config, job_id) -> list[dict]:
@@ -23,7 +21,7 @@ def _run(config, job_id, monkeypatch, fail_media=False):
 
 
 def test_run_id_invariant(tmp_path, monkeypatch):
-    config, store, job_id = make_media_job(tmp_path, {"01.mp4": b"v"})
+    config, _store, job_id = make_media_job(tmp_path, {"01.mp4": b"v"})
     assert _run(config, job_id, monkeypatch) == 0
     events = _events(config, job_id)
     started = [e for e in events if e["event"] == "preprocess_started"]
@@ -56,7 +54,7 @@ def test_media_output_ready_fields(tmp_path, monkeypatch):
 
 
 def test_media_failed_event_and_finished_failed(tmp_path, monkeypatch):
-    config, store, job_id = make_media_job(tmp_path, {"01.mp4": b"v"})
+    config, _store, job_id = make_media_job(tmp_path, {"01.mp4": b"v"})
     rc = _run(config, job_id, monkeypatch, fail_media=True)
     assert rc == 1
     events = _events(config, job_id)
@@ -88,7 +86,7 @@ def test_second_run_emits_cache_reused(tmp_path, monkeypatch):
 
 
 def test_route_emits_routed_event(tmp_path, monkeypatch):
-    config, store, job_id = make_media_job(tmp_path, {"01.mp4": b"v"})
+    config, _store, job_id = make_media_job(tmp_path, {"01.mp4": b"v"})
     routed = [e for e in _events(config, job_id) if e["event"] == "routed"]
     assert len(routed) == 1
     assert routed[0]["effective_media"] == 1

@@ -71,7 +71,7 @@ def test_media_transcribed_events_persisted_per_file(tmp_path, monkeypatch):
 
 def test_manifest_persisted_mid_transcription(tmp_path, monkeypatch):
     """转写循环内每个文件完成即落盘（不等阶段结束）。"""
-    config, store, job_id = make_media_job(tmp_path, {"01.mp4": b"v"})
+    config, _store, job_id = make_media_job(tmp_path, {"01.mp4": b"v"})
     seen_during = []
 
     real_save = ManifestStore.save
@@ -153,7 +153,7 @@ def test_resume_skips_locked_job(tmp_path, capsys):
     # v0.3：判活改为 flock 探测——测试必须真正持有锁
     fd = hold_flock(store.job_dir(job_id) / ".preprocess.lock")
     try:
-        rc = _cmd_resume(config, Namespace(job=None, exec_run=False))
+        _cmd_resume(config, Namespace(job=None, exec_run=False))
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -247,7 +247,7 @@ def test_distill_prepare_idempotent(tmp_path):
 
 
 def test_distill_prepare_requires_corpus(tmp_path):
-    config, store, job_id = make_doc_job(tmp_path, status="TRANSCRIBING")
+    config, _store, job_id = make_doc_job(tmp_path, status="TRANSCRIBING")
     rc = _cmd_distill_prepare(config, Namespace(job_id=job_id,
                                                 target="cangjie"))
     assert rc == 2

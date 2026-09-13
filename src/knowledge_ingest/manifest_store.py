@@ -7,10 +7,10 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterator
 
 import yaml
 
@@ -32,7 +32,7 @@ class LockWaitTimeout(RuntimeError):
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 @contextmanager
@@ -73,7 +73,7 @@ def flock_ctx(
         os.lseek(fd, 0, os.SEEK_SET)
         os.ftruncate(fd, 0)
         os.write(fd, f"pid={os.getpid()} "
-                     f"acquired_at={_now().isoformat()}".encode("utf-8"))
+                     f"acquired_at={_now().isoformat()}".encode())
         try:
             yield fd
         finally:

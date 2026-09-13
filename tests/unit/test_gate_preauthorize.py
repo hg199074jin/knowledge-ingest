@@ -4,7 +4,7 @@ preauthorize 发 grant → resolve 引用 grant（target/gate 匹配 + 未使用
 knowledge gate 拒绝预授权（registry 白名单）；personal 全门 = live。
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -19,8 +19,8 @@ from knowledge_ingest.next_action import (
 def make_manifest(targets=("cangjie",), status="CORPUS_READY") -> JobManifest:
     return JobManifest(
         job_id="20260913-000000-local-gate",
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
         status=status,
         request=JobRequest(raw_prompt="x", provider="local", source="/tmp/x",
                            targets=list(targets)),

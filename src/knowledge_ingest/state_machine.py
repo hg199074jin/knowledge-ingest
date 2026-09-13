@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from knowledge_ingest.models import (
     TERMINAL_TARGET_STATUSES,
@@ -74,7 +74,7 @@ def transition_to(
                 f"non-COMPLETED dependencies: {unmet}")
         manifest.active_target = new_active_target
     manifest.status = new_status
-    manifest.updated_at = datetime.now(timezone.utc)
+    manifest.updated_at = datetime.now(UTC)
     return manifest
 
 

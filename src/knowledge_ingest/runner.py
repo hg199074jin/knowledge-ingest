@@ -6,7 +6,7 @@ import hashlib
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 SECRET_FLAG = re.compile(
@@ -26,7 +26,7 @@ class CommandResult:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def safe_argv(argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -43,7 +43,7 @@ def safe_argv(argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
         if SECRET_FLAG.search(item) and not item.startswith("-"):
             continue
         if item.startswith("--") and "=" in item:
-            flag, _, value = item.partition("=")
+            flag, _, _ = item.partition("=")
             if SECRET_FLAG.search(flag):
                 kept[-1] = f"{flag}=[REDACTED]"
                 continue

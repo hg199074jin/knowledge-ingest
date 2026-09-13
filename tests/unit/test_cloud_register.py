@@ -139,6 +139,7 @@ def test_register_rejects_bad_schema_version(tmp_path: Path):
 
 def test_job_create_redacts_prompt(tmp_path: Path):
     from argparse import Namespace
+
     from knowledge_ingest.cli import _cmd_job_create
 
     config, store, existing = make_job(tmp_path, "local")

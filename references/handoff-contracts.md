@@ -42,7 +42,7 @@ canonical 文件：`jobs/<job-id>/handoff/target-<target>.yaml`
 
 ```yaml
 job_id: <job-id>
-target: cangjie | personal
+target: cangjie | personal | family_router
 corpus_path: /Volumes/ORICO/LongDocCorpus/<corpus-id>   # 已 verify PASS
 source:
   provider: quark
@@ -52,6 +52,12 @@ source:
 first_pilot: true            # cangjie：是否首次试点
 depth: null                  # personal：A/B/C；null=原 Skill 默认（实测默认 C）
 obsidian_vault: /Volumes/ORICO/Obsidian/Skill_Library   # personal 专用
+input_manifest: <job-dir>/handoff/cangjie-output-manifest.json   # family_router 专用（cangjie COMPLETED 才指向，否则 null）
+budget:                      # family_router 专用（规格 9，两阶段 acquire/outcome）
+  mode: balanced             # economy | balanced | full
+  max_external_calls: 20
+  max_retries_per_case: 1
+  breaker: {consecutive_empty: 3, consecutive_rate_limit: 2}
 purpose: 用户原始要求
 provenance_manifest: /Volumes/ORICO/KnowledgePipeline/jobs/<job>/job.yaml
 output_preference: auto
@@ -82,6 +88,55 @@ output_preference: auto
 5. workflow-states 命名门映射见 `references/target-gates.md`；安装必须用户明示授权。
 6. 完成后：`knowledge-ingest target complete JOB --target personal --output-path ...`。
 
-## 5. 串行顺序
+## 5. 依赖与顺序（依赖 ≠ 排序）
 
-`CORPUS_READY → Cangjie → Personal → COMPLETED`；不并行，不重复 docchunk。
+依赖只决定"能不能启动"（`depends_on` 全 COMPLETED 才 READY）；
+**声明顺序决定执行顺序**（一次只允许一个 RUNNING/WAITING_USER target）：
+
+| target | depends_on | 说明 |
+|---|---|---|
+| `cangjie` | `[]` | 独立可启动 |
+| `family_router` | `[cangjie]` | cangjie COMPLETED 后才 READY |
+| `personal` | `[]` | 独立可启动；与 cangjie 同时请求时按声明顺序先 cangjie 后 personal |
+
+`CORPUS_READY → 按声明顺序逐 target → COMPLETED / PARTIAL / FAILED`；
+不并行，不重复 docchunk。
+
+## 6. Family Router 契约（knowledge-ingest → family-router-builder）
+
+target handoff：`jobs/<job-id>/handoff/target-family_router.yaml`
+（`distill prepare --target family_router` 自动生成），在通用字段之上追加：
+
+```yaml
+input_manifest: /Volumes/ORICO/KnowledgePipeline/jobs/<job>/handoff/cangjie-output-manifest.json
+budget:
+  mode: balanced
+  max_external_calls: 20
+  max_retries_per_case: 1
+  breaker:
+    consecutive_empty: 3
+    consecutive_rate_limit: 2
+```
+
+规则：
+
+1. **input_manifest** 引用 cangjie 的 output manifest
+   （`cangjie-output-manifest.json`，cangjie COMPLETED 时由
+   `target complete` 事务生成并登记到 `targets.cangjie.output_manifest`）；
+   cangjie 未完成时写 `null`——router 不得自行猜测输入，宁可 BLOCKED。
+2. **budget 是协作式预算声明**（规格 9/16）：router 每次外部调用前
+   `budget acquire`（`request_id` 幂等，重放不重复计数），调用后
+   `budget outcome --result success|empty|rate_limit`；quota/breaker/case-retry
+   任一触发 → target BLOCKED。改上限用 `budget amend`（**改 ≠ 恢复**），
+   恢复必须显式 `target resume`。KI 不拦截宿主任意其他外部调用——绕过
+   acquire 的调用不受预算保护、不进审计（诚实边界见 SKILL.md）。
+3. 运行 cwd：`<pipeline_root>/distill/<job>/family_router/`；
+   `evidence_root = <pipeline_root>/distill/<job>/family_router/evidence/`
+   （逐案例证据落这里；`target checkpoint --evidence` 登记进 manifest）。
+4. **ROUTER_BUILD_STATE.md 约定**：router 自身断点文件放 cwd 根，记录
+   已完成 case 与当前 phase；中断恢复时先读它 + manifest 的
+   `checkpoint_path/evidence_dir`，再续跑，绝不重头跑已完成 case。
+5. 确认门 4 门顺序（necessity_gate → cost_budget_confirmed →
+   acceptance_report_reviewed → review_disposition_reviewed）与预授权语义见
+   `references/target-gates.md`；完成后
+   `target complete JOB --target family_router --output-path ...` 登记。

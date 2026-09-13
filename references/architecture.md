@@ -8,21 +8,27 @@
                           │  编排：意图/云盘 Skill/蒸馏 Skill/确认门
                           ▼
                 knowledge-ingest (Python CLI)
-                          │  状态/指纹/路由/调用/缓存/报告
+                          │  状态/指纹/路由/调用/缓存/预算/报告
         ┌─────────────────┼─────────────────┐
         ▼                 ▼                 ▼
    baidu-drive       quarkclouddrive      Local
         └─────────────────┼─────────────────┘
                           ▼
-              File Type Router (router.py)
+              File Type Router (router.py + encoding.py 预检)
                 ├─ Document → docchunk
                 └─ Media → media-transcriber → docchunk
                           ▼
               docchunk Corpus (verify PASS 硬门)
-                  ├─ cangjie-skill
-                  └─ personal-capability-distiller
                           ▼
-                   Final Job Report
+              Generic Target Runtime (targets.py)
+                ├─ cangjie-skill          depends_on []
+                ├─ personal-capability-distiller  depends_on []
+                └─ family-router-builder  depends_on [cangjie]
+                          │  Budget Guard (budget.py，协作式 acquire/outcome)
+                          │  Gate 预授权（preauthorizable_gates 白名单）
+                          │  Output Manifest (output_manifest.py)
+                          ▼
+                   Final Job Report（含"运行审计"段）
 ```
 
 ## 模块
@@ -41,8 +47,13 @@
 | `runner.py` | 无 shell subprocess；spawn/poll 长任务；安全日志 |
 | `cache.py` | Transcript/Corpus 缓存（复用前强制重校验） |
 | `collection.py` | 混合课程 Document Set（symlink + provenance map） |
-| `next_action.py` | next 协议、gate enter/resolve、target complete |
-| `report.py` | status/report + 事件日志 + 脱敏 |
+| `next_action.py` | next 协议、gate enter/resolve/preauthorize、target start/complete/checkpoint/resume |
+| `targets.py` | Generic Target Registry（数据驱动：depends_on、preauthorizable_gates、output manifest、handoff 钩子） |
+| `budget.py` | 外部调用预算守卫（acquire/outcome 两阶段幂等 + 熔断器 + amend） |
+| `output_manifest.py` | target 产物清单（决定性渲染；complete 时事务落 handoff/） |
+| `watchdog.py` | 重启看门狗安装器（动态路径 ki-resume.sh + LaunchAgent plist） |
+| `encoding.py` | 流式严格 UTF-8 预检（只 BLOCKED 上报，不转码不猜编码） |
+| `report.py` | status/report（含"运行审计"段）+ 事件日志 + 脱敏 |
 
 ## 运行时目录
 
@@ -51,7 +62,7 @@
 ├── jobs/<job-id>/{job.yaml, source/, handoff/{source.json, document-set/},
 │                  reports/final.md, logs/events.jsonl}
 ├── cache/{transcript-index.json, corpus-index.json}
-├── distill/<job-id>/{cangjie/, personal/}     # 原 Skill 运行 cwd（断点文件落这里）
+├── distill/<job-id>/{cangjie/, personal/, family_router/}   # 原 Skill 运行 cwd（断点文件落这里；family_router 另有 evidence/）
 └── tmp/
 ```
 

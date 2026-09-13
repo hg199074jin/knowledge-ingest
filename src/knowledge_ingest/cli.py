@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import fcntl
+import functools
 import json
 import os
 import re
@@ -12,6 +12,7 @@ import sys
 import time
 import uuid
 from dataclasses import asdict
+from datetime import UTC
 from pathlib import Path
 
 from knowledge_ingest.config import AppConfig
@@ -23,6 +24,8 @@ from knowledge_ingest.router import effective_paths, route_source
 from knowledge_ingest.state_machine import InvalidTransition, transition_to
 from knowledge_ingest.targets import (
     get as get_target,
+)
+from knowledge_ingest.targets import (
     target_choices,
 )
 
@@ -558,7 +561,7 @@ def _cmd_route(config: AppConfig, args) -> int:
 
 @_locked
 def _cmd_preprocess(config: AppConfig, args) -> int:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from knowledge_ingest.adapters.docchunk import DocchunkAdapter
     from knowledge_ingest.adapters.media import MediaAdapter
@@ -632,7 +635,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
                 tsm(manifest, "TRANSCRIBING")
             manifest.media.status = "running"
             manifest.media.started_at = manifest.media.started_at or \
-                datetime.now(timezone.utc)
+                datetime.now(UTC)
             manifest.media.outputs = []   # 重入时重建（缓存让重建零成本）
             store.save_section(manifest, ["status", "media"])
 
@@ -706,7 +709,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
                      cache_key=entry.cache_key, duration_ms=duration_ms,
                      attempt=1)
             manifest.media.status = "success"
-            manifest.media.completed_at = datetime.now(timezone.utc)
+            manifest.media.completed_at = datetime.now(UTC)
 
         if manifest.status in {"ROUTING", "TRANSCRIBING"}:
             tsm(manifest, "DOCCHUNKING")
@@ -1097,7 +1100,7 @@ def _cmd_resume(config: AppConfig, args) -> int:
 
 
 def _cmd_job_amend(config: AppConfig, args) -> int:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from knowledge_ingest.next_action import propagate_dependencies
 
@@ -1126,7 +1129,7 @@ def _cmd_job_amend(config: AppConfig, args) -> int:
             manifest.status = "CORPUS_READY"
             manifest.active_target = None
             manifest.gate_history.append({
-                "ts": datetime.now(timezone.utc).isoformat(),
+                "ts": datetime.now(UTC).isoformat(),
                 "action": "amend_reenter", "target": args.add_target,
             })
         print(f"targets: {manifest.request.targets}")
@@ -1206,8 +1209,8 @@ def _cmd_distill_prepare(config: AppConfig, args) -> int:
             "  author_or_speaker: null",
             "  publication_date: null",
             f"purpose: {manifest.request.raw_prompt}",
-            f"provenance_manifest: "
-            f"{store.job_dir(manifest.job_id) / 'job.yaml'}",
+            (f"provenance_manifest: "
+             f"{store.job_dir(manifest.job_id) / 'job.yaml'}"),
         ]
         if runtime.handoff_extra is not None:
             lines.extend(runtime.handoff_extra(

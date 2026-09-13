@@ -37,12 +37,15 @@ Python CLI（`knowledge-ingest`）负责状态、指纹、路由、调用 media-
 5.  route                        # 文件类型分流（documents/media/unsupported）
 6.  preprocess（后台）           # 媒体转写 → Document Set → docchunk split → verify
 7.  🔴 STOP：确认 docchunk verify PASS  # 硬门；FAIL 一律 BLOCKED，禁止蒸馏
-8.  distill prepare + target start    # 脚手架 distill 工作区 → CORPUS_READY → DISTILLING_*
+8.  distill prepare + target start    # --target cangjie|personal|family_router（一次只一个 RUNNING）
 9.  invoke target skill          # 按 references/handoff-contracts.md 传 target handoff
-10. 🔴 CHECKPOINT：gate enter / 真实用户确认 / gate resolve   # 确认门映射见 references/target-gates.md
+10. 🔴 CHECKPOINT：gate enter / 真实用户确认 / gate resolve
+    # 确认门映射见 references/target-gates.md；白名单 operational gate 可用
+    # gate preauthorize 发 grant，夜间 resolve --preauthorization 引用（规格 10）
 11. target complete [--pipeline-state PATH]
-12. next                         # 双 target 时先 Cangjie 后 Personal
-13. final report                 # knowledge-ingest report JOB → reports/final.md
+12. next                         # 依赖≠排序：cangjie [] / personal [] / family_router [cangjie]；
+                                 # 声明顺序=执行顺序
+13. final report                 # knowledge-ingest report JOB → reports/final.md（含"运行审计"段）
 ```
 
 每次会话开始时：先 `doctor`，再 `resume`（一条命令给出全部 Job 的下一步）；
@@ -53,7 +56,7 @@ Python CLI（`knowledge-ingest`）负责状态、指纹、路由、调用 media-
 ```text
 禁止重新实现 OCR/ASR/chunking
 禁止 verify FAIL 后蒸馏
-禁止伪造用户确认（gate resolve 只能来自真实用户回复）
+禁止伪造用户确认（gate resolve 只能来自真实用户回复或本人白天发放的 preauthorization grant）
 禁止读取云盘 Token/Cookie/授权码配置（~/.config/bdpan 等一律不碰）
 禁止自动删除/移动云端源文件
 禁止自动上传蒸馏结果
@@ -61,28 +64,41 @@ Python CLI（`knowledge-ingest`）负责状态、指纹、路由、调用 media-
 禁止用 Quark 5 条 preview 代替完整 Search/Browse Artifact
 禁止把多课程粗暴拼成一个失去来源边界的 Markdown
 禁止修改 media-transcriber / docchunk / cangjie-skill / personal-capability-distiller 核心代码
+禁止 KI 转码或猜测文件编码（TextEncodingError → BLOCKED 交用户处理；这是 v0.3 批准的
+  最小例外——只预检上报、不转码；docchunk 其余红线不变）
 ```
 
 ## CLI 速查
 
 ```bash
 knowledge-ingest doctor --config ./config.yaml [--json]
-knowledge-ingest job create --provider local|baidu|quark --source "..." --target cangjie [--target personal] --prompt "..."
+knowledge-ingest job create --provider local|baidu|quark --source "..." \
+  --target cangjie [--target personal] [--with-router [family_router]] --prompt "..."
 knowledge-ingest resume [--job JOB] [--exec]   # 全部 Job 的下一步；--exec 自动续跑第一个
 knowledge-ingest source init JOB --provider来源自动 [--remote-path ...] [--local-path DIR] [--note ...]
 knowledge-ingest source register JOB --handoff source.json
-knowledge-ingest job amend JOB --add-target cangjie|personal   # preprocess 运行中会被锁拒绝
+knowledge-ingest job amend JOB --add-target cangjie|personal|family_router  # preprocess 运行中会被锁拒绝
 knowledge-ingest route JOB [--exclude PATH ...]
 knowledge-ingest preprocess JOB          # 长任务：放后台跑，轮询 status（每文件实时落盘）
-knowledge-ingest distill prepare JOB --target cangjie|personal  # 脚手架 distill 工作区 + handoff
+knowledge-ingest distill prepare JOB \
+  --target cangjie|personal|family_router   # 脚手架 distill 工作区 + handoff
 knowledge-ingest status JOB [--json]
 knowledge-ingest next JOB --json
-knowledge-ingest target start JOB --target cangjie   # CORPUS_READY -> DISTILLING_*
+knowledge-ingest target start JOB --target cangjie   # CORPUS_READY -> TARGET_RUNNING
 knowledge-ingest gate enter JOB --target cangjie --name GATE
-knowledge-ingest gate resolve JOB --target cangjie --name GATE --decision confirmed|rejected
+knowledge-ingest gate resolve JOB --target cangjie --name GATE \
+  --decision confirmed|rejected [--preauthorization GRANT_ID]  # 引用 grant 时不再传 value
+knowledge-ingest gate preauthorize JOB --target cangjie \
+  --name stage5_install_location --value VALUE   # 仅白名单 gate（规格 10；知识门拒绝预授权）
+knowledge-ingest budget acquire JOB --target T --host HOST --case-id C --request-id R
+knowledge-ingest budget outcome JOB --permit PERMIT --result success|empty|rate_limit
+knowledge-ingest budget amend JOB --target T --max-external-calls N   # 改上限 ≠ 自动恢复 BLOCKED
+knowledge-ingest target checkpoint JOB --target T --phase PHASE [--checkpoint PATH] [--evidence DIR]
+knowledge-ingest target resume JOB --target T     # BLOCKED 显式恢复（唯一出口，规格 9）
 knowledge-ingest target complete JOB --target cangjie --output-path PATH \
   [--pipeline-state PATH]                              # cangjie: 登记断点文件
-knowledge-ingest report JOB
+knowledge-ingest watchdog install|status|uninstall    # 重启看门狗（LaunchAgent，动态路径）
+knowledge-ingest report JOB                           # reports/final.md（含"运行审计"段）
 ```
 
 ## 长任务纪律
@@ -95,6 +111,42 @@ knowledge-ingest report JOB
 - 重启/断电后：watchdog（`knowledge-ingest watchdog install` 安装的 LaunchAgent）每 15 分钟自动
   `resume --exec`；preprocess 持 pidfile 锁，绝不与运行中进程重叠。
 
+## 夜间模式工作流
+
+- **operational gate 可 preauthorize**（白名单：cangjie `stage5_install_location`、
+  family_router `cost_budget_confirmed`，见 references/target-gates.md）：
+  白天让用户给定值（安装位置 / 预算档位）→ `gate preauthorize --value ...` 发 grant；
+  夜间跑到该门时 `gate resolve --preauthorization pa_... --decision confirmed` 引用 grant
+  自动过门。value 来自用户的白天决定，夜间不新增任何自由裁量。
+- **knowledge gate 必须 live**（cangjie `stage0_overview` / `stage1_5_candidates`、
+  Personal 全部门、family_router `necessity_gate` / `acceptance_report_reviewed` /
+  `review_disposition_reviewed`）：夜间跑到知识门**自动停**（WAITING_USER），
+  产出门问题 + 上下文（Review Bundle）等用户回复；`gate resolve --preauthorization`
+  对知识门一律被 CLI 拒绝。watchdog 的 `resume --exec` 只续跑 preprocess，绝不替用户答门。
+
+## 评测口径规范（规格 12）
+
+蒸馏产物/Skill 的评测分数只允许三分口径，禁止混称：
+
+- **Blind**：蒸馏前不知道具体题目的盲测——衡量真实泛化。
+- **Regression**：对既有通过集的重跑——衡量改动没有变差。
+- **Holdout**：保留集终验——衡量"终版"水平。
+
+诚实约束：
+
+- 改过 description/技能文本后**未重跑原通过集** → 禁止声称"终版 100%"。
+- **修改过题目本身** → 历史分数作废，禁止新旧分数拼接宣传。
+- 报告/审计只引用可复现的分数并标注口径；manifest 无 scores 字段时审计段不展示分数。
+
+## 诚实边界（规格 16）
+
+- **Budget Guard 是协议级/协作式守卫**：它约束的是"经 KI 登记的外部调用"
+  （`budget acquire` → 调用 → `budget outcome`）。KI 不拦截、不监控宿主 Agent 的
+  任意其他外部调用；绕过 acquire 直接调外部 API 不受预算保护，也不进审计。
+- **"并行 ≤ 3"是宿主经验值**（media-transcriber/MinerU 本机资源实测），
+  **不是 KI 的架构约束**；KI 层面的串行保证只有一个：同时最多一个
+  RUNNING/WAITING_USER target（状态机强制）。
+
 ## 失败模式速查（if-then）
 
 | 症状 | 一线修复 | 仍失败兜底 |
@@ -103,6 +155,7 @@ knowledge-ingest report JOB
 | 想加 distill target 但 amend 被锁拒绝 | 等 preprocess 退出再 `job amend --add-target personal` | 用 `next` 确认顺序；complete 后链式也能接上 |
 | `status` 长时间 "running 0/N" | 正常——逐文件落盘后看 events.jsonl 的 media_output_ready 计数（按 run_id/outcome 统计） | 若 events 也停滞：检查 MediaTranscriber output 目录增长 |
 | `BLOCKED: text_encoding_unsupported` | 文档非 UTF-8（detected_encoding 见 errors）：转码或 `route --exclude` 后重新 route | KI 不转码不猜编码（规格 14） |
+| `BLOCKED`（budget_exhausted / breaker_open / case_retry_exceeded） | `budget amend JOB --target T --max-external-calls N` 改上限（改 ≠ 恢复）；限流窗口过后 breaker 由 success 双清零 | `target resume JOB --target T` 显式恢复；语义见 references/recovery.md |
 | source.json 手写易错 | `source init --local-path DIR --remote-path apps/bdpan/...`（校验存在+算指纹） | register 的完成门会拦下坏 handoff，按报错修字段 |
 | quark CLI 报 code -104 | 所有 quark 调用加 `CLAUDECODE=1` 前缀（配置按 Agent 身份分桶） | 见 references/cloud-sources.md |
 | distill 工作区/断点文件遗漏 | `distill prepare JOB --target X`（幂等，不覆盖已有 PIPELINE_STATE） | 手工补 books/ 目录与 handoff，契约见 handoff-contracts.md |
@@ -113,7 +166,7 @@ knowledge-ingest report JOB
 - `references/architecture.md` — 架构与目录
 - `references/routing.md` — 文件类型路由规则
 - `references/cloud-sources.md` — 百度/夸克 Adapter 与范围限制
-- `references/target-gates.md` — 确认门映射（Cangjie 3 处 / Personal 命名状态）
+- `references/target-gates.md` — 确认门映射（Cangjie 3 处 / Personal 命名状态 / Family Router 4 门）与预授权语义
 - `references/recovery.md` — 断点续跑策略
 - `references/handoff-contracts.md` — Source/Target handoff 契约
 - `docs/runtime-inventory.md` — 本机实测基线（升级组件后先更新）

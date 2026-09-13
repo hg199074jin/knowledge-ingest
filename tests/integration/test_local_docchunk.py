@@ -1,8 +1,8 @@
 """Real docchunk integration: TXT fixture -> verified corpus (isolated corpus root)."""
 
-import pytest
-
 from pathlib import Path
+
+import pytest
 
 from knowledge_ingest.adapters.docchunk import DocchunkAdapter
 from knowledge_ingest.config import AppConfig

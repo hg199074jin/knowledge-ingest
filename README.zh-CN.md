@@ -69,17 +69,24 @@ exec uv run knowledge-ingest "$@"
 ## 快速上手
 
 ```bash
-knowledge-ingest job create --provider local --source /path/book.pdf --target cangjie
+knowledge-ingest job create --provider local --source /path/book.pdf \
+  --target cangjie [--with-router [family_router]]
+knowledge-ingest source init JOB --local-path DIR [--remote-path ...]  # 生成 handoff
 knowledge-ingest source register JOB --handoff source.json   # 云盘下载完成后
 knowledge-ingest route JOB
 knowledge-ingest preprocess JOB       # 长任务：放后台跑，轮询 status
-knowledge-ingest status JOB
+knowledge-ingest status JOB / resume  # resume = 一条命令列出全部 Job 的下一步
 knowledge-ingest next JOB --json
+knowledge-ingest distill prepare JOB --target cangjie   # 脚手架 distill 工作区
 knowledge-ingest target start JOB --target cangjie
 knowledge-ingest gate enter JOB --target cangjie --name GATE
 knowledge-ingest gate resolve JOB --target cangjie --name GATE --decision confirmed
+knowledge-ingest gate preauthorize JOB --target cangjie --name GATE --value VALUE  # 仅白名单 gate
+knowledge-ingest budget acquire|outcome|amend JOB --target T [...]  # 两阶段外部调用预算
+knowledge-ingest target checkpoint|resume JOB --target T [...]      # 断点 / BLOCKED 显式恢复
 knowledge-ingest target complete JOB --target cangjie --output-path PATH
-knowledge-ingest report JOB
+knowledge-ingest watchdog install|status|uninstall  # 重启看门狗（LaunchAgent，动态路径）
+knowledge-ingest report JOB           # 含"运行审计"段
 ```
 
 作为 Agent Skill 的自然语言入口："把百度网盘里的 XX 做成 skill"、
@@ -96,6 +103,30 @@ knowledge-ingest report JOB
 | `schemas/` | Source/Target handoff 契约示例 |
 | `docs/` | 设计文档 v1.1、实施计划 v1.1、Runtime Inventory、验收记录 |
 | `tests/` | 单元 + 集成测试（全程 TDD） |
+
+## v0.3.0 — 通用 Target Runtime + 预算守卫
+
+- **Generic Target Runtime**：target 即数据，不是代码分支。`cangjie`、
+  `personal` 与新增 `family_router`（depends_on `[cangjie]`）在同一个
+  registry 注册；依赖图、串行调度、per-target 断点（checkpoint）与
+  事务式 output manifest 全部统一。
+- **Budget Guard**（协议级/协作式）：两阶段 `budget acquire` / `budget outcome`，
+  permit 幂等、target 级配额、host 级熔断、case 级重试上限。KI 不拦截宿主任意
+  其他外部调用；BLOCKED 只能由显式 `target resume` 恢复——`budget amend`
+  绝不自动恢复状态。
+- **Gate 预授权**：白名单 operational gate（cangjie `stage5_install_location`、
+  family_router `cost_budget_confirmed`）支持白天发放 grant
+  （`gate preauthorize`），夜间 `gate resolve --preauthorization` 引用——
+  值仍然来自真实用户。知识门一律 live，设计上拒绝预授权。
+- **转写三分口径**：每个媒体产物记录 `transcribed` / `cache_reused` /
+  `unknown`；v1 历史保持 `unknown`，禁止反推补写。
+- **编码预检**：文本文件 preprocess 前流式严格 UTF-8 校验；异常即 BLOCKED
+  并带 detected_encoding——KI 不转码、不猜编码。
+- **watchdog 安装器**：`watchdog install|status|uninstall` 把生产实战的
+  重启看门狗产品化，路径全动态生成。
+- **审计报告段**：`report` 渲染"运行审计"段——阶段耗时、转写口径、预算
+  用量与诚实的 "unknown / not instrumented" 标注，全部来自 manifest 已有
+  字段（v1 迁移 manifest 渲染不崩）。
 
 ## 文档
 

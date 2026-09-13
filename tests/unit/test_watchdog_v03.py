@@ -55,7 +55,7 @@ def fake_home(tmp_path, monkeypatch):
 
 def test_install_generates_dynamic_script_and_plist(tmp_path, fake_home):
     config = make_config(tmp_path)
-    home, calls = fake_home
+    _home, calls = fake_home
     rc = watchdog.install(config)
     assert rc == 0
     script = config.pipeline_root / "bin" / "ki-resume.sh"

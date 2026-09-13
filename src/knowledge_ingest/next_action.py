@@ -13,7 +13,7 @@ v0.3 Part C（冻结规格 2/3/8/10/12/13）：
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -28,11 +28,11 @@ from knowledge_ingest.targets import get as get_target
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def target_state(manifest: JobManifest, target: str) -> TargetState:
@@ -86,7 +86,7 @@ def propagate_dependencies(manifest: JobManifest) -> None:
     changed = True
     while changed:
         changed = False
-        for name, state in manifest.targets.items():
+        for state in manifest.targets.values():
             if state.status not in {"PENDING", "READY"}:
                 continue
             dep_statuses = [manifest.targets[d].status

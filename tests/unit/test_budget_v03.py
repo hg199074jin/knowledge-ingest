@@ -6,7 +6,7 @@ amend（只改字段不恢复状态）、target resume（显式恢复出口）�
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -16,7 +16,7 @@ from knowledge_ingest.next_action import target_resume
 
 
 def make_manifest(targets=("family_router",)) -> JobManifest:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return JobManifest(
         job_id="20260913-000000-local-budget",
         created_at=now, updated_at=now, status="TARGET_RUNNING",

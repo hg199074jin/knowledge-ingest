@@ -11,13 +11,12 @@ from pathlib import Path
 
 import pytest
 
-import knowledge_ingest.targets as targets_module
 from knowledge_ingest.cli import (
     _build_parser,
     _cmd_budget,
-    _cmd_job_amend,
     _cmd_distill_prepare,
     _cmd_gate,
+    _cmd_job_amend,
     _cmd_next,
     _cmd_target_complete,
     _cmd_target_resume,
@@ -190,7 +189,7 @@ def test_e9_amend_family_router_pending_when_dep_unmet(env):
 def test_e14_reject_cangjie_propagates_skip_job_completes(env):
     """reject cangjie → family_router SKIPPED(dependency_skipped) →
     personal COMPLETED → Job COMPLETED。"""
-    config, store = env
+    _config, store = env
     job_id = _make_job(store, ["cangjie", "personal", "family_router"])
     with store.edit(job_id) as m:
         target_start(m, "cangjie")
@@ -220,7 +219,7 @@ def test_e14_reject_cangjie_propagates_skip_job_completes(env):
 def test_e14_failed_cangjie_propagates_skip_partial(env):
     """cangjie FAILED → family_router SKIPPED(dependency_failed) →
     personal COMPLETED → PARTIAL。"""
-    config, store = env
+    _config, store = env
     job_id = _make_job(store, ["cangjie", "personal", "family_router"])
     with store.edit(job_id) as m:
         target_start(m, "cangjie")
@@ -268,7 +267,7 @@ def test_with_router_ensures_entry_and_direct_dep_only(env):
 
 
 def test_with_router_default_is_family_router(env):
-    config, store = env
+    config, _store = env
     from knowledge_ingest.cli import _cmd_job_create
 
     rc = _cmd_job_create(config, Namespace(
@@ -278,7 +277,7 @@ def test_with_router_default_is_family_router(env):
 
 
 def test_with_router_unregistered_target_fails_fast(env):
-    config, store = env
+    config, _store = env
     from knowledge_ingest.cli import _cmd_job_create
 
     rc = _cmd_job_create(config, Namespace(
@@ -291,7 +290,6 @@ def test_with_router_unregistered_target_fails_fast(env):
 
 
 def test_gate_preauthorize_cli_full_chain(env):
-    import json as _json
 
     config, store = env
     job_id = _make_job(store, ["cangjie"])

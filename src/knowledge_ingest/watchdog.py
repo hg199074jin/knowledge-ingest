@@ -11,7 +11,6 @@ monkeypatch it — unit tests must never touch the real launchd.
 from __future__ import annotations
 
 import hashlib
-import os
 import plistlib
 import shutil
 import stat

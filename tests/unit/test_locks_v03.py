@@ -55,9 +55,8 @@ def test_flock_ctx_conflicts_between_independent_opens(tmp_path: Path):
     lock = tmp_path / "some.lock"
     fd = hold_flock(lock)
     try:
-        with pytest.raises(LockHeld):
-            with flock_ctx(lock, blocking=False):
-                pass
+        with pytest.raises(LockHeld), flock_ctx(lock, blocking=False):
+            pass
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -82,9 +81,8 @@ def test_flock_ctx_bounded_wait_times_out(tmp_path: Path):
     lock = tmp_path / "slow.lock"
     fd = hold_flock(lock)
     try:
-        with pytest.raises(LockWaitTimeout):
-            with flock_ctx(lock, blocking=True, timeout=0.2):
-                pass
+        with pytest.raises(LockWaitTimeout), flock_ctx(lock, blocking=True, timeout=0.2):
+            pass
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -110,19 +108,17 @@ def test_edit_reloads_latest_inside_lock(
 def test_edit_does_not_write_when_body_raises(
     store: ManifestStore, job_id: str
 ):
-    with pytest.raises(RuntimeError):
-        with store.edit(job_id) as manifest:
-            manifest.media.status = "running"
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), store.edit(job_id) as manifest:
+        manifest.media.status = "running"
+        raise RuntimeError("boom")
 
     loaded = store.load(job_id)
     assert loaded.media.status == "pending"  # 未落盘
 
 
 def test_edit_validates_before_write(store: ManifestStore, job_id: str):
-    with pytest.raises(ValidationError):
-        with store.edit(job_id) as manifest:
-            manifest.status = "NOT_A_STATUS"
+    with pytest.raises(ValidationError), store.edit(job_id) as manifest:
+        manifest.status = "NOT_A_STATUS"
 
     assert store.load(job_id).status == "CREATED"
 
@@ -315,7 +311,8 @@ def test_preprocess_double_open_subprocess_exits_3(tmp_path: Path):
         proc = subprocess.run(
             ["uv", "run", "knowledge-ingest", "preprocess", job_id,
              "--config", str(config_yaml)],
-            cwd=repo_root, capture_output=True, text=True, timeout=120)
+            cwd=repo_root, capture_output=True, text=True, timeout=120,
+            check=False)
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)

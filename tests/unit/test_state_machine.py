@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -7,7 +7,7 @@ from knowledge_ingest.state_machine import InvalidTransition, transition_to
 
 
 def make_manifest(status: str = "ROUTING") -> JobManifest:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return JobManifest(
         job_id="20260906-000000-local-test",
         created_at=now,

@@ -12,14 +12,13 @@ build_media_cache_key。本测试用固定输入（config_sha/glossary/hotwords 
 若发现不一致，按冻结规格停止并报告，不得让现有缓存失效。
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from knowledge_ingest.adapters.media import MediaAdapter
-from knowledge_ingest.cache import build_media_cache_key
-from knowledge_ingest.cache import build_transcript_cache_key
+from knowledge_ingest.cache import build_media_cache_key, build_transcript_cache_key
 from knowledge_ingest.runner import CommandResult
 
 # 与 cli.py 查询侧 / media.py put 侧现状一致的固定输入
@@ -57,7 +56,7 @@ def media_put_side_key(
         md.write_text("# 转写内容", encoding="utf-8")
         (output_root / "lesson01" / "metadata.yaml").write_text(
             "source: x\n", encoding="utf-8")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         return CommandResult(argv=tuple(argv), returncode=0, stdout=str(md),
                              stderr="", started_at=now, ended_at=now)
 

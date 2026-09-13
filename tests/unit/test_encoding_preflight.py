@@ -7,7 +7,6 @@ from knowledge_ingest.cli import _cmd_route
 from knowledge_ingest.encoding import detect_bom, preflight_utf8
 from knowledge_ingest.manifest_store import ManifestStore
 from knowledge_ingest.models import JobRequest
-
 from tests.unit.test_preprocess_cli import make_config
 
 GBK_HEAD = "第八课、实操如何参与平台活动_1.mp4".encode("gbk")
@@ -39,7 +38,7 @@ def _register_and_route(config, store, job_id, handoff):
     return _cmd_route(config, Namespace(job_id=job_id, excludes=[]))
 
 
-from types import SimpleNamespace as Namespace  # noqa: E402
+from types import SimpleNamespace as Namespace
 
 
 def test_detect_bom_priority(tmp_path: Path):
@@ -94,7 +93,7 @@ def test_route_blocks_gbk_document(tmp_path: Path):
 
 def test_route_utf8_bom_document_passes(tmp_path: Path):
     config, store, job_id, handoff = _route_only(
-        tmp_path, {"目录.txt": b"\xEF\xBB\xBF" + "第一章 起点\n".encode("utf-8"),
+        tmp_path, {"目录.txt": b"\xEF\xBB\xBF" + "第一章 起点\n".encode(),
                    "ok.mp4": b"v"})
     rc = _register_and_route(config, store, job_id, handoff)
     assert rc == 0

@@ -32,8 +32,8 @@ def test_symlinked_handoff_fingerprint_matches_direct(tmp_path: Path):
 
 
 def test_corpus_cache_key_changes_with_components(tmp_path: Path):
-    base = dict(handoff_fingerprint="sha256:h1",
-                docchunk_revision="e84e889", config_fingerprint="none")
+    base = {"handoff_fingerprint": "sha256:h1",
+            "docchunk_revision": "e84e889", "config_fingerprint": "none"}
     k1 = build_corpus_cache_key(**base)
     assert k1 == build_corpus_cache_key(**base)
     assert (build_corpus_cache_key(**{**base, "handoff_fingerprint": "sha256:h2"})

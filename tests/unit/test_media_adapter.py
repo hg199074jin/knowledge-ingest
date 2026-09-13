@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -18,7 +18,7 @@ def fake_run_factory(output_root: Path, stems: dict[str, str]):
         md.write_text("# 转写内容", encoding="utf-8")
         (output_root / stem / "metadata.yaml").write_text(
             "source: x\n", encoding="utf-8")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         from knowledge_ingest.runner import CommandResult
         return CommandResult(argv=tuple(argv), returncode=0, stdout=str(md),
                              stderr="", started_at=now, ended_at=now)
@@ -51,7 +51,7 @@ def test_transcribe_failure_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     from knowledge_ingest.runner import CommandResult
 
     def fail_run(argv, cwd, timeout=None):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         return CommandResult(argv=tuple(argv), returncode=1, stdout="",
                              stderr="asr boom", started_at=now, ended_at=now)
 
@@ -74,7 +74,7 @@ def test_transcribe_missing_metadata_raises(
         md = output_root / stem / f"{stem}.md"
         md.parent.mkdir(parents=True, exist_ok=True)
         md.write_text("x", encoding="utf-8")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         from knowledge_ingest.runner import CommandResult
         return CommandResult(argv=tuple(argv), returncode=0, stdout=str(md),
                              stderr="", started_at=now, ended_at=now)
@@ -101,7 +101,7 @@ def test_transcribe_argv_includes_flags(tmp_path: Path, monkeypatch: pytest.Monk
         md.parent.mkdir(parents=True, exist_ok=True)
         md.write_text("x", encoding="utf-8")
         (output_root / "clip" / "metadata.yaml").write_text("a: b\n", encoding="utf-8")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         from knowledge_ingest.runner import CommandResult
         return CommandResult(argv=tuple(argv), returncode=0, stdout=str(md),
                              stderr="", started_at=now, ended_at=now)
@@ -125,9 +125,9 @@ def test_transcribe_argv_includes_flags(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_build_transcript_cache_key_changes_with_params():
-    base = dict(source_sha256="sha256:a", mt_head="h1", config_sha=None,
-                device="auto", timestamp="10m", glossary=None,
-                hotwords=None)
+    base = {"source_sha256": "sha256:a", "mt_head": "h1", "config_sha": None,
+            "device": "auto", "timestamp": "10m", "glossary": None,
+            "hotwords": None}
     k1 = build_transcript_cache_key(**base)
     assert k1 == build_transcript_cache_key(**base)
     k2 = build_transcript_cache_key(**{**base, "timestamp": "5m"})

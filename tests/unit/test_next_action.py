@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -17,7 +17,7 @@ from knowledge_ingest.state_machine import InvalidTransition, transition_to
 
 
 def make_manifest(targets=("cangjie", "personal"), status="CORPUS_READY") -> JobManifest:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return JobManifest(
         job_id="20260906-120000-local-course",
         created_at=now,
