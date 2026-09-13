@@ -21,7 +21,7 @@
 | E7 | Target 顺序 round-trip（CLI create + load/save） | ✅ PASS |
 | E8 | V1→V2 保持 precedence（COMPLETED 语义不变） | ✅ PASS |
 | E9 | COMPLETED Job amend（scratch 副本方案） | ✅ PASS |
-| E10 | output-manifest 决定性与字段完整性 | ⚠️ PASS（1 项缺陷如实记录，见 D1） |
+| E10 | output-manifest 决定性与字段完整性 | ✅ PASS（决定性验证；D1 在 e3834c4 后单独修复） |
 | E11 | budget 熔断（quota/breaker/case-retry/幂等/冲突/amend+resume） | ✅ PASS |
 | E12 | 审计报告渲染（运行审计段 + unknown 标注） | ✅ PASS |
 | E13 | PARTIAL 聚合（单测 + scratch CLI） | ✅ PASS |
@@ -205,7 +205,7 @@ CLI：job amend acceptance-e9-test --add-target family_router →
   - next --json → {"next_action":"invoke_family_router","targets_remaining":["family_router"]}
 ```
 
-## E10：output-manifest ✅（附 1 项缺陷记录 D1）
+## E10：output-manifest ✅（D1 在 e3834c4 已修复：top_level_files 改为 <name>.md 探测，对真实 17-skill 产物 4/4 present；本节首轮检查表按当初 HEAD 0d73590 验收口径记录 未修，已订正与 v0.3.0 head 一致）
 
 ```text
 对象：真实 cangjie 产物 distill/20260912-163657-baidu-9y/cangjie/books/minsu-heji-9y
@@ -218,7 +218,9 @@ CLI：job amend acceptance-e9-test --add-target family_router →
   （如 minsu-buy-customer-marketing-loop: test_prompts=True, test_results=True）
 事务失败注入：单测覆盖 tests/unit/test_output_manifest.py::
   test_target_complete_rename_failure_keeps_target_state（rename 失败 TargetState 不变）
-【D1·缺陷，未修】top_level_files 全 False（present 0/4）：真实 cangjie 产物的顶层
+【D1 · 修复 e3834c4】top_level_files 检测改为 <name>.md（真实 cangjie 产物带 .md 后缀的 DIGEST.md / INDEX.md / GLOSSARY.md / PIPELINE_STATE.md）：
+
+修复前（pre-e3834c4）top_level_files 全 False（present 0/4）：真实 cangjie 产物的顶层
   文件是 DIGEST.md / INDEX.md / GLOSSARY.md / PIPELINE_STATE.md（带 .md），而
   output_manifest.py TOP_LEVEL_FILES 检查的是无扩展名 DIGEST/INDEX/GLOSSARY/
   PIPELINE_STATE。单测（test_build_output_manifest_fields）按无扩展名构造并通过——
