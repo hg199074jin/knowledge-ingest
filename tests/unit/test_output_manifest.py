@@ -24,7 +24,7 @@ from .test_preprocess_cli import make_config
 
 
 def build_fixture_output(root: Path) -> Path:
-    """造 cangjie 产物：2 个 skill 目录 + DIGEST / GLOSSARY 顶层文件。"""
+    """造 cangjie 产物：2 个 skill 目录 + DIGEST.md / GLOSSARY.md 顶层文件。"""
     output = root / "output" / "skills"
     skill_a = output / "guarantee-course-skill"
     skill_a.mkdir(parents=True)
@@ -51,7 +51,7 @@ def build_fixture_output(root: Path) -> Path:
     (skill_b / "test-results.md").write_text("results", encoding="utf-8")
 
     for name in ("DIGEST", "GLOSSARY"):
-        (output / name).write_text(f"{name} content\n", encoding="utf-8")
+        (output / f"{name}.md").write_text(f"{name} content\n", encoding="utf-8")
     return output
 
 

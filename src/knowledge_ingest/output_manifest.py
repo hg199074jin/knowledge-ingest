@@ -92,7 +92,9 @@ def scan_skills(output_path: Path) -> list[dict]:
 def build_output_manifest(output_path: Path) -> dict:
     output_path = Path(output_path)
     skills = scan_skills(output_path)
-    top_level = {name: (output_path / name).exists()
+    # 真实 cangjie 产物为 DIGEST.md/INDEX.md/GLOSSARY.md/PIPELINE_STATE.md
+    # （E10 验收缺陷 D1 修正：键名保持无后缀约定，按 <name>.md 探测）
+    top_level = {name: (output_path / f"{name}.md").exists()
                  for name in TOP_LEVEL_FILES}
     return {
         "schema_version": SCHEMA_VERSION,
