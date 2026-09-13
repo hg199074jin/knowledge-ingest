@@ -123,3 +123,45 @@ def test_route_bucket_invariant_multiset_and_order(tmp_path: Path):
         # effective must be an order-preserving subsequence of discovered
         it = iter(disc)
         assert all(p in it for p in eff)
+
+
+def test_route_excluded_bucket_preserves_discovery_order(tmp_path: Path):
+    (tmp_path / "a.mp4").write_bytes(b"v")
+    (tmp_path / "b.pdf").write_bytes(b"p")
+    (tmp_path / "c.mp4").write_bytes(b"v")
+    r = route_source(tmp_path, excludes={(tmp_path / "a.mp4").resolve(),
+                                         (tmp_path / "c.mp4").resolve()})
+    assert r.excluded_media == [(tmp_path / "a.mp4").resolve(),
+                                (tmp_path / "c.mp4").resolve()]
+
+
+def test_route_exclude_non_discovered_path_is_inert(tmp_path: Path):
+    (tmp_path / "a.md").write_bytes(b"m")
+    ghost = Path("/foo/not-discovered.pdf")
+    r = route_source(tmp_path, excludes={ghost})
+    assert r.excluded_documents == []
+    assert r.documents == [(tmp_path / "a.md").resolve()]
+    assert ghost not in r.discovered_documents
+    assert ghost not in r.excluded_documents
+
+
+def test_route_excluded_document_never_reaches_document_set(tmp_path: Path):
+    """v0.2 production bug regression: route exclusion must propagate to
+    the Document Set — an excluded document may not re-enter via collection."""
+    import yaml
+
+    from knowledge_ingest.collection import build_document_set
+
+    (tmp_path / "a.pdf").write_bytes(b"p")
+    (tmp_path / "b.pdf").write_bytes(b"q")
+    r = route_source(tmp_path, excludes={(tmp_path / "a.pdf").resolve()})
+    handoff = tmp_path / "handoff" / "document-set"
+    handoff.mkdir(parents=True)
+    build_document_set(handoff_dir=handoff, source_root=tmp_path,
+                       document_paths=r.documents, media_paths=r.media,
+                       transcripts={})
+    names = sorted(p.name for p in handoff.iterdir())
+    assert names == ["b.pdf"]
+    mapping = yaml.safe_load((tmp_path / "handoff" / "document-set-map.yaml")
+                             .read_text(encoding="utf-8"))
+    assert {e["source_relative_path"] for e in mapping} == {"b.pdf"}

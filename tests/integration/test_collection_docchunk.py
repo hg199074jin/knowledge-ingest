@@ -28,7 +28,7 @@ def test_docchunk_reads_symlinked_document_set(tmp_path: Path):
     result = build_document_set(
         handoff_dir=handoff, source_root=source,
         document_paths=[source / "01.md", source / "02.txt"],
-        media_paths=[], transcripts={}, excluded=set(),
+        media_paths=[], transcripts={},
     )
     assert result.map_path.parent.name == "handoff"
     assert all(p.is_symlink() for p in handoff.iterdir())

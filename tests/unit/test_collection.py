@@ -39,7 +39,6 @@ def test_build_mixed_document_set(tmp_path: Path):
         document_paths=[src / "03.pdf", src / "04.docx"],
         media_paths=[src / "01.mp4", src / "02.mp4"],
         transcripts=make_transcripts(tmp_path, src),
-        excluded=set(),
     )
     names = sorted(p.name for p in handoff.iterdir())
     assert names == ["01.md", "02.md", "03.pdf", "04.docx"]
@@ -66,23 +65,25 @@ def test_missing_transcript_blocks(tmp_path: Path):
             handoff_dir=handoff, source_root=src,
             document_paths=[src / "03.pdf"],
             media_paths=[src / "01.mp4", src / "02.mp4"],
-            transcripts=transcripts, excluded=set(),
+            transcripts=transcripts,
         )
     assert str(src / "02.mp4") in str(excinfo.value)
 
 
-def test_excluded_media_skipped(tmp_path: Path):
+def test_effective_lists_are_respected(tmp_path: Path):
+    """v0.2 production bug regression: route-level exclusion must hold —
+    media missing from effective lists never blocks, never enters the set."""
     src = make_source(tmp_path)
     handoff = tmp_path / "handoff" / "document-set"
     handoff.mkdir(parents=True)
     transcripts = make_transcripts(tmp_path, src)
     del transcripts[str(src / "02.mp4")]
+    # 02.mp4 was excluded at route time -> not in effective media_paths
     result = build_document_set(
         handoff_dir=handoff, source_root=src,
         document_paths=[src / "03.pdf"],
-        media_paths=[src / "01.mp4", src / "02.mp4"],
+        media_paths=[src / "01.mp4"],
         transcripts=transcripts,
-        excluded={str(src / "02.mp4")},
     )
     names = sorted(p.name for p in handoff.iterdir())
     assert names == ["01.md", "03.pdf"]
@@ -100,7 +101,7 @@ def test_name_conflict_uses_sanitized_relative(tmp_path: Path):
     result = build_document_set(
         handoff_dir=handoff, source_root=src,
         document_paths=[src / "a" / "notes.pdf", src / "b" / "notes.pdf"],
-        media_paths=[], transcripts={}, excluded=set(),
+        media_paths=[], transcripts={},
     )
     names = sorted(p.name for p in handoff.iterdir())
     assert len(names) == 2
@@ -120,7 +121,7 @@ def test_single_document_handoff(tmp_path: Path):
     handoff.mkdir(parents=True)
     result = build_document_set(
         handoff_dir=handoff, source_root=doc,
-        document_paths=[doc], media_paths=[], transcripts={}, excluded=set(),
+        document_paths=[doc], media_paths=[], transcripts={},
     )
     entries = list(handoff.iterdir())
     assert len(entries) == 1
@@ -141,5 +142,4 @@ def test_refuses_to_overwrite_existing_handoff(tmp_path: Path):
         build_document_set(
             handoff_dir=handoff, source_root=doc,
             document_paths=[doc], media_paths=[], transcripts={},
-            excluded=set(),
         )

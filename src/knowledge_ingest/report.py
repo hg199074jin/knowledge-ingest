@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from knowledge_ingest.models import JobManifest
+from knowledge_ingest.router import effective_paths
 
 REDACT_PATTERN = re.compile(
     r"(token|cookie|authorization|auth[_-]?code|password|secret|"
@@ -43,7 +44,11 @@ def redact_deep(value):
 
 def build_status(manifest: JobManifest) -> dict:
     media_out = len(manifest.media.outputs)
-    media_total = int(manifest.routing.get("media") or 0) or media_out
+    # 分母三级回退：v0.3 effective → v0.2 media_paths → v0.2 计数键
+    media_total = (len(effective_paths(manifest.routing, "media"))
+                   or len(manifest.routing.get("media_paths") or [])
+                   or int(manifest.routing.get("media") or 0)
+                   or media_out)
     source_status = manifest.source.get("download_completed")
     transcribe = (f"{manifest.media.status} {media_out}/{media_total}"
                   if manifest.media.status != "pending" else "skipped")
@@ -87,10 +92,18 @@ def render_report(manifest: JobManifest) -> str:
         lines.append(f"- 云端路径：{source['remote'].get('path')}")
     lines.append("")
     lines.append("## 路由统计")
-    lines.append(f"- collection：{routing.get('collection')}")
-    lines.append(f"- documents：{routing.get('documents')}")
-    lines.append(f"- media：{routing.get('media')}")
-    lines.append(f"- unsupported：{routing.get('unsupported')}")
+    eff = routing.get("effective")
+    if eff:
+        lines.append(f"- collection：{routing.get('collection')}")
+        for t in ("documents", "media", "unsupported"):
+            disc = len((routing.get("discovered") or {}).get(t) or [])
+            exc = len((routing.get("excluded") or {}).get(t) or [])
+            lines.append(f"- {t}：发现 {disc} / 排除 {exc} / 进入 {len(eff.get(t) or [])}")
+    else:
+        lines.append(f"- collection：{routing.get('collection')}")
+        lines.append(f"- documents：{routing.get('documents')}")
+        lines.append(f"- media：{routing.get('media')}")
+        lines.append(f"- unsupported：{routing.get('unsupported')}")
     lines.append("")
     lines.append("## 转写产物")
     if manifest.media.outputs:
@@ -116,9 +129,15 @@ def render_report(manifest: JobManifest) -> str:
     lines.append(f"- 产物：{manifest.personal.output_path}")
     lines.append("")
     lines.append("## 显式排除项")
-    excluded = routing.get("excluded") or []
-    if excluded:
-        for item in excluded:
+    excluded = routing.get("excluded")
+    excl_items: list = []
+    if isinstance(excluded, dict):
+        for t in ("documents", "media", "unsupported"):
+            excl_items.extend(excluded.get(t) or [])
+    elif isinstance(excluded, list):
+        excl_items = excluded
+    if excl_items:
+        for item in excl_items:
             lines.append(f"- {item}")
     else:
         lines.append("- 无")

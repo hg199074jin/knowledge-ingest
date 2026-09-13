@@ -15,7 +15,7 @@ from knowledge_ingest.config import AppConfig
 from knowledge_ingest.doctor import has_fail, run_doctor
 from knowledge_ingest.manifest_store import ManifestStore
 from knowledge_ingest.models import JobRequest
-from knowledge_ingest.router import route_source
+from knowledge_ingest.router import effective_paths, route_source
 from knowledge_ingest.state_machine import InvalidTransition, transition_to
 
 BAIDU_APP_PREFIXES = ("apps/bdpan", "/apps/bdpan")
@@ -352,34 +352,46 @@ def _cmd_route(config: AppConfig, args) -> int:
         print(f"error: source path missing: {local_path}", file=sys.stderr)
         return 2
     _advance(manifest, ["ROUTING"])
-    result = route_source(local_path)
+    result = route_source(local_path, excludes=args.excludes)
     manifest.routing = {
         "collection": result.is_collection,
-        "documents": len(result.documents),
-        "media": len(result.media),
-        "unsupported": len(result.unsupported),
-        "document_paths": [str(p) for p in result.documents],
-        "media_paths": [str(p) for p in result.media],
-        "unsupported_paths": [str(p) for p in result.unsupported],
-        "excluded": list(args.excludes),
+        "discovered": {
+            "documents": [str(p) for p in result.discovered_documents],
+            "media": [str(p) for p in result.discovered_media],
+            "unsupported": [str(p) for p in result.discovered_unsupported],
+        },
+        "excluded": {
+            "documents": [str(p) for p in result.excluded_documents],
+            "media": [str(p) for p in result.excluded_media],
+            "unsupported": [str(p) for p in result.excluded_unsupported],
+        },
+        "effective": {
+            "documents": [str(p) for p in result.documents],
+            "media": [str(p) for p in result.media],
+            "unsupported": [str(p) for p in result.unsupported],
+        },
+        "excluded_raw": list(args.excludes),
     }
-    excluded = {Path(p).expanduser().resolve() for p in args.excludes}
-    remaining_unsupported = [
-        p for p in result.unsupported if p not in excluded
-    ]
-    if remaining_unsupported:
+    # v0.3 冻结规格 1：unsupported 检查先于编码预检（Part B 在此之后插入）
+    if result.unsupported:
         manifest.routing["blocked_unsupported"] = [
-            str(p) for p in remaining_unsupported]
-        _block(manifest, "unsupported_inputs")
+            str(p) for p in result.unsupported]
+        _block(manifest, "unsupported_source")
         store.save(manifest)
-        for p in remaining_unsupported:
+        for p in result.unsupported:
             print(f"unsupported (exclude explicitly to continue): {p}")
-        print("BLOCKED: unsupported_inputs")
+        print("BLOCKED: unsupported_source")
         return 1
     store.save(manifest)
     print(
-        f"routed: documents={len(result.documents)} media={len(result.media)} "
-        f"unsupported={len(result.unsupported)} collection={result.is_collection}"
+        f"routed: discovered documents={len(result.discovered_documents)} "
+        f"media={len(result.discovered_media)} "
+        f"unsupported={len(result.discovered_unsupported)}; "
+        f"excluded documents={len(result.excluded_documents)} "
+        f"media={len(result.excluded_media)} "
+        f"unsupported={len(result.excluded_unsupported)}; "
+        f"effective documents={len(result.documents)} "
+        f"media={len(result.media)} collection={result.is_collection}"
     )
     print(f"status: {manifest.status}")
     return 0
@@ -418,10 +430,8 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
         return 2
 
     routing = manifest.routing
-    excluded = {str(Path(p).expanduser().resolve()) for p in
-                (routing.get("excluded") or [])}
-    document_paths = [Path(p) for p in routing.get("document_paths") or []]
-    media_paths = [Path(p) for p in routing.get("media_paths") or []]
+    document_paths = effective_paths(routing, "documents")
+    media_paths = effective_paths(routing, "media")
     if not document_paths and not media_paths:
         print("error: nothing to preprocess (all inputs excluded?)",
               file=sys.stderr)
@@ -436,8 +446,6 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
     if media_paths:
         seen_stems: dict[str, Path] = {}
         for media in media_paths:
-            if media.resolve().as_posix() in excluded:
-                continue
             stem = media.stem.lower()
             if stem in seen_stems:
                 # media-transcriber 产物按 stem 落盘，同名 stem 会互相覆盖/混淆
@@ -465,8 +473,6 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
 
         for media in media_paths:
             media_resolved = media.resolve()
-            if media_resolved.as_posix() in excluded:
-                continue
             source_sha = fingerprint_file(media_resolved)
             key = build_transcript_cache_key(
                 source_sha256=source_sha, mt_head=mt_head, config_sha=None,
@@ -524,7 +530,7 @@ def _cmd_preprocess(config: AppConfig, args) -> int:
         built = build_document_set(
             handoff_dir=handoff_dir, source_root=source_root,
             document_paths=document_paths, media_paths=media_paths,
-            transcripts=transcripts, excluded=excluded)
+            transcripts=transcripts)
     except CollectionIncomplete as exc:
         _block(manifest, "collection_incomplete")
         store.save(manifest)
