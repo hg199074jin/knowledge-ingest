@@ -21,6 +21,8 @@ class SkillNames(BaseModel):
     personal_distiller: str
     # v0.3：family_router 是最小验证实例；保留旧四键
     family_router: str = "family-router-builder"
+    # M2 Task 18：k2c = Capability Compiler Target
+    k2c: str = "k2c"
 
 
 class ProcessingConfig(BaseModel):

@@ -31,6 +31,7 @@ def config(tmp_path: Path) -> AppConfig:
         "cangjie-skill",
         "personal-capability-distiller",
         "family-router-builder",
+        "k2c",
     ):
         (skills / name).mkdir(parents=True, exist_ok=True)
         (skills / name / "SKILL.md").write_text("x", encoding="utf-8")

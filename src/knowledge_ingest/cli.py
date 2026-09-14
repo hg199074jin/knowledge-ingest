@@ -878,10 +878,6 @@ def _cmd_target_complete(config: AppConfig, args) -> int:
     import os as _os
 
     from knowledge_ingest.next_action import target_complete
-    from knowledge_ingest.output_manifest import (
-        build_output_manifest,
-        render_output_manifest,
-    )
 
     store = _store(config)
     if not store.manifest_path(args.job_id).is_file():
@@ -897,6 +893,8 @@ def _cmd_target_complete(config: AppConfig, args) -> int:
     runtime = get_target(args.target)
     # 锁外：扫描产物 + 生成决定性 manifest 内容 → tmp
     # （锁内校验通过后才 rename，事务失败则 TargetState 不变）
+    # Task 21/22：按 target dispatch —— cangjie 用既有 scanner，
+    # k2c 用专属 scanner + 状态映射门；禁止互相套用。
     tmp_path: Path | None = None
     final_path: Path | None = None
     if runtime.output_manifest:
@@ -904,9 +902,29 @@ def _cmd_target_complete(config: AppConfig, args) -> int:
         handoff_dir.mkdir(parents=True, exist_ok=True)
         final_path = handoff_dir / runtime.output_manifest
         tmp_path = handoff_dir / f".{runtime.output_manifest}.tmp"
-        tmp_path.write_text(
-            render_output_manifest(build_output_manifest(output_path)),
-            encoding="utf-8")
+        if args.target == "k2c":
+            from knowledge_ingest.k2c_output_manifest import (
+                build_k2c_output_manifest,
+                k2c_complete_blocked_reason,
+                render_k2c_output_manifest,
+            )
+
+            k2c_manifest = build_k2c_output_manifest(output_path)
+            blocked = k2c_complete_blocked_reason(k2c_manifest)
+            if blocked is not None:
+                print(f"error: {blocked}", file=sys.stderr)
+                return 2
+            tmp_path.write_text(
+                render_k2c_output_manifest(k2c_manifest), encoding="utf-8")
+        else:
+            from knowledge_ingest.output_manifest import (
+                build_output_manifest,
+                render_output_manifest,
+            )
+
+            tmp_path.write_text(
+                render_output_manifest(build_output_manifest(output_path)),
+                encoding="utf-8")
     try:
         with store.edit(args.job_id) as manifest:
             # 先校验 target 仍允许 complete（锁内），再 rename，最后推进状态：
@@ -1220,7 +1238,8 @@ def _cmd_distill_prepare(config: AppConfig, args) -> int:
         if runtime.handoff_extra is not None:
             lines.extend(runtime.handoff_extra(
                 manifest=manifest,
-                job_dir=store.job_dir(manifest.job_id)))
+                job_dir=store.job_dir(manifest.job_id),
+                corpus_path=manifest.docchunk.corpus_path))
         handoff_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"distill workspace: {root}")
     print(f"target handoff: {handoff_path}")

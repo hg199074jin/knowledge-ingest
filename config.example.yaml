@@ -17,6 +17,7 @@ skills:
   cangjie: cangjie-skill
   personal_distiller: personal-capability-distiller
   family_router: family-router-builder
+  k2c: k2c
 
 processing:
   media_device: auto

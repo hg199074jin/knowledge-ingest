@@ -122,3 +122,75 @@ register(TargetRuntime(
     preauthorizable_gates=("cost_budget_confirmed",),
     handoff_extra=_family_router_handoff_extra,
 ))
+
+
+# ---- k2c（M2 Task 18/20）：Capability Compiler Target -----------------------
+
+K2C_DATA_ROOT = "/Volumes/ORICO/Data/KnowledgeToCapability"
+
+
+def _read_corpus_identity(corpus_path) -> dict:
+    """从 corpus manifest.json 读 fingerprints + verify_status；容错缺席。"""
+    import json
+
+    identity = {
+        "corpus_id": None,
+        "source_fingerprint_ref": None,
+        "normalization_fingerprint_ref": None,
+        "atomic_policy_fingerprint_ref": None,
+        "verify_status": "unknown",
+    }
+    try:
+        manifest = json.loads(
+            (Path(corpus_path) / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return identity
+    identity["corpus_id"] = manifest.get("corpus_id")
+    fingerprints = manifest.get("fingerprints") or {}
+    for key in ("source", "normalization", "atomic_policy"):
+        identity[f"{key}_fingerprint_ref"] = fingerprints.get(key)
+    verification = manifest.get("verification") or {}
+    identity["verify_status"] = verification.get("status", "unknown")
+    return identity
+
+
+def _k2c_handoff_extra(*, manifest, job_dir, corpus_path=None, **_):
+    """k2c 专属 handoff 段：corpus 身份 + K2C data root + budget。
+
+    Task 20/集成测试要求 handoff/target-k2c.yaml 至少含 corpus / budget /
+    target identity / k2c handoff_extra 关键字段。
+    """
+    identity = _read_corpus_identity(corpus_path)
+    lines = [
+        "k2c:",
+        f"  data_root: {K2C_DATA_ROOT}",
+        f"  job_ref: {manifest.job_id}",
+        "  handoff_mode: build --handoff target-k2c.yaml",
+        "  corpus:",
+        f"    corpus_id: {identity['corpus_id']}",
+        f"    source_fingerprint_ref: {identity['source_fingerprint_ref']}",
+        f"    normalization_fingerprint_ref: {identity['normalization_fingerprint_ref']}",
+        f"    atomic_policy_fingerprint_ref: {identity['atomic_policy_fingerprint_ref']}",
+        f"    verify_status: {identity['verify_status']}",
+        "budget:",
+        "  mode: balanced",
+        "  max_external_calls: 20",
+        "  max_retries_per_case: 1",
+        "  breaker:",
+        "    consecutive_empty: 3",
+        "    consecutive_rate_limit: 2",
+    ]
+    return lines
+
+
+register(TargetRuntime(
+    name="k2c",
+    display_name="K2C",
+    invoke_key="invoke_k2c",
+    skill_config_key="k2c",
+    depends_on=(),  # 只消费 Verified Corpus，不依赖旧 target
+    preauthorizable_gates=(),  # activate 等门在 K2C 侧自有 journal，KI 侧全 live
+    workspace_subdirs=(),
+    output_manifest="k2c-output-manifest.json",
+    handoff_extra=_k2c_handoff_extra,
+))
