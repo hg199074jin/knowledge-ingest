@@ -37,13 +37,13 @@ Python CLI（`knowledge-ingest`）负责状态、指纹、路由、调用 media-
 5.  route                        # 文件类型分流（documents/media/unsupported）
 6.  preprocess（后台）           # 媒体转写 → Document Set → docchunk split → verify
 7.  🔴 STOP：确认 docchunk verify PASS  # 硬门；FAIL 一律 BLOCKED，禁止蒸馏
-8.  distill prepare + target start    # --target cangjie|personal|family_router（一次只一个 RUNNING）
+8.  distill prepare + target start    # --target cangjie|personal|family_router|k2c（一次只一个 RUNNING）
 9.  invoke target skill          # 按 references/handoff-contracts.md 传 target handoff
 10. 🔴 CHECKPOINT：gate enter / 真实用户确认 / gate resolve
     # 确认门映射见 references/target-gates.md；白名单 operational gate 可用
     # gate preauthorize 发 grant，夜间 resolve --preauthorization 引用（规格 10）
 11. target complete [--pipeline-state PATH]
-12. next                         # 依赖≠排序：cangjie [] / personal [] / family_router [cangjie]；
+12. next                         # 依赖≠排序：cangjie [] / personal [] / family_router [cangjie] / k2c []；
                                  # 声明顺序=执行顺序
 13. final report                 # knowledge-ingest report JOB → reports/final.md（含"运行审计"段）
 ```
@@ -74,6 +74,8 @@ Python CLI（`knowledge-ingest`）负责状态、指纹、路由、调用 media-
 knowledge-ingest doctor --config ./config.yaml [--json]
 knowledge-ingest job create --provider local|baidu|quark --source "..." \
   --target cangjie [--target personal] [--with-router [family_router]] --prompt "..."
+  # 把资料编译成可给 Agent调用的能力（默认能力生产路径）：
+  #   knowledge-ingest job create --target k2c --prompt "把这些课程学习一下，形成 Agent 能力"
 knowledge-ingest resume [--job JOB] [--exec]   # 全部 Job 的下一步；--exec 自动续跑第一个
 knowledge-ingest source init JOB --provider来源自动 [--remote-path ...] [--local-path DIR] [--note ...]
 knowledge-ingest source register JOB --handoff source.json
@@ -81,7 +83,8 @@ knowledge-ingest job amend JOB --add-target cangjie|personal|family_router  # pr
 knowledge-ingest route JOB [--exclude PATH ...]
 knowledge-ingest preprocess JOB          # 长任务：放后台跑，轮询 status（每文件实时落盘）
 knowledge-ingest distill prepare JOB \
-  --target cangjie|personal|family_router   # 脚手架 distill 工作区 + handoff
+  --target cangjie|personal|family_router|k2c   # 脚手架 distill 工作区 + handoff
+  # k2c handoff 自带 corpus 指纹 + verify_status + budget；消费方 = k2c build --handoff
 knowledge-ingest status JOB [--json]
 knowledge-ingest next JOB --json
 knowledge-ingest target start JOB --target cangjie   # CORPUS_READY -> TARGET_RUNNING
@@ -95,6 +98,10 @@ knowledge-ingest budget outcome JOB --permit PERMIT --result success|empty|rate_
 knowledge-ingest budget amend JOB --target T --max-external-calls N   # 改上限 ≠ 自动恢复 BLOCKED
 knowledge-ingest target checkpoint JOB --target T --phase PHASE [--checkpoint PATH] [--evidence DIR]
 knowledge-ingest target resume JOB --target T     # BLOCKED 显式恢复（唯一出口，规格 9）
+knowledge-ingest target complete JOB --target k2c --output-path RUN_DIR
+  # k2c complete 读 run 目录的 k2c-target-manifest.yaml：completed /
+  # needs_review_nonblocking → COMPLETED；needs_review_blocking → 先走 gate；
+  # paused_budget / failed → 拒绝（manifest 决定，Task 22 冻结映射）
 knowledge-ingest target complete JOB --target cangjie --output-path PATH \
   [--pipeline-state PATH]                              # cangjie: 登记断点文件
 knowledge-ingest watchdog install|status|uninstall    # 重启看门狗（LaunchAgent，动态路径）
