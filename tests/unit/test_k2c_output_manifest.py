@@ -148,3 +148,26 @@ def test_paused_budget_rejects_complete(env):
         target_start(m, "k2c")
     assert _complete(config, store, job_id, run_dir) == 2
     assert store.load(job_id).targets["k2c"].status == "RUNNING"
+
+
+def test_missing_manifest_reports_clean_error_not_traceback(
+        env, tmp_path, monkeypatch, capsys) -> None:
+    """C6（评审 #10）：manifest 缺失/损坏时 main 捕获为 rc=2，不抛 traceback。"""
+    import yaml as _yaml
+
+    from knowledge_ingest.cli import main
+
+    config, store = env
+    job_id = _make_job(store, ["k2c"])
+    empty_run = config.pipeline_root / "run-empty"
+    empty_run.mkdir(parents=True)
+    with store.edit(job_id) as m:
+        target_start(m, "k2c")
+    # main() 按 cwd/config.example.yaml 找配置：切到临时 cwd 并落一份
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(_yaml.safe_dump(
+        json.loads(config.model_dump_json())), encoding="utf-8")
+    rc = main(["target", "complete", job_id, "--target", "k2c",
+               "--output-path", str(empty_run)])
+    assert rc == 2
+    assert "k2c-target-manifest" in capsys.readouterr().err

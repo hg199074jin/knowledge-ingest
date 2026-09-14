@@ -28,8 +28,9 @@ KNOWN_STATUSES = ALLOWED_COMPLETABLE | {
 }
 
 
-class K2CManifestError(Exception):
-    pass
+class K2CManifestError(ValueError):
+    """ValueError 子类（评审 C6）：main() 统一捕获后输出错误信息而非
+    traceback，与 cangjie scanner 的全总和错误行为对齐。"""
 
 
 def load_k2c_target_manifest(run_dir: Path) -> dict:
