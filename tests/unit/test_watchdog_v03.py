@@ -1,6 +1,9 @@
 """v0.3 A4: watchdog installer — dynamic paths, idempotent install.
 
 Unit tests never touch the real launchd: run_launchctl is monkeypatched.
+Nor the real machine PATH: _resolve_ki is monkeypatched in fake_home,
+so generated content cannot depend on where knowledge-ingest happens
+to be installed on the host running the tests (test isolation).
 """
 
 import plistlib
@@ -35,6 +38,8 @@ def fake_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr(watchdog, "_home", lambda: home)
+    fake_ki = tmp_path / "bin" / "knowledge-ingest"
+    monkeypatch.setattr(watchdog, "_resolve_ki", lambda: str(fake_ki))
     calls: list[list[str]] = []
     loaded: list[bool] = [False]
 
@@ -50,12 +55,12 @@ def fake_home(tmp_path, monkeypatch):
         return 0, "", ""
 
     monkeypatch.setattr(watchdog, "run_launchctl", fake_launchctl)
-    return home, calls
+    return home, calls, fake_ki
 
 
 def test_install_generates_dynamic_script_and_plist(tmp_path, fake_home):
     config = make_config(tmp_path)
-    _home, calls = fake_home
+    _home, calls, fake_ki = fake_home
     rc = watchdog.install(config)
     assert rc == 0
     script = config.pipeline_root / "bin" / "ki-resume.sh"
@@ -65,7 +70,8 @@ def test_install_generates_dynamic_script_and_plist(tmp_path, fake_home):
     assert str(config.pipeline_root) in text          # dynamic paths
     assert "resume --exec" in text
     assert "export PATH=" in text
-    assert "/Users/sandro" not in text                # no hardcoded user
+    assert f'KI="{fake_ki}"' in text                  # injected KI path, verbatim
+    assert "/Users/" not in text                      # no real user home leaks in
     label = watchdog.label_for()
     plist_path = watchdog.plist_install_path()
     assert plist_path.is_file()
