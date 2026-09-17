@@ -1,4 +1,4 @@
-# K2C Telegram Knowledge Source V1 设计文档
+# K2C Telegram Knowledge Source V2 设计文档
 
 > **Continuous Knowledge Ingestion · Telegram Source Adapter for knowledge-ingest → K2C**
 
@@ -8,6 +8,7 @@
 - 下游 Target：`K2C / Knowledge-to-Capability`
 - 设计性质：新增 Source 子系统，不修改 K2C V5 冻结职责边界
 - 核心原则：Source-level Trust / Local-first / Provenance-first / Fail-closed / Exception-driven Automation / Human Gate at Publish & Activate
+- V2 修订：吸收本机审阅，补齐通知运行时、Source AI Budget、SQLite 并发、Source Handoff v2 迁移面，并将已落地的 `target=k2c` 改为回归契约
 
 ---
 
@@ -54,7 +55,7 @@ REVIEW 通知
 08:00 / 12:00 / 20:00 Digest
 ```
 
-V1 不做历史回溯，只从部署完成后的启用时间开始采集；服务中断期间产生、但时间晚于启用边界的消息，允许在恢复后补齐，视为**增量恢复**，不视为历史 Backfill。
+V2 不做历史回溯，只从部署完成后的启用时间开始采集；服务中断期间产生、但时间晚于启用边界的消息，允许在恢复后补齐，视为**增量恢复**，不视为历史 Backfill。
 
 ---
 
@@ -66,7 +67,7 @@ V1 不做历史回溯，只从部署完成后的启用时间开始采集；服�
 2. **单独发布 PDF，通常伴随标题或简短说明**；
 3. **发布夸克、百度等网盘链接，通常伴随资源说明**。
 
-群本身已经完成第一层人工筛选，因此 V1 不再要求“逐条人工确认后才进入 K2C”。
+群本身已经完成第一层人工筛选，因此 V2 不再要求“逐条人工确认后才进入 K2C”。
 
 设计哲学从：
 
@@ -127,7 +128,7 @@ Telegram Source Runtime 只负责把 Telegram 世界转换为 canonical Source I
 
 ## 2.3 三个事实层，各管一段生命周期
 
-V1 明确只允许三个权威状态源：
+V2 明确只允许三个权威状态源：
 
 ```text
 Telegram source lifecycle  → telegram/state.db
@@ -147,7 +148,7 @@ Capability lifecycle       → K2C Capability Registry
 
 # 3. GitHub 开源调研与复用策略
 
-V1 不直接套用完整开源项目，而是吸收成熟设计，避免重复造轮子和引入第二套产品状态机。
+V2 不直接套用完整开源项目，而是吸收成熟设计，避免重复造轮子和引入第二套产品状态机。
 
 ## 3.1 `tggo/tg-archive`
 
@@ -162,7 +163,7 @@ V1 不直接套用完整开源项目，而是吸收成熟设计，避免重复�
 5. `doctor` 用于检测消息缺口和归档不一致；
 6. `FLOOD_WAIT`、rate limit 是正常运行状态，不应当作不可恢复错误。
 
-V1 采用其中的“本地事实库 + 增量补齐 + doctor”思想。
+V2 采用其中的“本地事实库 + 增量补齐 + doctor”思想。
 
 不直接部署 `tg-archive` 作为生产依赖，原因是它自身已经是一套 Telegram Archive 产品；若再接 `knowledge-ingest`，会出现两套归档/恢复状态机和重复 Markdown 投影。
 
@@ -198,9 +199,15 @@ GitHub 原仓库：<https://github.com/LonamiWebs/Telethon>
 
 其 GitHub 仓库已于 2026-02-21 归档，但项目明确迁移到 Codeberg：<https://codeberg.org/Lonami/Telethon>。
 
-V1 可采用 Telethon 作为第一版 MTProto user client，但**业务代码不得直接依赖 Telethon 对象模型**，必须经 `TelegramClientPort` 隔离。
+V2 可采用 Telethon 作为第一版 MTProto user client，但**业务代码不得直接依赖 Telethon 对象模型**，必须经 `TelegramClientPort` 隔离。
 
 这样未来若更换 MTProto client，只替换 Adapter，不影响 Source Registry、Event Store、Interest Policy、PDF Router 和 knowledge-ingest handoff。
+
+## 3.4 依赖策略
+
+Telethon 作为可选 Source 依赖，不进入 `knowledge-ingest` 核心最小依赖集合。建议以 optional dependency group 管理，并为异步测试补充 `pytest-asyncio`。Telegram 功能未启用时，不得要求用户安装 MTProto 依赖。
+
+开源项目只提供设计参考，不引入其独立状态机、GUI、媒体库或归档产品层。
 
 ---
 
@@ -214,7 +221,7 @@ V1 可采用 Telethon 作为第一版 MTProto user client，但**业务代码不
                    ↓
 ┌───────────────────────────────────────┐
 │ TelegramClientPort                    │
-│ V1 Adapter: Telethon                  │
+│ V2 Adapter: Telethon                  │
 └──────────────────┬────────────────────┘
                    ↓
 ┌───────────────────────────────────────┐
@@ -275,7 +282,7 @@ Telegram Runtime / knowledge-ingest / K2C
 
 ## 5.1 代码归属
 
-V1 逻辑归属 `knowledge-ingest`，建议新增：
+V2 逻辑归属 `knowledge-ingest`，建议新增：
 
 ```text
 src/knowledge_ingest/telegram/
@@ -287,6 +294,8 @@ src/knowledge_ingest/telegram/
 ├── merge.py
 ├── classify.py
 ├── materialize.py
+├── notification_port.py
+├── wxpusher_adapter.py
 ├── notifier.py
 └── doctor.py
 ```
@@ -317,6 +326,8 @@ ORICO 不可用时：
 - 发出异常通知；
 - ORICO 恢复后，从已持久化 cursor / Telegram 增量范围恢复。
 
+实现不得只依赖现有 `processing.require_orico` 配置值；Telegram watcher 在启动、reconcile 和实际下载/物化前都必须主动确认 `/Volumes/ORICO` 数据根真实可用，避免“配置为 true 但未被执行”的假保护。
+
 ## 5.3 Session 与密钥
 
 Telegram session、`api_id`、`api_hash` 不得写入 Git、SQLite provenance 或 Job report。
@@ -346,6 +357,15 @@ telegram-secrets*
 ```
 
 Session 按“账号完全访问凭据”处理。
+
+微信通知凭据独立存放，例如：
+
+```text
+~/.config/knowledge-ingest/notifications/
+└── wxpusher.env
+```
+
+同样要求 `chmod 600`，不得进入 Git、SQLite、Job report 或 Digest 正文。
 
 ---
 
@@ -394,7 +414,7 @@ sources:
 
 ## 6.3 `start_at` 是硬边界
 
-V1 不做历史 Backfill。
+V2 不做历史 Backfill。
 
 首次启用来源时写入 `start_at`，任何 `message_date < start_at` 的历史消息不得进入 Source Item。
 
@@ -436,16 +456,16 @@ class TelegramClientPort(Protocol):
 - Telethon-specific FloodWait、RPC Error 在 Adapter 内映射为内部错误类别；
 - Adapter 可以独立替换。
 
-## 7.2 V1 只读
+## 7.2 V2 只读
 
-V1 Telegram session 只用于：
+V2 Telegram session 只用于：
 
 - 读取消息；
 - 获取编辑/删除更新；
 - 下载符合规则的 PDF；
 - 获取来源元数据。
 
-V1 不提供：
+V2 不提供：
 
 - 自动发送消息；
 - 自动回复；
@@ -455,6 +475,12 @@ V1 不提供：
 - 批量操作联系人。
 
 降低账号风险，也缩小权限面。
+
+## 7.3 首次认证是显式运维步骤
+
+本机没有可复用 Telegram session 时，`knowledge-ingest telegram auth` 必须完成一次交互式登录。该步骤可能涉及手机号、Telegram 登录码以及账号启用的二步验证密码。
+
+认证成功后仅持久化本地 session；后续 watcher 使用已有 session，不得把验证码或二步验证密码写盘。
 
 ---
 
@@ -568,11 +594,27 @@ SQLite 只记录：
 
 进入 `knowledge-ingest` 后，Job 的真实状态只以 `job.yaml` 为准。
 
+## 8.4 SQLite 并发契约
+
+V2 明确 watcher 与人工 CLI 会并发访问同一个 `state.db`。冻结规则：
+
+```text
+journal_mode = WAL
+foreign_keys = ON
+busy_timeout = 5000ms
+事务尽量短
+所有写入必须幂等
+```
+
+Watcher 内部采用单写队列，避免多个 asyncio coroutine 直接竞争写锁。`review resolve` 等人工 CLI 只执行短事务并服从 `busy_timeout`。
+
+`doctor --fix`、retention 批量清理、结构迁移等会产生多步写入的操作必须先获取 maintenance lock；拿不到锁时宁可拒绝修复，也不得与 watcher 同时改写事实层。
+
 ---
 
 # 9. Source Item Builder
 
-V1 只支持三类正式 Source Item。
+V2 只支持三类正式 Source Item。
 
 ## 9.1 TEXT
 
@@ -629,9 +671,9 @@ caption + PDF metadata
 - 保存 URL；
 - 保存来源 provenance；
 - 状态进入 `PENDING_RESOURCE`；
-- V1 不登录网盘；
-- V1 不解析目录；
-- V1 不自动下载。
+- V2 不登录网盘；
+- V2 不解析目录；
+- V2 不自动下载。
 
 若正文明确描述“大型资源合集/课程包/数百份文件/几十 GB”等，可标记：
 
@@ -639,7 +681,7 @@ caption + PDF metadata
 resource_collection_candidate = true
 ```
 
-但 V1 只创建 Resource Collection Stub，不解析真实目录。
+但 V2 只创建 Resource Collection Stub，不解析真实目录。
 
 ---
 
@@ -647,7 +689,7 @@ resource_collection_candidate = true
 
 ## 10.1 基本原则
 
-白名单来源先验质量高，V1 采用：
+白名单来源先验质量高，V2 采用：
 
 ```text
 默认 KEEP
@@ -676,6 +718,26 @@ resource_collection_candidate = true
 
 即：**宁可多收，不漏掉知识。**
 
+## 10.4 规则优先，模型只处理边界情况
+
+白名单纯文字不应逐条调用模型。V2 的默认顺序：
+
+```text
+TEXT
+├── 明确规则广告 → SKIP
+├── 疑似广告/知识混合 → LLM Noise Classifier
+└── 其他 → KEEP
+
+PDF
+→ caption + filename + source metadata
+→ Interest Classifier
+
+CLOUD_LINK
+→ 默认 KEEP / PENDING_RESOURCE
+```
+
+目标是把持续静默模型成本限制在真正需要判断的少数 Item 上。
+
 ---
 
 # 11. Interest Policy
@@ -688,7 +750,7 @@ Interest Policy 主要用于决定：
 
 纯文字白名单知识默认 KEEP，不要求每条都通过兴趣分类才能保存。
 
-## 11.2 INCLUDE 第一版
+## 11.2 INCLUDE
 
 默认感兴趣：
 
@@ -699,28 +761,42 @@ AI / 大模型 / Agent / AI 工具 / 编程工具
 副业 / 赚钱 / 商业模式 / 个人变现
 认知提升 / 思维模型 / 决策 / 个人成长
 效率 / 工作流 / 知识管理
+民宿 / 短租 / OTA / 本地生活
+自媒体 / 内容运营 / 抖音 / 直播电商 / 带货
+企业分析 / 商业分析 / 投资纪律 / 长期投资方法 / 风险管理
 ```
 
-## 11.3 EXCLUDE 第一版
+## 11.3 EXCLUDE
 
 默认不感兴趣：
 
 ```text
-股票个股 / 短线交易 / 荐股 / 炒股策略
+个股荐股
+短线交易
+行情预测
+涨停 / 打板 / 炒股技巧
 恋爱 / 情感关系 / 婚恋技巧
 娱乐八卦
 纯热点新闻搬运且无方法论价值
 ```
 
-注意：
+“股票/投资”不是直接黑名单词。以下内容应优先 INCLUDE 或 REVIEW，而不是因为出现证券语义就自动 EXCLUDE：
 
-- “商业模式分析上市公司”不能因为包含股票词就自动 EXCLUDE；
-- “投资思维/企业分析方法”可能属于认知或商业，应允许 INCLUDE；
-- 因此必须是语义分类，不使用简单关键词黑名单作为最终判定。
+```text
+上市公司商业模式分析
+企业基本面分析
+长期投资框架
+投资纪律
+风险管理
+估值方法
+认知型投资方法论
+```
+
+最终判定必须是语义分类，不允许只靠关键词命中。
 
 ## 11.4 PDF 下载前判定信息
 
-因为 V1 尚未下载 PDF，分类只能基于：
+因为 V2 尚未下载 PDF，分类只能基于：
 
 ```text
 source identity
@@ -745,9 +821,7 @@ REVIEW
 → REVIEW
 ```
 
-V1 不为了分类而预下载整份 PDF。
-
----
+V2 不为了分类而预下载整份 PDF。
 
 # 12. PDF 自动处理规则
 
@@ -867,7 +941,7 @@ status=PENDING_RESOURCE
 local | baidu | quark
 ```
 
-V1 需要新增：
+V2 需要新增：
 
 ```text
 telegram
@@ -906,6 +980,25 @@ telegram
 
 凭据不得进入 handoff。
 
+## 13.5 Source Handoff v2 迁移影响面
+
+`provider=telegram` 不是只改一个示例 JSON。实施时必须同步审查并修改所有 provider/schema 硬编码位置，至少包括：
+
+```text
+ProviderName / Pydantic Literal
+CLI provider choices
+source register validation
+Source Handoff schema
+unknown-key / schema-version 行为
+doctor provider mapping
+fixtures
+unit / contract tests
+report rendering
+Source Router
+```
+
+v1 handoff 必须继续可读；v2 新增 `provenance` 时要明确旧 reader 对未知键的行为，禁止“看似兼容、实际 schema_version != 1 直接拒绝”。迁移测试必须同时覆盖旧 `local/baidu/quark` 与新 `telegram`。
+
 ---
 
 # 14. K2C 自动化边界
@@ -940,39 +1033,26 @@ Telegram 入口不得绕过 K2C 的 release / activation 生命周期。
 
 ---
 
-# 15. 当前仓库前置依赖：`target=k2c` 尚未落入 knowledge-ingest main
+# 15. 既有 `target=k2c` 的回归契约
 
-设计核对时发现：
-
-当前 `knowledge-ingest/src/knowledge_ingest/targets.py` 的内置 Target Registry 实际只有：
+截至 V2 修订时，`knowledge-ingest/main` 已正式注册 `k2c` Target，并已具备：
 
 ```text
-cangjie
-personal
-family_router
+Target Registry: name="k2c"
+corpus identity handoff
+k2c-output-manifest
+SKILL.md target=k2c 入口语义
+相关单元 / 编排测试
+真实 target-k2c.yaml 产物
 ```
 
-而 K2C V5 已经冻结：
+因此 `target=k2c` **不再是 Telegram E2E 的系统级前置阻塞**。
 
-```text
-knowledge-ingest → target=k2c → K2C
-```
+Telegram Source 的实施约束改为：
 
-因此完整 Telegram E2E 的前置条件是：
+> **必须复用既有 Generic Target Runtime 与 target=k2c，不得另建旁路、重复状态机或直接调用 K2C 绕过 knowledge-ingest。**
 
-> **把已设计的 `k2c` Target 正式接入 knowledge-ingest Generic Target Runtime。**
-
-这不是 Telegram Source Runtime 自己偷偷实现的职责。
-
-V1 可以先完成：
-
-```text
-Telegram → Source Item → knowledge-ingest → Verified Corpus
-```
-
-但“自动到 staged”的最终验收必须在 `target=k2c` 正式存在之后进行。
-
----
+验收时应将既有 K2C Target 作为回归基线：Telegram 引入后，现有 corpus identity、checkpoint、budget、output manifest、staged 与 Human Gate 语义都必须保持不变。
 
 # 16. REVIEW 机制
 
@@ -1021,19 +1101,33 @@ decision
 
 ---
 
-# 17. 微信通知与 Digest
+# 17. Notification Runtime 与 Digest
 
-## 17.1 不再实时转发 Telegram 原文
+## 17.1 定位
 
-V1 明确关闭：
+微信通知不是“顺手 print 一条消息”，而是 V2 明确认领的 Integration 子系统。
+
+接口：
+
+```text
+NotificationPort
+        │
+        └── WxPusherAdapter
+```
+
+Telegram Runtime、knowledge-ingest、K2C 只发标准化 Notification Event，不直接依赖 WxPusher SDK/HTTP 细节。
+
+## 17.2 不再实时转发 Telegram 原文
+
+V2 明确关闭：
 
 ```text
 Telegram 每条消息 → 微信
 ```
 
-微信不再复制出第二条信息流。
+微信只承担异常、人工介入和摘要，不复制第二条信息流。
 
-## 17.2 即时通知
+## 17.3 即时通知
 
 只在以下情况即时推送：
 
@@ -1043,19 +1137,22 @@ REVIEW_REQUIRED
 IMPORTANT_CAPABILITY
 ```
 
-示例：
+通知必须带稳定 `event_id`，适配器做发送幂等，避免 watcher 重启或 retry 后重复轰炸。
+
+建议最小字段：
 
 ```text
-【K2C REVIEW】
-来源：vip 大佬文集
-文件：xxx.pdf
-大小：72.4 MiB
-主题判断：认知提升
-原因：超过 50 MiB 自动下载阈值
-状态：等待人工决定
+event_id
+event_type
+source_item_id / job_id / capability_id
+title
+summary
+created_at
+attempt
+delivery_status
 ```
 
-## 17.3 Digest
+## 17.4 Digest
 
 固定：
 
@@ -1065,7 +1162,7 @@ IMPORTANT_CAPABILITY
 20:00
 ```
 
-Digest 统计自上一次 Digest 之后的增量，不重复刷全部历史。
+Digest 统计“自上一次成功 Digest cursor 之后”的增量，不按进程内存计数，因此 watcher 重启不会丢统计，也不会重复整天历史。
 
 建议内容：
 
@@ -1085,7 +1182,22 @@ K2C staged 数
 重要 Capability 摘要
 ```
 
----
+## 17.5 调度与可靠性
+
+Watcher 与 Digest 分开调度：
+
+```text
+telegram-watch
+→ LaunchAgent KeepAlive
+
+telegram-digest
+→ LaunchAgent StartCalendarInterval
+   08:00 / 12:00 / 20:00
+```
+
+Digest 自身按持久 cursor 幂等计算；若 Mac 在计划时刻不可运行，后续启动时仍可按 cursor 补算，不把“某次 launchd 没按秒触发”变成数据丢失。
+
+Notification Runtime 至少保存 delivery log，并对临时网络失败做有限 retry；连续失败进入 ERROR/doctor 可见状态，不无限重试。
 
 # 18. Retention 与 Provenance
 
@@ -1208,7 +1320,7 @@ knowledge-ingest telegram doctor
 - REVIEW 是否长期未处理；
 - 是否存在启用时间之后明显未 reconcile 的来源。
 
-`doctor --fix` V1 只允许执行无争议修复；涉及重新下载、大量补消息、覆盖文件等动作必须显式人工确认。
+`doctor --fix` V2 只允许执行无争议修复；涉及重新下载、大量补消息、覆盖文件等动作必须显式人工确认。
 
 ---
 
@@ -1225,7 +1337,7 @@ knowledge-ingest telegram doctor
 
 若已经 handoff 到 knowledge-ingest：
 
-V1 不自动反向重写已进入 Corpus 的 Job。
+V2 不自动反向重写已进入 Corpus 的 Job。
 
 记录：
 
@@ -1254,7 +1366,7 @@ source_deleted=true
 
 # 21. 分类模型的契约
 
-V1 不把分类逻辑写成不可测试的自由文本 prompt。
+V2 不把分类逻辑写成不可测试的自由文本 prompt。
 
 必须要求结构化输出。
 
@@ -1287,11 +1399,35 @@ Interest：
 - 不得因为模型不可用而丢消息；
 - classifier 版本与 policy 版本写入 Item 审计记录。
 
+## 21.1 Source AI Budget
+
+Source Runtime 不复用 Target 的业务账本，但复用现有 KI Budget Guard 的设计原则：
+
+```text
+acquire
+outcome
+quota
+retry limit
+breaker
+```
+
+Source AI Budget 独立记账，至少区分：
+
+```text
+noise_classifier
+pdf_interest_classifier
+review_assist
+```
+
+正常白名单 TEXT 不调用模型。预算耗尽或 breaker 打开时，默认退化到 REVIEW / KEEP-safe 行为，绝不因为省模型成本而静默 SKIP 知识。
+
+模型调用通道在实施前优先复用本机已有统一 worker/router 能力；设计层不把具体 provider/model 写死。
+
 ---
 
-# 22. Resource Collection V1 边界
+# 22. Resource Collection V2 边界
 
-Resource Collection 是正式概念，但 V1 只实现 Stub。
+Resource Collection 是正式概念，但 V2 只实现 Stub。
 
 结构：
 
@@ -1300,7 +1436,7 @@ ResourceCollectionStub
 ├── source_item_id
 ├── caption
 ├── cloud_url
-├── provider_guess
+├── provider_guess      # quark | baidu | unknown
 ├── estimated_size_text
 ├── estimated_count_text
 └── status=PENDING_RESOURCE
@@ -1319,6 +1455,8 @@ ResourceCollectionStub
 - 遍历 2755 个文件；
 - 创建数千个 Job。
 
+`provider_guess` 只做轻量识别并与现有 `baidu/quark` provider 枚举对齐；识别不出时必须为 `unknown`，不得猜测。
+
 未来单独设计 Cloud Resource Resolver 后，再 enrich：
 
 ```text
@@ -1335,7 +1473,7 @@ Stub
 
 # 23. CLI 与运维面
 
-推荐 V1 命令：
+推荐 V2 命令：
 
 ```bash
 knowledge-ingest telegram auth
@@ -1352,18 +1490,29 @@ knowledge-ingest telegram digest --since ...
 knowledge-ingest telegram doctor [--fix]
 ```
 
-常驻方式优先复用 macOS LaunchAgent，与现有 `knowledge-ingest watchdog` 运维风格一致。
+运维面分成两个 LaunchAgent：
 
-V1 不强制 Docker。原因：
+```text
+A. telegram-watch
+   KeepAlive
+   负责实时监听 + reconcile
+
+B. telegram-digest
+   StartCalendarInterval
+   08:00 / 12:00 / 20:00
+   负责读取持久 cursor 生成 Digest
+```
+
+不得用现有 15 分钟周期性 `ki-resume` LaunchAgent 替代 Telegram 常驻 watcher；两者职责不同。
+
+V2 不强制 Docker。原因：
 
 - 当前 `knowledge-ingest` 本身是本机 Python/uv 项目；
 - Telegram session 与本机 ORICO 数据根直接绑定；
-- LaunchAgent 与现有运行方式一致；
-- 为单一 watcher 引入 Docker 会增加 session mount、volume、网络和运维复杂度。
+- LaunchAgent 与现有运维体系一致；
+- 为单一 watcher 引入 Docker 会增加 session mount、volume、网络和排障复杂度。
 
-若未来 Source Runtime 独立服务化，再重新评估容器化。
-
----
+未来 Source Runtime 独立服务化时再重新评估容器化。
 
 # 24. 数据流详解
 
@@ -1421,12 +1570,12 @@ NewMessage(cloud url)
 → KEEP
 → create Pending Resource / Collection Stub
 → Digest / optional REVIEW notification
-→ STOP in V1
+→ STOP in V2
 ```
 
 ---
 
-# 25. 不做什么（V1 Non-goals）
+# 25. 不做什么（V2 Non-goals）
 
 明确不做：
 
@@ -1447,7 +1596,7 @@ NewMessage(cloud url)
 
 # 26. 验收标准
 
-V1 必须通过以下验收。
+V2 必须通过以下验收。
 
 ## A. Source Registry
 
@@ -1511,7 +1660,7 @@ V1 必须通过以下验收。
 - Telegram Source Runtime 不写 Capability Registry；
 - 自动化最多推进到 staged；
 - Publish / Activate 仍要求 K2C Human Gate；
-- `target=k2c` 未接入时必须诚实 BLOCKED / PRECONDITION_MISSING，不得伪装完整链路成功。
+- 必须复用现有 `target=k2c` Generic Target Runtime；Telegram 接入后既有 K2C target 回归测试与真实 handoff 语义不得退化。
 
 ---
 
@@ -1559,7 +1708,7 @@ Real Acceptance
 
 # 28. 未来扩展原则
 
-Telegram 是 Continuous Knowledge Ingestion 的第一个持续来源，但 V1 不提前实现其他来源。
+Telegram 是 Continuous Knowledge Ingestion 的第一个持续来源，但 V2 不提前实现其他来源。
 
 未来统一模型可以演进为：
 
@@ -1585,13 +1734,13 @@ Handoff
 
 但每个来源单独设计、单独实施、单独验收。
 
-不在 Telegram V1 中预建一个“万能 Source Framework”。
+不在 Telegram V2 中预建一个“万能 Source Framework”。
 
 ---
 
 # 29. 冻结决策清单
 
-本设计确认后，下列内容作为 Telegram V1 冻结输入：
+本设计确认后，下列内容作为 Telegram V2 冻结输入：
 
 ```text
 1. 归属：knowledge-ingest Source 层，不进入 K2C 内核
@@ -1603,38 +1752,52 @@ Handoff
 7. PDF：先 Interest Policy，后下载
 8. PDF 自动下载阈值：<=50 MiB
 9. >50 MiB：REVIEW，不是永久拒绝
-10. INCLUDE：AI/审计/商业/副业/赚钱/认知/效率等
-11. EXCLUDE：荐股/短线股票、恋爱、娱乐八卦等
+10. INCLUDE：AI/审计/商业/副业/赚钱/认知/效率/民宿/内容运营/直播电商/企业分析/长期投资方法等
+11. EXCLUDE：个股荐股/短线交易/行情预测/恋爱/娱乐八卦等
 12. 网盘：只保存原帖 + URL，PENDING
 13. 大型资源：Resource Collection Stub
 14. Noise：默认 KEEP / 明确广告 SKIP / 不确定 REVIEW
-15. 自动化：Telegram → ingest → compile → staged
-16. Human Gate：Publish / Activate
-17. 微信原文实时转发：关闭
-18. 微信即时通知：ERROR / REVIEW / IMPORTANT_CAPABILITY
-19. Digest：08:00 / 12:00 / 20:00
-20. Telegram 登录：个人账号 MTProto user session
-21. Client：V1 Telethon，经 TelegramClientPort 隔离
-22. Telegram Source Facts：SQLite
-23. knowledge-ingest Job Facts：job.yaml
-24. K2C Capability Facts：Capability Registry
-25. KEEP provenance：长期保留
-26. 原始 PDF：保留
-27. SKIP 原始记录：约 30 天后可清理
-28. 长期目标：Continuous Knowledge Ingestion
-29. 当前只实施 Telegram，不提前做 GitHub/Web/YouTube/公众号/Email
+15. 模型策略：规则优先；LLM 主要用于疑似广告、PDF Interest、少量 REVIEW
+16. Source AI Budget：与 Target Budget 分账，复用 acquire/outcome/quota/breaker 思想
+17. 自动化：Telegram → ingest → compile → staged
+18. Human Gate：Publish / Activate
+19. 微信原文实时转发：关闭
+20. Notification Runtime：NotificationPort + WxPusherAdapter + retry/dedup/delivery log
+21. 微信即时通知：ERROR / REVIEW / IMPORTANT_CAPABILITY
+22. Digest：08:00 / 12:00 / 20:00
+23. Telegram 登录：个人账号 MTProto user session
+24. Client：Telethon，经 TelegramClientPort 隔离，作为 optional dependency
+25. Telegram Source Facts：SQLite
+26. SQLite 并发：WAL + busy_timeout + watcher 单写队列 + maintenance lock
+27. knowledge-ingest Job Facts：job.yaml
+28. K2C Capability Facts：Capability Registry
+29. target=k2c：已存在，Telegram 必须复用，不得旁路
+30. KEEP provenance：长期保留
+31. 原始 PDF：保留
+32. SKIP 原始记录：约 30 天后可清理
+33. 长期目标：Continuous Knowledge Ingestion
+34. 当前只实施 Telegram，不提前做 GitHub/Web/YouTube/公众号/Email
 ```
 
----
+# 30. 实施前 Preflight 与回归基线
 
-# 30. 实施前必须解决的唯一系统级前置问题
+V2 已不存在“target=k2c 尚未落地”的系统级阻塞。实施前只做环境与契约 Preflight，不新增架构前置层。
 
-在开始完整 E2E 实施前，需要核实并完成：
+必须核对：
 
-> **knowledge-ingest 的 Generic Target Runtime 中正式注册 `k2c` Target。**
+```text
+1. local main == origin/main
+2. target=k2c 现有测试全绿
+3. knowledge-ingest 全量测试全绿
+4. ORICO 数据根可用
+5. Telegram optional dependency 可安装
+6. Telegram 首次 auth 可完成且 session 权限正确
+7. Source Handoff v2 的旧 v1 fixture 回归策略明确
+8. SQLite WAL / busy_timeout / maintenance lock 测试方案明确
+9. WxPusher 凭据与发送测试方案明确
+10. 两个 LaunchAgent（watch / digest）职责分离
+```
 
-当前 main 的事实与 K2C V5 设计存在这一处接口落差。
+本机环境里与 Telegram 无直接关系的既有运维异常，只作为 Preflight 单独处理，不写进 Telegram 核心状态机。
 
-建议把它作为 Telegram 实施计划的显式前置任务，而不是在 Telegram 模块中临时旁路。
-
-除此之外，本设计不要求修改 K2C V5 冻结架构。
+除此之外，本设计不修改 K2C V5 FROZEN 架构，也不重做 knowledge-ingest 已有 Job OS。
