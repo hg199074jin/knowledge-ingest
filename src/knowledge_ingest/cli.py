@@ -28,6 +28,7 @@ from knowledge_ingest.targets import (
 from knowledge_ingest.targets import (
     target_choices,
 )
+from knowledge_ingest.telegram.event_store import TelegramEventStore
 
 BAIDU_APP_PREFIXES = ("apps/bdpan", "/apps/bdpan")
 
@@ -354,6 +355,38 @@ def _build_parser() -> argparse.ArgumentParser:
     distill_prep.add_argument("job_id")
     distill_prep.add_argument("--target", required=True,
                               choices=target_choices())
+
+    tg = sub.add_parser("telegram", parents=[common],
+                        help="Telegram source operations (TG2: local state)")
+    tg_sub = tg.add_subparsers(dest="telegram_command", required=True)
+    tg_sources = tg_sub.add_parser("sources", parents=[common],
+                                   help="whitelist source registry")
+    tg_sources_sub = tg_sources.add_subparsers(
+        dest="telegram_sources_command", required=True)
+    tg_sources_sub.add_parser("list", parents=[common],
+                              help="list configured sources")
+    tg_show = tg_sources_sub.add_parser("show", parents=[common],
+                                        help="show one source")
+    tg_show.add_argument("source_id")
+    tg_enable = tg_sources_sub.add_parser("enable", parents=[common],
+                                          help="enable a source")
+    tg_enable.add_argument("source_id")
+    tg_disable = tg_sources_sub.add_parser("disable", parents=[common],
+                                           help="disable a source")
+    tg_disable.add_argument("source_id")
+    tg_sub.add_parser("status", parents=[common],
+                      help="read-only telegram state summary")
+    tg_review = tg_sub.add_parser("review", parents=[common],
+                                  help="human review queue")
+    tg_review_sub = tg_review.add_subparsers(dest="telegram_review_command",
+                                             required=True)
+    tg_review_sub.add_parser("list", parents=[common],
+                             help="list unresolved reviews")
+    tg_resolve = tg_review_sub.add_parser("resolve", parents=[common],
+                                          help="resolve a review")
+    tg_resolve.add_argument("review_id", type=int)
+    tg_resolve.add_argument("--decision", required=True,
+                            choices=["KEEP", "SKIP", "DOWNLOAD_ONCE"])
 
     return parser
 
@@ -1301,6 +1334,122 @@ def _cmd_report(config: AppConfig, args) -> int:
     return 0
 
 
+# ---- TG2：telegram 本地状态入口（冻结设计 §6/§8/§16/§23） ----
+
+
+def _telegram_db_path(config: AppConfig) -> Path:
+    return config.pipeline_root / "telegram" / "state.db"
+
+
+def _cmd_telegram(config: AppConfig, args) -> int:
+    if args.telegram_command == "status":
+        return _cmd_telegram_status(config, args)
+    if args.telegram_command == "sources":
+        sub = args.telegram_sources_command
+        if sub == "list":
+            return _cmd_telegram_sources_list(config, args)
+        store = TelegramEventStore(_telegram_db_path(config))
+        if sub == "show":
+            row = store.get_source(args.source_id)
+            if row is None:
+                print(f"error: source not found: {args.source_id}",
+                      file=sys.stderr)
+                return 2
+            for key in ("source_id", "chat_id", "display_name", "enabled",
+                        "start_at", "last_seen_message_id",
+                        "last_reconciled_at"):
+                print(f"{key}: {row[key]}")
+            return 0
+        if sub in ("enable", "disable"):
+            try:
+                store.set_source_enabled(args.source_id, sub == "enable")
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            print(f"{args.source_id}: {sub}d")
+            return 0
+        print(f"unknown sources command: {sub}", file=sys.stderr)
+        return 2
+    if args.telegram_command == "review":
+        sub = args.telegram_review_command
+        if sub == "list":
+            return _cmd_telegram_review_list(config, args)
+        if sub == "resolve":
+            return _cmd_telegram_review_resolve(config, args)
+        print(f"unknown review command: {sub}", file=sys.stderr)
+        return 2
+    print(f"unknown telegram command: {args.telegram_command}",
+          file=sys.stderr)
+    return 2
+
+
+def _cmd_telegram_sources_list(config: AppConfig, args) -> int:
+    store = TelegramEventStore(_telegram_db_path(config))
+    rows = store.list_sources()
+    if not rows:
+        print("no telegram sources configured")
+        return 0
+    for row in rows:
+        state = "enabled" if row["enabled"] else "disabled"
+        print(f"{row['source_id']}  {state}  "
+              f"start_at={row['start_at']}  "
+              f"last_seen={row['last_seen_message_id']}  "
+              f"{row['display_name']}")
+    return 0
+
+
+def _render_telegram_status(store) -> int:
+    summary = store.status_summary()
+    print(f"schema: user_version={summary['schema_version']}")
+    print(f"sources: enabled={summary['sources_enabled']} "
+          f"disabled={summary['sources_disabled']}")
+    print(f"messages: {summary['messages_total']}")
+    print(f"open_reviews: {summary['open_reviews']}")
+    print(f"pending_resources: {summary['pending_resources']}")
+    downloads = summary["downloads_by_status"]
+    print("downloads: " + (", ".join(
+        f"{key}={value}" for key, value in sorted(downloads.items()))
+        or "none"))
+    handoffs = summary["recent_handoffs"]
+    print("handoffs: " + (", ".join(
+        f"{item['item_id']}->{item['job_id']}" for item in handoffs)
+        or "none"))
+    pending_once = summary["download_once_pending"]
+    print("DOWNLOAD_ONCE pending: " + (", ".join(pending_once) or "none"))
+    return 0
+
+
+def _cmd_telegram_status(config: AppConfig, args) -> int:
+    return _render_telegram_status(
+        TelegramEventStore(_telegram_db_path(config)))
+
+
+def _cmd_telegram_review_list(config: AppConfig, args) -> int:
+    store = TelegramEventStore(_telegram_db_path(config))
+    rows = store.list_open_reviews()
+    if not rows:
+        print("no open reviews")
+        return 0
+    for row in rows:
+        size = row["size_bytes"]
+        print(f"review={row['review_id']}  item={row['item_id']}  "
+              f"reason={row['reason']}  kind={row['kind']}  "
+              f"size={size if size is not None else '-'}  "
+              f"created={row['created_at']}")
+    return 0
+
+
+def _cmd_telegram_review_resolve(config: AppConfig, args) -> int:
+    store = TelegramEventStore(_telegram_db_path(config))
+    try:
+        outcome = store.resolve_review(args.review_id, args.decision)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"review {args.review_id}: {outcome} (decision={args.decision})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1314,6 +1463,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "doctor":
             return _cmd_doctor(config, args)
+        if args.command == "telegram":
+            return _cmd_telegram(config, args)
         if args.command == "job" and args.job_command == "create":
             return _cmd_job_create(config, args)
         if args.command == "source" and args.source_command == "register":
