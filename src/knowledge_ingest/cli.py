@@ -458,7 +458,9 @@ def _telegram_provenance_error(handoff: dict) -> str | None:
     if not provenance.get("source_id"):
         return "invalid_telegram_provenance"
     message_ids = provenance.get("message_ids")
-    if not isinstance(message_ids, list) or not message_ids:
+    if (not isinstance(message_ids, list) or not message_ids
+            or not all(isinstance(i, int) and not isinstance(i, bool)
+                       for i in message_ids)):
         return "invalid_telegram_provenance"
     return None
 
@@ -1341,6 +1343,14 @@ def _telegram_db_path(config: AppConfig) -> Path:
     return config.pipeline_root / "telegram" / "state.db"
 
 
+def _open_telegram_store(config: AppConfig, *, create: bool):
+    """create=False 时读命令不得创建 state.db（方案 §4.6 只读约束）。"""
+    db = _telegram_db_path(config)
+    if not create and not db.exists():
+        return None
+    return TelegramEventStore(db)
+
+
 def _cmd_telegram(config: AppConfig, args) -> int:
     if args.telegram_command == "status":
         return _cmd_telegram_status(config, args)
@@ -1348,7 +1358,11 @@ def _cmd_telegram(config: AppConfig, args) -> int:
         sub = args.telegram_sources_command
         if sub == "list":
             return _cmd_telegram_sources_list(config, args)
-        store = TelegramEventStore(_telegram_db_path(config))
+        store = _open_telegram_store(config, create=False)
+        if store is None:
+            print("error: telegram state not initialized",
+                  file=sys.stderr)
+            return 2
         if sub == "show":
             row = store.get_source(args.source_id)
             if row is None:
@@ -1366,7 +1380,8 @@ def _cmd_telegram(config: AppConfig, args) -> int:
             except ValueError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 2
-            print(f"{args.source_id}: {sub}d")
+            state = "enabled" if sub == "enable" else "disabled"
+            print(f"{args.source_id}: {state}")
             return 0
         print(f"unknown sources command: {sub}", file=sys.stderr)
         return 2
@@ -1384,7 +1399,10 @@ def _cmd_telegram(config: AppConfig, args) -> int:
 
 
 def _cmd_telegram_sources_list(config: AppConfig, args) -> int:
-    store = TelegramEventStore(_telegram_db_path(config))
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("telegram state not initialized (no sources added)")
+        return 0
     rows = store.list_sources()
     if not rows:
         print("no telegram sources configured")
@@ -1403,6 +1421,12 @@ def _render_telegram_status(store) -> int:
     print(f"schema: user_version={summary['schema_version']}")
     print(f"sources: enabled={summary['sources_enabled']} "
           f"disabled={summary['sources_disabled']}")
+    for item in summary["sources_last_seen"]:
+        reconciled = item["last_reconciled_at"] or "-"
+        state = "on" if item["enabled"] else "off"
+        print(f"last_seen: {item['source_id']} ({state}) "
+              f"id={item['last_seen_message_id']} "
+              f"reconciled={reconciled}")
     print(f"messages: {summary['messages_total']}")
     print(f"open_reviews: {summary['open_reviews']}")
     print(f"pending_resources: {summary['pending_resources']}")
@@ -1420,12 +1444,18 @@ def _render_telegram_status(store) -> int:
 
 
 def _cmd_telegram_status(config: AppConfig, args) -> int:
-    return _render_telegram_status(
-        TelegramEventStore(_telegram_db_path(config)))
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("telegram state not initialized (no state.db)")
+        return 0
+    return _render_telegram_status(store)
 
 
 def _cmd_telegram_review_list(config: AppConfig, args) -> int:
-    store = TelegramEventStore(_telegram_db_path(config))
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("telegram state not initialized (no reviews)")
+        return 0
     rows = store.list_open_reviews()
     if not rows:
         print("no open reviews")
@@ -1440,7 +1470,10 @@ def _cmd_telegram_review_list(config: AppConfig, args) -> int:
 
 
 def _cmd_telegram_review_resolve(config: AppConfig, args) -> int:
-    store = TelegramEventStore(_telegram_db_path(config))
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("error: telegram state not initialized", file=sys.stderr)
+        return 2
     try:
         outcome = store.resolve_review(args.review_id, args.decision)
     except ValueError as exc:

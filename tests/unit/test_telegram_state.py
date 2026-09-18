@@ -300,6 +300,8 @@ def test_status_summary_readonly_and_empty_ok(tmp_path: Path):
 
 def test_cli_telegram_status_empty_db(tmp_path, capsys):
     config = make_config(tmp_path)
+    db = config.pipeline_root / "telegram" / "state.db"
+    TelegramEventStore(db)  # 已初始化但全空的库
     rc = _cmd_telegram_status(config, Namespace())
     assert rc == 0
     out = capsys.readouterr().out
@@ -344,3 +346,117 @@ def test_cli_review_resolve_flow(tmp_path, capsys):
     # 未消费的 DOWNLOAD_ONCE 在 status 中可见
     _cmd_telegram_status(config, Namespace())
     assert "DOWNLOAD_ONCE" in capsys.readouterr().out
+
+
+# ---------- 评审修复（review round 1） ----------
+
+def test_review_resolve_lost_race_does_not_overwrite(tmp_path, monkeypatch):
+    """并发竞态：读取 open 行后另一连接先解决为 SKIP，
+    本连接的 UPDATE 必须被 resolved_at IS NULL 守卫拦下。"""
+    store = make_store(tmp_path)
+    sid = make_source(store)
+    store.create_source_item("item-1", sid, "pdf", [9])
+    rid = store.create_review("item-1", "race")
+
+    other = TelegramEventStore(store.db_path)
+    other.resolve_review(rid, "SKIP")
+
+    stale = dict(store.get_review(rid))
+    stale["resolved_at"] = None
+    stale["decision"] = None  # 模拟 A 在 B 提交前读到的 open 行
+    monkeypatch.setattr(store, "get_review", lambda _rid: stale)
+
+    with pytest.raises(ReviewConflictError):
+        store.resolve_review(rid, "KEEP")
+    assert other.get_review(rid)["decision"] == "SKIP"  # 未被覆盖
+
+
+def test_review_resolve_lost_race_same_decision_noop(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    sid = make_source(store)
+    store.create_source_item("item-1", sid, "pdf", [9])
+    rid = store.create_review("item-1", "race")
+
+    other = TelegramEventStore(store.db_path)
+    other.resolve_review(rid, "KEEP")
+
+    stale = dict(store.get_review(rid))
+    stale["resolved_at"] = None
+    stale["decision"] = None
+    monkeypatch.setattr(store, "get_review", lambda _rid: stale)
+
+    assert store.resolve_review(rid, "KEEP") == "no-op"
+
+
+def test_add_source_chat_id_conflict_raises(tmp_path):
+    """chat_id 已被其他 source 占用时不得静默吞掉注册。"""
+    store = make_store(tmp_path)
+    make_source(store, "tg_a")  # chat_id=-1001234567890
+    with pytest.raises(ValueError, match="tg_a"):
+        store.add_source(source_id="tg_b", chat_id=-1001234567890,
+                         start_at=T1)
+    assert store.get_source("tg_b") is None
+
+
+def test_add_source_rebind_chat_id_raises(tmp_path):
+    store = make_store(tmp_path)
+    make_source(store, "tg_a")
+    with pytest.raises(ValueError, match="chat_id"):
+        store.add_source(source_id="tg_a", chat_id=-999, start_at=T1)
+    assert store.get_source("tg_a")["chat_id"] == -1001234567890
+
+
+def test_add_source_fills_missing_chat_id(tmp_path):
+    store = make_store(tmp_path)
+    store.add_source(source_id="tg_c", start_at=T0)
+    store.add_source(source_id="tg_c", chat_id=-777, start_at=T0)
+    assert store.get_source("tg_c")["chat_id"] == -777
+
+
+def test_status_includes_last_seen_summary(tmp_path):
+    """方案 §4.6：status 至少可见 last_seen / last_reconciled 摘要。"""
+    store = make_store(tmp_path)
+    store.add_source(source_id="tg_a", chat_id=-1, start_at=T0,
+                     last_seen_message_id=42)
+    summary = store.status_summary()
+    entry = summary["sources_last_seen"][0]
+    assert entry["source_id"] == "tg_a"
+    assert entry["last_seen_message_id"] == 42
+    assert "last_reconciled_at" in entry
+
+
+def test_message_delete_keeps_earliest_timestamp(tmp_path):
+    """重复 DELETE 幂等：保留最早 deleted_at（审计事实，§18/§20）。"""
+    store = make_store(tmp_path)
+    sid = make_source(store)
+    store.upsert_message(sid, 9, message_date=T1, text="正文")
+    store.mark_message_deleted(sid, 9, deleted_at=T1)
+    store.mark_message_deleted(sid, 9,
+                               deleted_at="2026-09-18T23:00:00+08:00")
+    assert store.get_message(sid, 9)["deleted_at"] == T1
+
+
+def test_readonly_cli_does_not_create_db(tmp_path, capsys):
+    """方案 §4.6：status/sources list/review list 只读，不创建 state.db。"""
+    config = make_config(tmp_path)
+    db = config.pipeline_root / "telegram" / "state.db"
+    assert _cmd_telegram_status(config, Namespace()) == 0
+    assert "not initialized" in capsys.readouterr().out
+    assert not db.exists()
+    assert _cmd_telegram_sources_list(config, Namespace()) == 0
+    capsys.readouterr()
+    assert _cmd_telegram_review_list(config, Namespace()) == 0
+    capsys.readouterr()
+    assert not db.exists()
+
+
+def test_cli_status_renders_last_seen(tmp_path, capsys):
+    config = make_config(tmp_path)
+    db = config.pipeline_root / "telegram" / "state.db"
+    store = TelegramEventStore(db)
+    store.add_source(source_id="tg_a", chat_id=-1, start_at=T0,
+                     last_seen_message_id=7)
+    assert _cmd_telegram_status(config, Namespace()) == 0
+    out = capsys.readouterr().out
+    assert "last_seen" in out
+    assert "tg_a" in out

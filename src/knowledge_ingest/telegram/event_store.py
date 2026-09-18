@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS source_items (
 );
 
 CREATE TABLE IF NOT EXISTS downloads (
-    item_id              TEXT NOT NULL,
+    item_id              TEXT NOT NULL REFERENCES source_items(item_id),
     document_message_id  INTEGER NOT NULL,
     telegram_document_id TEXT,
     expected_size_bytes  INTEGER,
@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS downloads (
 
 CREATE TABLE IF NOT EXISTS reviews (
     review_id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    item_id              TEXT NOT NULL,
+    item_id              TEXT NOT NULL REFERENCES source_items(item_id),
     reason               TEXT NOT NULL,
     kind                 TEXT,
     size_bytes           INTEGER,
@@ -168,7 +168,13 @@ class TelegramEventStore:
                    display_name: str = "", start_at: str | None = None,
                    last_seen_message_id: int = 0,
                    enabled: bool = True) -> None:
-        """幂等：重复 add 不改写既有事实（含 start_at 不倒退）。"""
+        """幂等：完全重复的 add 是 no-op；真实冲突显式报错。
+
+        - chat_id 已被其他 source 占用 → ValueError（不静默吞掉）；
+        - 同 source_id 试图改绑不同 chat_id → ValueError；
+        - 既有行 chat_id 为空时允许补填。
+        start_at 一经写入不倒退（§6.3）。
+        """
         now = _now_iso()
         with self._conn:
             self._conn.execute(
@@ -178,6 +184,27 @@ class TelegramEventStore:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (source_id, chat_id, display_name, int(enabled), start_at,
                  last_seen_message_id, now, now))
+        existing = self.get_source(source_id)
+        if existing is None:
+            owner = self._conn.execute(
+                "SELECT source_id FROM tg_sources WHERE chat_id = ?",
+                (chat_id,)).fetchone()
+            owner_id = owner["source_id"] if owner else "unknown"
+            raise ValueError(
+                f"chat_id {chat_id} already registered to source "
+                f"{owner_id}; refusing to register {source_id}")
+        existing_chat = existing["chat_id"]
+        if (chat_id is not None and existing_chat is not None
+                and existing_chat != chat_id):
+            raise ValueError(
+                f"source {source_id} already bound to chat_id "
+                f"{existing_chat}; refusing to rebind to {chat_id}")
+        if chat_id is not None and existing_chat is None:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE tg_sources SET chat_id = ?, updated_at = ? "
+                    "WHERE source_id = ?",
+                    (chat_id, _now_iso(), source_id))
 
     def get_source(self, source_id: str) -> sqlite3.Row | None:
         return self._conn.execute(
@@ -264,15 +291,20 @@ class TelegramEventStore:
 
     def mark_message_deleted(self, source_id: str, message_id: int, *,
                              deleted_at: str | None = None) -> None:
-        """冻结 §20.2：只记删除事实，不物理删除行。"""
+        """冻结 §20.2：只记删除事实，不物理删除行；重复删除幂等，
+        保留最早 deleted_at（首次删除时间是审计事实）。"""
         stamp = deleted_at or _now_iso()
         with self._conn:
             cursor = self._conn.execute(
                 "UPDATE tg_messages SET deleted_at = ? "
-                "WHERE source_id = ? AND message_id = ?",
+                "WHERE source_id = ? AND message_id = ? "
+                "AND deleted_at IS NULL",
                 (stamp, source_id, message_id))
-        if cursor.rowcount == 0:
-            raise ValueError(f"message not found: {source_id}#{message_id}")
+        if cursor.rowcount == 0 and \
+                self.get_message(source_id, message_id) is None:
+            raise ValueError(
+                f"message not found: {source_id}#{message_id}")
+        # 已删除（或刚删除成功）：保留最早时间戳，幂等返回
 
     # ---------- source items / downloads ----------
 
@@ -390,11 +422,22 @@ class TelegramEventStore:
                 f"review {review_id} already resolved as "
                 f"{row['decision']}; refusing to overwrite with "
                 f"{decision}")
+        # UPDATE 带 resolved_at IS NULL 守卫：读取与写入之间被并发
+        # 解决时 rowcount=0，以库内事实裁决，绝不静默覆盖
         with self._conn:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE reviews SET resolved_at = ?, decision = ? "
-                "WHERE review_id = ?",
+                "WHERE review_id = ? AND resolved_at IS NULL",
                 (_now_iso(), decision, review_id))
+        if cursor.rowcount == 0:
+            current = self._conn.execute(
+                "SELECT decision FROM reviews WHERE review_id = ?",
+                (review_id,)).fetchone()
+            if current is not None and current["decision"] == decision:
+                return "no-op"
+            raise ReviewConflictError(
+                f"review {review_id} was concurrently resolved; "
+                f"refusing to overwrite with {decision}")
         return "resolved"
 
     # ---------- status（只读，§23 telegram status） ----------
@@ -415,6 +458,12 @@ class TelegramEventStore:
         summary: dict[str, Any] = {"schema_version": self.user_version()}
         for key, sql in scalars.items():
             summary[key] = int(self._conn.execute(sql).fetchone()[0])
+        summary["sources_last_seen"] = [
+            {"source_id": row["source_id"],
+             "enabled": bool(row["enabled"]),
+             "last_seen_message_id": row["last_seen_message_id"],
+             "last_reconciled_at": row["last_reconciled_at"]}
+            for row in self.list_sources()]
         summary["downloads_by_status"] = {
             row["status"]: row["n"] for row in self._conn.execute(
                 "SELECT status, COUNT(*) AS n FROM downloads "

@@ -230,3 +230,22 @@ def test_baidu_scope_gate_not_applied_to_telegram(tmp_path: Path):
     assert loaded.status != "BLOCKED"
     reasons = [e.get("reason") for e in loaded.errors]
     assert "baidu_scope_limited" not in reasons
+
+
+def test_v2_telegram_non_int_message_ids_blocked(tmp_path: Path):
+    """message_ids 必须是非空 int 列表（身份字段，不允许字符串混入）。"""
+    config, store, job_id = make_job(tmp_path, "telegram")
+    provenance = telegram_provenance(message_ids=["a", "b"])
+    rc = register(config, job_id,
+                  write_telegram_handoff(tmp_path, provenance=provenance))
+    assert rc == 1
+    assert last_error_reason(store, job_id) == "invalid_telegram_provenance"
+
+
+def test_cli_parser_accepts_telegram_provider():
+    """argparse 层锁定 job create --provider telegram 可用。"""
+    from knowledge_ingest.cli import _build_parser
+    args = _build_parser().parse_args(
+        ["job", "create", "--provider", "telegram", "--source", "tg://x",
+         "--target", "k2c"])
+    assert args.provider == "telegram"
