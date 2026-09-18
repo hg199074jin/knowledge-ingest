@@ -1,14 +1,24 @@
 {
-  "schema_version": 1,
-  "provider": "quark",
+  "schema_version": 2,
+  "provider": "telegram",
   "remote": {
-    "id": "provider-id-or-null",
-    "path": "/审计课程/融资担保",
-    "name": "融资担保",
+    "id": "tg_<source_id>:<first_message_id>-<last_message_id>",
+    "path": null,
+    "name": "AI探索指南",
     "size_bytes": null,
     "mtime": null
   },
-  "local_path": "/Volumes/ORICO/KnowledgePipeline/jobs/<job>/source/融资担保",
+  "local_path": "/Volumes/ORICO/KnowledgePipeline/telegram/materialized/<item-id>/message.md",
   "download_completed": true,
-  "source_notes": []
+  "source_notes": [],
+  "provenance": {
+    "platform": "telegram",
+    "source_id": "tg_ai_explore",
+    "chat_id": -1001234567890,
+    "message_ids": [12345, 12346, 12347],
+    "sender_id": "<sender-id-or-null>",
+    "message_url": null,
+    "first_message_at": "2026-09-18T12:25:00+08:00",
+    "last_message_at": "2026-09-18T12:29:00+08:00"
+  }
 }

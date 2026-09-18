@@ -159,7 +159,7 @@ def _build_parser() -> argparse.ArgumentParser:
     create_cmd = job_sub.add_parser("create", parents=[common],
                                     help="create a new ingest job")
     create_cmd.add_argument("--provider", required=True,
-                            choices=["local", "baidu", "quark"])
+                            choices=["local", "baidu", "quark", "telegram"])
     create_cmd.add_argument("--source", required=True,
                             help="cloud path, share link, or local path")
     create_cmd.add_argument("--target", dest="targets", action="append",
@@ -411,9 +411,32 @@ def _cmd_job_create(config: AppConfig, args) -> int:
 BAIDU_APP_PATH = re.compile(r"^/?apps/bdpan(/|$)")
 
 
+def _telegram_provenance_error(handoff: dict) -> str | None:
+    """TG1：telegram 的最小 provenance 契约（冻结设计 §13.4/§13.5）。
+
+    身份三要素必须可读（platform / source_id / message_ids）；
+    未知键一律容忍；message_url 等可选字段缺席不拒绝。
+    """
+    provenance = handoff.get("provenance")
+    if not isinstance(provenance, dict):
+        return "invalid_telegram_provenance"
+    if provenance.get("platform") != "telegram":
+        return "invalid_telegram_provenance"
+    if not provenance.get("source_id"):
+        return "invalid_telegram_provenance"
+    message_ids = provenance.get("message_ids")
+    if not isinstance(message_ids, list) or not message_ids:
+        return "invalid_telegram_provenance"
+    return None
+
+
 def _handoff_validation_error(manifest, handoff: dict) -> str | None:
-    """Source Handoff 完成门：不完整/不存在/provider 不符一律拒绝。"""
-    if handoff.get("schema_version") != 1:
+    """Source Handoff 完成门：不完整/不存在/provider 不符一律拒绝。
+
+    TG1：schema v1/v2 并存（v1=既有 local/baidu/quark，
+    v2=telegram+provenance）；v3+ 仍 fail-fast。
+    """
+    if handoff.get("schema_version") not in (1, 2):
         return "invalid_handoff_schema"
     if handoff.get("download_completed") is not True:
         return "source_incomplete"
@@ -422,6 +445,8 @@ def _handoff_validation_error(manifest, handoff: dict) -> str | None:
     local = handoff.get("local_path")
     if not local or not Path(str(local)).expanduser().exists():
         return "source_missing"
+    if manifest.request.provider == "telegram":
+        return _telegram_provenance_error(handoff)
     return None
 
 

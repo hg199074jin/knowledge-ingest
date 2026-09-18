@@ -37,7 +37,7 @@ TERMINAL_TARGET_STATUSES = frozenset(
 ACTIVE_TARGET_STATUSES = frozenset({"RUNNING", "WAITING_USER"})
 
 TargetName = str  # v0.3：合法名由 targets.REGISTRY 校验（CLI choices / get()）
-ProviderName = Literal["local", "baidu", "quark"]
+ProviderName = Literal["local", "baidu", "quark", "telegram"]
 
 # v1 小写 target 状态字符串 → v2 枚举值（旧字符串原样映射，未知值 fail-fast）
 _LEGACY_TARGET_STATUS = {

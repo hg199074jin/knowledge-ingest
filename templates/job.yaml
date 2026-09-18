@@ -6,7 +6,7 @@ updated_at: "2026-09-06T00:00:00+08:00"
 status: CREATED
 request:
   raw_prompt: ""
-  provider: local   # local | baidu | quark
+  provider: local   # local | baidu | quark | telegram
   source: ""
   targets: []       # cangjie | personal | family_router（可多选）
 source: {}
