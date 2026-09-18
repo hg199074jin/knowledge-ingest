@@ -17,3 +17,11 @@ config.yaml
 
 # pytest artifact
 .coverage
+
+# TG3 安全门（冻结设计 §5.3；H1 Telegram Auth 前置条件，
+# 这五条缺一不可：session = 账号完全访问凭据）
+*.session
+*.session-journal
+credentials.env
+telegram-secrets*
+wxpusher.env

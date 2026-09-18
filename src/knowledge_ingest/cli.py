@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import fcntl
 import functools
 import json
@@ -29,6 +30,7 @@ from knowledge_ingest.targets import (
     target_choices,
 )
 from knowledge_ingest.telegram.event_store import TelegramEventStore
+from knowledge_ingest.telegram.registry import register_source
 
 BAIDU_APP_PREFIXES = ("apps/bdpan", "/apps/bdpan")
 
@@ -387,6 +389,18 @@ def _build_parser() -> argparse.ArgumentParser:
     tg_resolve.add_argument("review_id", type=int)
     tg_resolve.add_argument("--decision", required=True,
                             choices=["KEEP", "SKIP", "DOWNLOAD_ONCE"])
+    tg_sub.add_parser("auth", parents=[common],
+                      help="interactive Telegram login (H1: user present)")
+    tg_sub.add_parser("watch", parents=[common],
+                      help="run the live watcher (long-running)")
+    tg_sources_sub.add_parser("discover", parents=[common],
+                              help="list visible dialogs")
+    tg_add = tg_sources_sub.add_parser("add", parents=[common],
+                                       help="add a whitelisted source")
+    tg_add.add_argument("ref", help="@username or chat ref")
+    tg_add.add_argument("--source-id", required=True,
+                        help="stable local source id, e.g. tg_ai_explore")
+    tg_add.add_argument("--display-name", default=None)
 
     return parser
 
@@ -1352,12 +1366,20 @@ def _open_telegram_store(config: AppConfig, *, create: bool):
 
 
 def _cmd_telegram(config: AppConfig, args) -> int:
+    if args.telegram_command == "auth":
+        return _cmd_telegram_auth(config, args)
+    if args.telegram_command == "watch":
+        return _cmd_telegram_watch(config, args)
     if args.telegram_command == "status":
         return _cmd_telegram_status(config, args)
     if args.telegram_command == "sources":
         sub = args.telegram_sources_command
         if sub == "list":
             return _cmd_telegram_sources_list(config, args)
+        if sub == "discover":
+            return _cmd_telegram_sources_discover(config, args)
+        if sub == "add":
+            return _cmd_telegram_sources_add(config, args)
         store = _open_telegram_store(config, create=False)
         if store is None:
             print("error: telegram state not initialized",
@@ -1480,6 +1502,135 @@ def _cmd_telegram_review_resolve(config: AppConfig, args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(f"review {args.review_id}: {outcome} (decision={args.decision})")
+    return 0
+
+
+# ---- TG3：认证 / 监听 / 来源发现（冻结设计 §5.5-§5.7，§7） ----
+
+
+def _tg_session_dir() -> Path:
+    return Path.home() / ".config" / "knowledge-ingest" / "telegram"
+
+
+def _tg_repo_root() -> Path:
+    import knowledge_ingest
+
+    return Path(knowledge_ingest.__file__).resolve().parents[2]
+
+
+def _tg_build_adapter(config: AppConfig):
+    """从既有 session + credentials 构造 adapter；缺任一则提示 auth。"""
+    from knowledge_ingest.telegram import auth as tg_auth
+    from knowledge_ingest.telegram.telethon_adapter import TelethonAdapter
+
+    session_dir = _tg_session_dir()
+    if not tg_auth.has_session(session_dir):
+        print("error: no telegram session; "
+              "run: knowledge-ingest telegram auth", file=sys.stderr)
+        return None
+    try:
+        credentials = tg_auth.load_credentials(
+            session_dir / "credentials.env")
+    except tg_auth.TelegramAuthRequiredError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None
+    return TelethonAdapter(session_dir=session_dir, credentials=credentials)
+
+
+def _cmd_telegram_auth(config: AppConfig, args, *, repo_root=None,
+                       session_dir=None, signer=None) -> int:
+    """H1 人工环节：交互式登录。Agent 不得代替用户输入凭据。"""
+    from knowledge_ingest.telegram import auth as tg_auth
+    from knowledge_ingest.telegram.client_port import (
+        TelegramDependencyMissingError,
+    )
+
+    repo = Path(repo_root) if repo_root is not None else _tg_repo_root()
+    directory = (Path(session_dir) if session_dir is not None
+                 else _tg_session_dir())
+    if signer is None:
+        from knowledge_ingest.telegram.telethon_adapter import (
+            TelethonAdapter,
+        )
+
+        def signer(directory: Path, credentials: dict) -> Path:
+            adapter = TelethonAdapter(session_dir=directory,
+                                      credentials=credentials)
+            return adapter.interactive_sign_in()
+
+    try:
+        report = tg_auth.run_auth(repo_root=repo, session_dir=directory,
+                                  signer=signer)
+    except tg_auth.TelegramAuthRequiredError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except TelegramDependencyMissingError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"session: {report['session_path']}")
+    print(f"session_exists: {report['session_exists']}")
+    print(f"dir_mode_ok: {report['dir_mode_ok']}")
+    print(f"file_mode_ok: {report['file_mode_ok']}")
+    return 0
+
+
+def _cmd_telegram_watch(config: AppConfig, args) -> int:
+    from knowledge_ingest.telegram.watcher import TelegramWatcher
+
+    adapter = _tg_build_adapter(config)
+    if adapter is None:
+        return 2
+    store = TelegramEventStore(_telegram_db_path(config))
+    watcher = TelegramWatcher(store, client=adapter)
+    print("telegram watcher running (Ctrl-C to stop); "
+          "live updates + periodic reconcile")
+    try:
+        asyncio.run(watcher.run())
+    except KeyboardInterrupt:
+        print("watcher stopped")
+    return 0
+
+
+def _cmd_telegram_sources_discover(config: AppConfig, args) -> int:
+    adapter = _tg_build_adapter(config)
+    if adapter is None:
+        return 2
+    dialogs = asyncio.run(adapter.list_dialogs())
+    if not dialogs:
+        print("no dialogs visible")
+        return 0
+    for dialog in dialogs:
+        username = f"@{dialog.username}" if dialog.username else "-"
+        print(f"{dialog.chat_id}  {username}  {dialog.title}")
+    return 0
+
+
+def _cmd_telegram_sources_add(config: AppConfig, args, *, client=None):
+    """§5.6：首次 add 即写 start_at（当前时刻）+ last_seen（当前边界），
+    绝不导入历史消息。client 参数供测试注入 fake。"""
+    if client is None:
+        client = _tg_build_adapter(config)
+        if client is None:
+            return 2
+
+    async def flow():
+        store = TelegramEventStore(_telegram_db_path(config))
+        dialog = await client.resolve_chat(args.ref)
+        latest = await client.latest_message(dialog.chat_id)
+        last_seen = latest.message_id if latest is not None else 0
+        register_source(store, args.source_id, chat_id=dialog.chat_id,
+                        display_name=args.display_name or dialog.title)
+        store.touch_source_cursor(args.source_id,
+                                  last_seen_message_id=last_seen)
+        print(f"source added: {args.source_id}  "
+              f"chat_id={dialog.chat_id}  last_seen={last_seen}  "
+              f"(start_at=now; no historical import)")
+
+    try:
+        asyncio.run(flow())
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

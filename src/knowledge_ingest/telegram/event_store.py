@@ -211,6 +211,11 @@ class TelegramEventStore:
             "SELECT * FROM tg_sources WHERE source_id = ?",
             (source_id,)).fetchone()
 
+    def get_source_by_chat_id(self, chat_id: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM tg_sources WHERE chat_id = ?",
+            (chat_id,)).fetchone()
+
     def list_sources(self) -> list[sqlite3.Row]:
         return self._conn.execute(
             "SELECT * FROM tg_sources ORDER BY source_id").fetchall()
@@ -221,6 +226,22 @@ class TelegramEventStore:
                 "UPDATE tg_sources SET enabled = ?, updated_at = ? "
                 "WHERE source_id = ?",
                 (int(enabled), _now_iso(), source_id))
+        if cursor.rowcount == 0:
+            raise ValueError(f"source not found: {source_id}")
+
+    def touch_source_cursor(self, source_id: str, *,
+                            last_seen_message_id: int | None = None,
+                            last_reconciled_at: str | None = None) -> None:
+        """§4.7：reconcile 后推进 last_seen / last_reconciled 游标。"""
+        with self._conn:
+            cursor = self._conn.execute(
+                """UPDATE tg_sources SET
+                     last_seen_message_id = COALESCE(?, last_seen_message_id),
+                     last_reconciled_at = COALESCE(?, last_reconciled_at),
+                     updated_at = ?
+                   WHERE source_id = ?""",
+                (last_seen_message_id, last_reconciled_at, _now_iso(),
+                 source_id))
         if cursor.rowcount == 0:
             raise ValueError(f"source not found: {source_id}")
 

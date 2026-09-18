@@ -11,10 +11,18 @@ dependencies = [
 [project.scripts]
 knowledge-ingest = "knowledge_ingest.cli:main"
 
+[project.optional-dependencies]
+# TG3：Telegram MTProto 支持为可选 extra；核心 KI 不安装 Telethon
+# 也能完整工作（冻结设计 §3.4/§5.2）。版本由 uv 求解，不硬编码失真值。
+telegram = [
+  "Telethon>=1.41,<2",
+]
+
 [dependency-groups]
 dev = [
   "pytest>=8.3,<9",
   "pytest-cov>=5,<8",
+  "pytest-asyncio>=0.25,<2",
   "ruff>=0.8,<1",
 ]
 
