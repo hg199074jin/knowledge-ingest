@@ -54,9 +54,9 @@ def load_credentials(path: Path) -> dict[str, str]:
     return creds
 
 
-def ensure_gitignore_gate(repo_root: Path) -> list[str]:
+def ensure_gitignore_gate(repo_root: str | Path) -> list[str]:
     """H1 前置安全门：返回缺失的 .gitignore 模式列表（空 = 通过）。"""
-    gitignore = repo_root / ".gitignore"
+    gitignore = Path(repo_root) / ".gitignore"
     content = (gitignore.read_text(encoding="utf-8")
                if gitignore.is_file() else "")
     return [pattern for pattern in GITIGNORE_REQUIRED_PATTERNS
