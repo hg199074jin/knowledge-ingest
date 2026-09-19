@@ -268,3 +268,59 @@ def test_to_event_with_document():
     assert event.document is not None
     assert event.document.file_name == "课程.pdf"
     assert event.document.size_bytes == 1024
+
+
+def test_r8_live_handlers_are_awaitable(tmp_path):
+    """R8（生产日志实测）：telethon 1.45 的派发是 `await callback(event)`；
+    同步 handler 返回 None → 每条 update 在 telethon 内部抛
+    TypeError（消息仍入队，但每条日志一个 traceback，异常还发生在
+    别人的派发器里）。handler 必须是协程函数。"""
+    import contextlib
+    import inspect
+    from types import SimpleNamespace
+
+    from knowledge_ingest.telegram.telethon_adapter import TelethonAdapter
+
+    class DuckTelethonClient:
+        def __init__(self):
+            self.handlers = []
+
+        def is_connected(self):
+            return True
+
+        async def connect(self):
+            return None
+
+        def add_event_handler(self, callback, event):
+            self.handlers.append(callback)
+
+        def remove_event_handler(self, callback, event):
+            if callback in self.handlers:
+                self.handlers.remove(callback)
+
+    duck = DuckTelethonClient()
+    adapter = TelethonAdapter(session_dir=tmp_path / "s", credentials={})
+    adapter._client = duck
+    message = SimpleNamespace(
+        id=11, chat_id=-1001234567890,
+        date=datetime(2026, 9, 18, 2, 0, tzinfo=UTC), edit_date=None,
+        sender_id=1, message="hi", document=None)
+    update_event = SimpleNamespace(message=message,
+                                   chat_id=-1001234567890)
+
+    async def drive():
+        generator = adapter.watch_updates()
+        task = asyncio.create_task(generator.__anext__())
+        await asyncio.sleep(0.02)
+        handlers = list(duck.handlers)
+        assert len(handlers) == 3
+        for handler in handlers:          # telethon 的派发路径
+            await handler(update_event)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return handlers
+
+    handlers = asyncio.run(drive())
+    assert all(inspect.iscoroutinefunction(handler)
+               for handler in handlers)

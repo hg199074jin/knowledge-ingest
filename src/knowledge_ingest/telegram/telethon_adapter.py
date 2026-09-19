@@ -291,7 +291,10 @@ class TelethonAdapter:
         queue: asyncio.Queue[TelegramEvent] = asyncio.Queue()
 
         def make_handler(kind: TelegramEventKind):
-            def handler(update_event):
+            # R8：必须是协程函数——telethon 1.45 的派发是无条件
+            # `await callback(event)`，同步 handler 返回 None 会让每条
+            # update 在 telethon 内部抛 TypeError（生产日志实测）。
+            async def handler(update_event):
                 message = getattr(update_event, "message", None)
                 chat_id = (getattr(update_event, "chat_id", None)
                            or getattr(message, "chat_id", 0) or 0)
