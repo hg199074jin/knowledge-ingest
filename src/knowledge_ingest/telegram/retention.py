@@ -68,8 +68,15 @@ def run(config: AppConfig, *, days: int = DEFAULT_DAYS,
     with maintenance_lock(db):
         # 锁内重算候选（迁移/并发可能已改变事实）
         cands = candidates(store, days=days)
+        attachments_root = (config.pipeline_root / "telegram"
+                            / "attachments").resolve()
         for c in cands:
             path = Path(c["local_path"])
+            # 路径安全：只删 attachments 根下的文件（防误删）
+            if attachments_root not in path.resolve().parents:
+                print(f"retention: skip (outside attachments root): "
+                      f"{path}")
+                continue
             if path.is_file():
                 path.unlink()
             store.mark_download_purged(c["item_id"])

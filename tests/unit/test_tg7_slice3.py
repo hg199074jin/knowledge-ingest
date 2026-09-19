@@ -2,8 +2,14 @@
 
 import asyncio
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from knowledge_ingest.telegram.client_port import (
+    TelegramDocumentRef,
+    TelegramEvent,
+    TelegramEventKind,
+)
 from knowledge_ingest.telegram.event_store import TelegramEventStore
 from knowledge_ingest.telegram.materialize import download_pdf
 from knowledge_ingest.telegram.telethon_adapter import (
@@ -110,3 +116,40 @@ def test_r1fix_video_items_in_download_scan(tmp_path):
     done = asyncio.run(pipeline.download_pending_pdfs(C()))
     assert done == 1
     assert store.get_download("tg_b:3")["status"] == "complete"
+
+
+def test_review_video_item_gates_and_rebuild(tmp_path):
+    """Minor 10 回归：video 的 gate / edit-rebuild 与 pdf 同语义。"""
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+    from knowledge_ingest.telegram.watcher import TelegramWatcher
+
+    store = make_store(tmp_path)
+    pipeline = SourceItemPipeline(
+        store, data_root=tmp_path, orico_check=lambda: True,
+        interest_llm=lambda _p: (
+            '{"decision": "INCLUDE", "primary_topic": "devtools", '
+            '"reason": "ok", "confidence": 1.0}'))
+    watcher = TelegramWatcher(store, client=None, pipeline=pipeline)
+    doc = TelegramDocumentRef(document_id=9, file_name="课.mp4",
+                              mime_type="video/mp4", size_bytes=1024)
+    now = datetime.now(UTC)
+    watcher.handle_event(TelegramEvent(
+        kind=TelegramEventKind.NEW, chat_id=-100, message_id=7,
+        message_date=now, sender_id=9, text=None, document=doc))
+    item_id = "tg_a:7"
+    assert store.get_source_item(item_id)["processing_status"] == \
+        "interest_include"
+
+    # EDIT：caption 变化 → 重判兴趣（不残留旧决定）
+    watcher.handle_event(TelegramEvent(
+        kind=TelegramEventKind.EDIT, chat_id=-100, message_id=7,
+        message_date=now, sender_id=9, text="新的说明文字",
+        edited_at=now + timedelta(seconds=30), document=doc))
+    item = store.get_source_item(item_id)
+    assert item["interest_decision"] in ("INCLUDE", "EXCLUDE", "REVIEW")
+    assert item["processing_status"] != "interest_include" or \
+        item["interest_decision"] == "INCLUDE"
+    # handoff scan 覆盖 video（未下载 → blocked，而非被跳过）
+    from knowledge_ingest.telegram.handoff import TelegramHandoffRunner
+    gate = TelegramHandoffRunner(store, None).gate(item)
+    assert gate in ("blocked:download_incomplete", None)

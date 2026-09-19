@@ -98,6 +98,19 @@ def run_checks(config: AppConfig, *,
                          "PASS" if not bad_sources else "FAIL",
                          ", ".join(bad_sources) or "全部绑定"))
 
+    # cursor 未倒退/未滞后（§10.2：advance_seen 用 MAX 结构性防倒退；
+    # 此处检查 last_seen 是否落后于库内最大消息 id）
+    lagging = [r["source_id"] for r in store._conn.execute(
+        """SELECT source_id FROM (
+               SELECT s.source_id, s.last_seen_message_id,
+                      (SELECT MAX(message_id) FROM tg_messages m
+                       WHERE m.source_id = s.source_id) mx
+               FROM tg_sources s WHERE s.enabled = 1)
+           WHERE mx IS NOT NULL AND last_seen_message_id < mx""")]
+    checks.append(_check("cursor 未倒退/未滞后",
+                         "PASS" if not lagging else "WARN",
+                         ", ".join(lagging) or "全部同步"))
+
     # 长时间未 reconcile
     fresh = store._conn.execute(
         "SELECT MAX(last_reconciled_at) m FROM tg_sources "

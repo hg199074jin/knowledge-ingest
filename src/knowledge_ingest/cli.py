@@ -2254,18 +2254,24 @@ def _cmd_telegram_digest(config: AppConfig, args) -> int:
     since = store.get_digest_state("digest:last_sent_at")
     digest = build_digest(store, since=since)
     print(digest)
-    if args.send:
-        port, uid = _tg_ports(config)
-        event_id = f"digest-{uuid.uuid4().hex[:8]}"
-        delivered = notify(store, port, event_id=event_id,
-                           channel="wxpusher", uid=uid,
-                           summary="Telegram 采集日报", content=digest)
-        print("digest sent" if delivered else
-              "digest not delivered（无凭据或投递失败）")
-        store.set_digest_state("digest:last_sent_at",
-                               datetime.now(UTC).isoformat(timespec="seconds"))
-    else:
+    if not args.send:
         print("(dry-run: 加 --send 才会投递)")
+        return 0
+    port, uid = _tg_ports(config)
+    # 稳定 event_id：同一游标窗口 + 同一天 = 同一事件（崩溃重跑不重发）
+    event_id = ("digest-" + (since or "initial") + "-"
+                + datetime.now(UTC).date().isoformat())
+    delivered = notify(store, port, event_id=event_id,
+                       channel="wxpusher", uid=uid,
+                       summary="Telegram 采集日报", content=digest)
+    if delivered:
+        # §9.6：只在成功投递后推进游标——失败的窗口不会丢
+        store.set_digest_state(
+            "digest:last_sent_at",
+            datetime.now(UTC).isoformat(timespec="seconds"))
+        print("digest sent；游标已推进")
+    else:
+        print("digest 未投递（无凭据或投递失败）：游标不推进，事件保留可重试")
     return 0
 
 

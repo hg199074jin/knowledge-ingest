@@ -529,7 +529,8 @@ class SourceItemPipeline:
             if not self.store.has_open_review(item_id,
                                               "interest_uncertain"):
                 self.store.create_review(item_id, "interest_uncertain",
-                                         kind="pdf", size_bytes=size)
+                                         kind=item["kind"],
+                                         size_bytes=size)
         else:                                   # INCLUDE
             self.store.set_item_processing_status(item_id,
                                                   "interest_include")
@@ -548,7 +549,7 @@ class SourceItemPipeline:
             return
         reason = "pdf size unknown" if size is None else "size over 50 MiB"
         if not self.store.has_open_review(item_id, reason):
-            self.store.create_review(item_id, reason, kind="pdf",
+            self.store.create_review(item_id, reason, kind=item["kind"],
                                      size_bytes=size)
 
     def _live_texts(self, item_id: str) -> list[str]:

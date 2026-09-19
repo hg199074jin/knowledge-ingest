@@ -278,6 +278,12 @@ class TelegramEventStore:
             "SELECT 1 FROM notifications WHERE event_id = ?",
             (event_id,)).fetchone() is not None
 
+    def notification_delivered(self, event_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT delivered_at FROM notifications WHERE event_id = ?",
+            (event_id,)).fetchone()
+        return row is not None and row["delivered_at"] is not None
+
     def get_digest_state(self, key: str) -> str | None:
         row = self._conn.execute(
             "SELECT value FROM digest_state WHERE key = ?", (key,)).fetchone()

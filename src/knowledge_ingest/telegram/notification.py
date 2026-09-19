@@ -81,10 +81,18 @@ def null_port(uid: str, summary: str, content: str) -> bool:
 def notify(store: TelegramEventStore, port: NotificationPort, *,
            event_id: str, channel: str, summary: str, content: str,
            uid: str) -> bool:
-    """幂等通知：事件先落库；已存在的事件绝不重发。"""
-    if not store.record_notification(event_id, channel, summary, content):
+    """幂等通知：事件先落库；**已成功投递**的事件拒绝重放。
+
+    投递失败/异常 → 事件保留在未投递态，同一 event_id 再次调用会重试
+    （评审 I6：原实现失败后事件被永久消费，"补凭据后可重发"没有实现）。
+    """
+    fresh = store.record_notification(event_id, channel, summary, content)
+    if not fresh and store.notification_delivered(event_id):
         return False                                  # 已投递过：重放安全
-    delivered = port.send(uid, summary, content)
+    try:
+        delivered = port.send(uid, summary, content)
+    except Exception:                                 # noqa: BLE001
+        return False                                  # 未送达：保留重试
     if delivered:
         store.mark_notification_delivered(event_id)
     return delivered
@@ -116,4 +124,17 @@ def build_digest(store: TelegramEventStore, *,
         for r in rows:
             lines.append(f"  {r['item_id']} [{r['kind']}] "
                          f"{r['processing_status']}")
+        # §9.7：分类分布与进入 KI 计数（TG7 评审 I7 补齐的日报内容）
+        counts = store._conn.execute(
+            """SELECT kind, processing_status, COUNT(*) n
+               FROM source_items WHERE created_at > ?
+               GROUP BY kind, processing_status ORDER BY n DESC""",
+            (since,)).fetchall()
+        breakdown = ", ".join(f"{r['kind']}/{r['processing_status']}={r['n']}"
+                              for r in counts)
+        lines.append(f"  分布：{breakdown or '无'}")
+        handed = store._conn.execute(
+            "SELECT COUNT(*) FROM source_items WHERE created_at > ? "
+            "AND handoff_completed = 1", (since,)).fetchone()[0]
+        lines.append(f"  进入 KI（handoff）：{handed} 条")
     return "\n".join(lines)
