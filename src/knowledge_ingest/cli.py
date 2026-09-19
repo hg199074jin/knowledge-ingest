@@ -404,6 +404,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "handoff", parents=[common],
         help="hand one source item to knowledge-ingest (explicit, gated)")
     tg_handoff.add_argument("item_id")
+    tg_dryrun = tg_sub.add_parser(
+        "classify-dryrun", parents=[common],
+        help="run the classifier channel over parked samples (read-only)")
+    tg_dryrun.add_argument("--limit", type=int, default=None)
     tg_budget = tg_sub.add_parser(
         "budget", parents=[common],
         help="source AI budget ledger (show / reset)")
@@ -1401,6 +1405,8 @@ def _cmd_telegram(config: AppConfig, args) -> int:
         return _cmd_telegram_download(config, args)
     if args.telegram_command == "handoff":
         return _cmd_telegram_handoff(config, args)
+    if args.telegram_command == "classify-dryrun":
+        return _cmd_telegram_classify_dryrun(config, args)
     if args.telegram_command == "budget":
         return _cmd_telegram_budget(config, args)
     if args.telegram_command == "sources":
@@ -1842,6 +1848,82 @@ def _cmd_telegram_download(config: AppConfig, args, *, client=None) -> int:
           f"{row['attempts'] if row else 0} attempts); "
           "see: knowledge-ingest telegram review list")
     return 1
+
+
+def _cmd_telegram_classify_dryrun(config: AppConfig, args, *,
+                                  channel=None) -> int:
+    """用配置好的通道对现存 parked 样本试跑（只读：不写账本、不改状态）。
+
+    开通道之前先看它对真实样本怎么判——合规率、判定分布、单次耗时；
+    这一步零生产影响（预算不记账、Item 状态不动）。
+    """
+    from knowledge_ingest.telegram.classify import (
+        classify_interest,
+        classify_noise,
+    )
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("telegram state not initialized (no state.db)")
+        return 0
+    if channel is None:
+        channel, _budget = _tg_classifier_channel(store)
+        if channel is None:
+            print("error: no classifier channel configured "
+                  "(set KI_TELEGRAM_LLM_CMD)", file=sys.stderr)
+            return 2
+    pipeline = SourceItemPipeline(store, data_root=config.pipeline_root)
+    rows = [row for row in store.list_source_items()
+            if row["processing_status"] in ("noise_review",
+                                            "interest_review")]
+    limit = getattr(args, "limit", None)
+    if limit:
+        rows = rows[:limit]
+    if not rows:
+        print("no parked items to dry-run")
+        return 0
+    decisions: dict[str, int] = {}
+    elapsed_total = 0.0
+    counted = 0
+    for row in rows:
+        started = time.monotonic()
+        try:
+            if row["kind"] == "pdf":
+                message = store.get_message(row["source_id"],
+                                            row["last_message_id"])
+                source = store.get_source(row["source_id"])
+                meta = {
+                    "caption": message["text"] if message else None,
+                    "filename": message["document_name"] if message else None,
+                    "size_bytes": (message["document_size_bytes"]
+                                   if message else None),
+                    "source_display_name": (source["display_name"]
+                                            if source else None),
+                }
+                decision = classify_interest(meta, llm=channel,
+                                             source_id=row["source_id"])
+                label, reason = decision.decision, decision.reason
+            else:
+                decision = classify_noise(pipeline.live_text(row["item_id"]),
+                                          llm=channel,
+                                          source_id=row["source_id"])
+                label, reason = decision.decision, decision.reason_code
+        except Exception as exc:            # noqa: BLE001 —— 试跑不中断
+            print(f"{row['item_id']:20} ERROR  {exc}")
+            continue
+        elapsed = time.monotonic() - started
+        elapsed_total += elapsed
+        counted += 1
+        decisions[label] = decisions.get(label, 0) + 1
+        print(f"{row['item_id']:20} {label:8} conf={decision.confidence:<4} "
+              f"{elapsed:5.1f}s  {str(reason)[:50]}")
+    print(f"\ndry-run: {counted}/{len(rows)} item(s) classified, "
+          f"{elapsed_total:.1f}s total, "
+          f"mean {elapsed_total / max(counted, 1):.1f}s; "
+          f"decisions={decisions or '{}'}")
+    print("note: nothing was written (no budget, no item status change)")
+    return 0
 
 
 def _cmd_telegram_handoff(config: AppConfig, args) -> int:

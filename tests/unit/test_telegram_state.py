@@ -735,3 +735,47 @@ def test_r9_budget_limits_from_env(monkeypatch):
     monkeypatch.setenv("KI_TELEGRAM_LLM_MAX_CALLS", "abc")
     with pytest.raises(ValueError):
         _tg_budget_limits()
+
+
+def test_r9_classify_dryrun_is_read_only(tmp_path, capsys):
+    """试跑：只读——不写预算账本、不改 Item 状态。"""
+    import json as _json
+
+    from knowledge_ingest.cli import _cmd_telegram_classify_dryrun
+
+    config = make_config(tmp_path)
+    store = TelegramEventStore(config.pipeline_root / "telegram" / "state.db")
+    store.add_source(source_id="tg_a", chat_id=-1, start_at=T0,
+                     display_name="A")
+    store.upsert_message("tg_a", 7,
+                         message_date="2026-09-18T10:00:00+08:00",
+                         text="疑似广告的长正文，含私聊与领取字样。" * 20)
+    store.create_source_item("tg_a:7", "tg_a", "text", [7],
+                             processing_status="noise_review")
+    store.finalize_item("tg_a:7", status="noise_review")
+    store.set_item_noise("tg_a:7", "REVIEW")
+    store.create_review("tg_a:7", "noise_uncertain", kind="text")
+
+    def fake_channel(_prompt):
+        return _json.dumps({"decision": "SKIP", "reason_code": "ad",
+                            "confidence": 0.9})
+
+    assert _cmd_telegram_classify_dryrun(config, Namespace(limit=None),
+                                         channel=fake_channel) == 0
+    out = capsys.readouterr().out
+    assert "SKIP" in out and "decisions={'SKIP': 1}" in out
+    assert "nothing was written" in out
+    assert store.list_ai_budgets() == []                      # 不记账
+    assert store.get_source_item("tg_a:7")["processing_status"] == \
+        "noise_review"                                        # 不改状态
+
+
+def test_r9_classify_dryrun_requires_channel(tmp_path, capsys, monkeypatch):
+    from knowledge_ingest.cli import _cmd_telegram_classify_dryrun
+
+    monkeypatch.delenv("KI_TELEGRAM_LLM_CMD", raising=False)
+    config = make_config(tmp_path)
+    TelegramEventStore(config.pipeline_root / "telegram" / "state.db")
+    rc = _cmd_telegram_classify_dryrun(config, Namespace(limit=None))
+    assert rc == 2
+    assert "no classifier channel configured" in capsys.readouterr().err

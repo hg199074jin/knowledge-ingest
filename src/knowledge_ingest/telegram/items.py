@@ -513,6 +513,10 @@ class SourceItemPipeline:
         return [row["text"] for row in self.store.get_item_messages(item_id)
                 if row["text"] and not row["deleted_at"]]
 
+    def live_text(self, item_id: str) -> str:
+        """Item 的幸存正文（拼接版；试跑/审计用，不写任何状态）。"""
+        return "\n\n".join(self._live_texts(item_id))
+
     def _orico(self):
         from .materialize import orico_ready
 
