@@ -31,12 +31,19 @@ def _iso(value: datetime) -> str:
 
 class TelegramWatcher:
     def __init__(self, store: TelegramEventStore,
-                 client: TelegramClientPort | None = None):
+                 client: TelegramClientPort | None = None,
+                 pipeline=None):
         self.store = store
         self.client = client
+        # TG4：可选 Item 层（原始事实落库后回调；§19.2 顺序不变）
+        self.pipeline = pipeline
 
     def handle_event(self, event) -> str:
-        """三类 update → Raw Event；返回处理结果供测试/日志观测。"""
+        """三类 update → Raw Event；返回处理结果供测试/日志观测。
+
+        落库成功后回调可选 pipeline（TG4 Item 层）；§19.2 顺序：
+        先 SQLite commit，后任何下游。
+        """
         source = self.store.get_source_by_chat_id(event.chat_id)
         if source is None:
             return "ignored"  # 非白名单来源
@@ -49,6 +56,8 @@ class TelegramWatcher:
                                                 event.message_id)
             except ValueError:
                 return "ignored"  # 从未入库的消息：无需标记
+            if self.pipeline is not None:
+                self.pipeline.on_raw(event, "deleted", source_id)
             return "deleted"
         document = event.document
         try:
@@ -71,11 +80,12 @@ class TelegramWatcher:
                            if event.edited_at else None))
         except MessageBeforeStartError:
             return "skipped_old"  # §6.3 硬边界：永不历史回溯
-        if event.kind is TelegramEventKind.EDIT:
-            self.store.advance_seen(source_id, event.message_id)
-            return "updated"
         self.store.advance_seen(source_id, event.message_id)
-        return "stored"
+        status = ("updated" if event.kind is TelegramEventKind.EDIT
+                  else "stored")
+        if self.pipeline is not None:
+            self.pipeline.on_raw(event, status, source_id)
+        return status
 
     async def reconcile(self, source_id: str) -> int:
         """§5.7 B 路径：只补 start_at 之后、cursor 之前的缺口。"""

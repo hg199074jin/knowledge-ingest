@@ -342,6 +342,7 @@ class TelegramEventStore:
     def create_source_item(self, item_id: str, source_id: str, kind: str,
                            message_ids: list[int], *,
                            processing_status: str = "open") -> None:
+        """确定性 item_id 重放时幂等（§19.3；评审 TG4 备注）。"""
         if kind not in ITEM_KINDS:
             raise ValueError(f"invalid item kind: {kind}")
         if not message_ids:
@@ -349,7 +350,7 @@ class TelegramEventStore:
         now = _now_iso()
         with self._conn:
             self._conn.execute(
-                """INSERT INTO source_items
+                """INSERT OR IGNORE INTO source_items
                    (item_id, source_id, kind, first_message_id,
                     last_message_id, message_ids_json, created_at,
                     processing_status)
@@ -380,6 +381,96 @@ class TelegramEventStore:
                 (job_id, item_id))
         if cursor.rowcount == 0:
             raise ValueError(f"item not found: {item_id}")
+
+    # ---------- TG4：窗口 / 物化 / 下载闸门 ----------
+
+    def find_open_text_item(self, source_id: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            """SELECT * FROM source_items
+               WHERE source_id = ? AND kind = 'text'
+                 AND processing_status = 'open'
+               ORDER BY created_at DESC LIMIT 1""",
+            (source_id,)).fetchone()
+
+    def append_item_message(self, item_id: str, message_id: int) -> None:
+        row = self.get_source_item(item_id)
+        if row is None:
+            raise ValueError(f"item not found: {item_id}")
+        ids = json.loads(row["message_ids_json"])
+        if message_id in ids:
+            return  # 幂等
+        ids.append(message_id)
+        with self._conn:
+            self._conn.execute(
+                "UPDATE source_items SET message_ids_json = ?, "
+                "last_message_id = ? WHERE item_id = ?",
+                (json.dumps(ids), max(ids), item_id))
+
+    def finalize_item(self, item_id: str) -> None:
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE source_items SET finalized_at = COALESCE("
+                "finalized_at, ?), processing_status = 'finalized' "
+                "WHERE item_id = ?", (_now_iso(), item_id))
+        if cursor.rowcount == 0:
+            raise ValueError(f"item not found: {item_id}")
+
+    def set_item_materialized(self, item_id: str, path: str) -> None:
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE source_items SET materialized_path = ?, "
+                "processing_status = 'materialized' WHERE item_id = ?",
+                (path, item_id))
+        if cursor.rowcount == 0:
+            raise ValueError(f"item not found: {item_id}")
+
+    def get_item_messages(self, item_id: str) -> list[sqlite3.Row]:
+        item = self.get_source_item(item_id)
+        if item is None:
+            return []
+        rows = [self.get_message(item["source_id"], mid)
+                for mid in json.loads(item["message_ids_json"])]
+        return [row for row in rows if row is not None]
+
+    def find_item_by_message(self, source_id: str,
+                             message_id: int) -> sqlite3.Row | None:
+        for row in self._conn.execute(
+                "SELECT * FROM source_items WHERE source_id = ? "
+                "ORDER BY created_at DESC", (source_id,)).fetchall():
+            if message_id in json.loads(row["message_ids_json"]):
+                return row
+        return None
+
+    def download_gate(self, item_id: str) -> str:
+        """§6.7 DOWNLOAD_ONCE 闸门（短事务守卫，幂等）。
+
+        返回：'authorized'（本次 claim 成功）/ 'retry'（同授权内的
+        重试，已有失败/挂起下载行）/ 'completed'（已完成，禁止再下）
+        / 'denied'（无授权）。
+        """
+        review = self._conn.execute(
+            """SELECT * FROM reviews WHERE item_id = ?
+               AND decision = 'DOWNLOAD_ONCE'
+               ORDER BY review_id DESC LIMIT 1""",
+            (item_id,)).fetchone()
+        if review is None:
+            return "denied"
+        row = self._conn.execute(
+            "SELECT status, attempts FROM downloads WHERE item_id = ?",
+            (item_id,)).fetchone()
+        if row is not None and row["status"] == "complete":
+            return "completed"
+        if review["decision_consumed_at"] is None:
+            with self._conn:
+                cursor = self._conn.execute(
+                    "UPDATE reviews SET decision_consumed_at = ? "
+                    "WHERE review_id = ? AND decision_consumed_at IS NULL",
+                    (_now_iso(), review["review_id"]))
+            if cursor.rowcount == 1:
+                return "authorized"
+        if row is not None and row["attempts"] >= 1:
+            return "retry"
+        return "denied"
 
     def upsert_download(self, item_id: str, document_message_id: int, *,
                         telegram_document_id: str | None = None,
