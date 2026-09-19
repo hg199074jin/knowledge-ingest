@@ -2170,9 +2170,18 @@ Publish / Activate 没有被自动越权
    路径动态生成（沿用 `watchdog install` 的动态模板纪律，不硬编码）。
 2. 通道与开关环境变量写入 plist（LLM_CMD/TIMEOUT/MAX_CALLS/
    BREAKER_*/LLM_CWD）；`KI_TELEGRAM_HANDOFF` 显式写 0（可审计）。
-3. `telegram watch install|status|uninstall` 子命令。
+3. `telegram watch-agent install|status|uninstall` 子命令；install 会把
+   `--config` 钉进 ProgramArguments（launchd 的 cwd 不可控）。
 4. 验收：kill -9 后自动复活；`launchctl kickstart` 模拟重启后，
    无人工干预恢复采集与通道（横幅/账本可证）。
+5. **本机现实约束（2026-09-19 实测，代码评审后补记）**：macOS TCC 默认
+   拒绝 launchd 子进程访问可移动卷（ORICO）——探针 touch 实锤 exit 1，
+   interpreter 读卷上文件挂起。完成 P0 部署需先在"隐私与安全性 → 完整
+   磁盘访问"对解释器本体授权；授权前 watcher 以 nohup 过渡运行
+   （迁移顺序：停 nohup → install → status 验证；install 对已运行
+   watcher 有警告）。同根因：v0.3 ki-resume watchdog 自 09-13 起未跑成
+   （launchctl exit 78），修复方式相同。验收第 4 条在授权前不可验证，
+   P0 状态 = 代码完成、部署待授权。
 
 ## V2.1-2 TG6 收尾（锚点变更）
 

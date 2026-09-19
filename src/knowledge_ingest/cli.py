@@ -2135,22 +2135,27 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 def _cmd_telegram_watch_agent(config: AppConfig, args) -> int:
     """V2.1-1 P0：把 telegram watcher 安装为 LaunchAgent。
 
-    重启即死的 nohup 裸进程是采集的单点；install 会把当前 shell 里的
-    通道/开关环境变量（KI_TELEGRAM_LLM_* / KI_TELEGRAM_HANDOFF / PATH）
-    持久化进 plist——因此**必须用带通道环境变量的 shell 执行 install**。
-    卸载：telegram watch-agent uninstall（然后才能安全做人工维护）。
+    install 会把当前 shell 里的通道/开关环境变量（KI_TELEGRAM_LLM_* /
+    KI_TELEGRAM_HANDOFF / PATH）持久化进 plist——因此**必须用带通道环境
+    变量的 shell 执行 install**，并用 --config 钉死配置文件路径（否则
+    agent 的配置解析依赖 launchd 的 cwd）。
+
+    迁移顺序（session 互斥，双 watcher 会 database is locked）：
+    1) 停掉 nohup watcher；2) 本命令 install；3) 验证 status。
+    本机提示：数据根在可移动卷（ORICO）上时，launchd 子进程需要
+    完整磁盘访问（TCC）授权给解释器本体，否则 spawn 即挂/EX_CONFIG——
+    授权前请继续用 nohup 方式运行。
     """
+    from knowledge_ingest.config import _default_config_path
     from knowledge_ingest.telegram import watch_agent
 
     if args.telegram_watch_agent_command == "install":
-        return watch_agent.install(config)
+        config_path = (Path(args.config).expanduser() if args.config
+                       else _default_config_path())
+        return watch_agent.install(config, config_path=config_path)
     if args.telegram_watch_agent_command == "status":
         return watch_agent.status(config)
     if args.telegram_watch_agent_command == "uninstall":
@@ -2158,3 +2163,9 @@ def _cmd_telegram_watch_agent(config: AppConfig, args) -> int:
     print(f"unknown watch-agent command: "
           f"{args.telegram_watch_agent_command}", file=sys.stderr)
     return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
