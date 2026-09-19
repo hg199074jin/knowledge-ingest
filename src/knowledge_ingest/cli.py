@@ -400,6 +400,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "download", parents=[common],
         help="download one PDF source item (explicit human trigger)")
     tg_download.add_argument("item_id")
+    tg_handoff = tg_sub.add_parser(
+        "handoff", parents=[common],
+        help="hand one source item to knowledge-ingest (explicit, gated)")
+    tg_handoff.add_argument("item_id")
+    tg_budget = tg_sub.add_parser(
+        "budget", parents=[common],
+        help="source AI budget ledger (show / reset)")
+    tg_budget_sub = tg_budget.add_subparsers(dest="telegram_budget_command",
+                                             required=True)
+    tg_budget_sub.add_parser("show", parents=[common],
+                             help="ledger counters + breaker state")
+    tg_budget_reset = tg_budget_sub.add_parser(
+        "reset", parents=[common],
+        help="clear counters/breaker (recover a stuck classifier channel)")
+    tg_budget_reset.add_argument("--source", default=None)
+    tg_budget_reset.add_argument(
+        "--kind", default=None,
+        choices=["noise_classifier", "pdf_interest_classifier"])
     tg_sources_sub.add_parser("discover", parents=[common],
                               help="list visible dialogs")
     tg_add = tg_sources_sub.add_parser("add", parents=[common],
@@ -1381,6 +1399,10 @@ def _cmd_telegram(config: AppConfig, args) -> int:
         return _cmd_telegram_status(config, args)
     if args.telegram_command == "download":
         return _cmd_telegram_download(config, args)
+    if args.telegram_command == "handoff":
+        return _cmd_telegram_handoff(config, args)
+    if args.telegram_command == "budget":
+        return _cmd_telegram_budget(config, args)
     if args.telegram_command == "sources":
         sub = args.telegram_sources_command
         if sub == "list":
@@ -1475,6 +1497,17 @@ def _render_telegram_status(store) -> int:
         or "none"))
     pending_once = summary["download_once_pending"]
     print("DOWNLOAD_ONCE pending: " + (", ".join(pending_once) or "none"))
+    max_calls, breaker_empty, breaker_rate_limit = _tg_budget_limits()
+    budgets = store.list_ai_budgets()
+    rendered = []
+    for row in budgets:
+        calls = f"{row['calls']}/{max_calls}"
+        if (row["calls"] >= max_calls
+                or row["consecutive_empty"] >= breaker_empty
+                or row["consecutive_rate_limit"] >= breaker_rate_limit):
+            calls += "(breaker)"
+        rendered.append(f"{row['source_id']}:{row['classifier_kind']}={calls}")
+    print("classifier channel budget: " + (", ".join(rendered) or "unused"))
     return 0
 
 
@@ -1598,6 +1631,73 @@ def _cmd_telegram_auth(config: AppConfig, args, *, repo_root=None,
     return 0
 
 
+def _extract_json_text(raw: str) -> str | None:
+    """从模型输出里取出第一个**完整** JSON 对象文本。
+
+    容错模型爱加的代码围栏与前后寒暄；取不出来返回 None（调用方
+    原样返回，交给 §21 判定为 unparseable_output → REVIEW，绝不猜
+    内容、绝不把非 JSON 当结论）。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        json.loads(text)
+        return text
+    except ValueError:
+        pass
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:index + 1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except ValueError:
+                        break
+        start = text.find("{", start + 1)
+    return None
+
+
+def _tg_budget_limits() -> tuple[int, int, int]:
+    """分类通道的预算/熔断阈值（env 可调）。
+
+    默认值沿用 API 分类器的口径；subprocess 通道（模型 CLI）的失败
+    模式更直接，运维可按需放宽，避免两三次抖动就把通道熔断掉。
+    """
+    def _int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise ValueError(f"invalid {name}: {raw!r}") from exc
+
+    return (_int("KI_TELEGRAM_LLM_MAX_CALLS", 100),
+            _int("KI_TELEGRAM_LLM_BREAKER_EMPTY", 3),
+            _int("KI_TELEGRAM_LLM_BREAKER_RATE_LIMIT", 2))
+
+
 def _tg_classifier_channel(store):
     """§7.6：分类模型通道——必须可注入，不写死任何 provider/SDK。
 
@@ -1605,8 +1705,14 @@ def _tg_classifier_channel(store):
     stdout），用于复用本机已有 worker/router：
         KI_TELEGRAM_LLM_CMD        例: "claude -p" / 自建 worker CLI
         KI_TELEGRAM_LLM_TIMEOUT    秒，默认 120
-        KI_TELEGRAM_LLM_MAX_CALLS  每 source 每 classifier 次数，默认 100
-    未配置 → (None, None)：规则路径照常，疑似内容进 REVIEW 等人。
+        KI_TELEGRAM_LLM_CWD        可选：模型 CLI 的工作目录（建议指向
+                                   中性目录，避免加载项目上下文）
+        KI_TELEGRAM_LLM_MAX_CALLS / _BREAKER_EMPTY / _BREAKER_RATE_LIMIT
+                                   预算与熔断阈值（见 _tg_budget_limits）
+        未配置 → (None, None)：规则路径照常，疑似内容进 REVIEW 等人。
+
+    输出侧做一次 JSON 提取（代码围栏/寒暄容错）；提取不出来就原样
+    返回，让严格解析器把它判成 unparseable_output（REVIEW）。
     """
     import shlex
     import subprocess
@@ -1619,20 +1725,26 @@ def _tg_classifier_channel(store):
         return None, None
     try:
         timeout = float(os.environ.get("KI_TELEGRAM_LLM_TIMEOUT", "120"))
-        max_calls = int(os.environ.get("KI_TELEGRAM_LLM_MAX_CALLS", "100"))
     except ValueError as exc:
-        raise ValueError(f"invalid KI_TELEGRAM_LLM_* value: {exc}") from exc
+        raise ValueError(f"invalid KI_TELEGRAM_LLM_TIMEOUT: {exc}") from exc
+    max_calls, breaker_empty, breaker_rate_limit = _tg_budget_limits()
+    cwd = (os.environ.get("KI_TELEGRAM_LLM_CWD") or "").strip() or None
 
     def channel(prompt: str) -> str:
         proc = subprocess.run(argv, input=prompt, capture_output=True,
-                              text=True, timeout=timeout, check=False)
+                              text=True, timeout=timeout, check=False,
+                              cwd=cwd)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"classifier channel exit {proc.returncode}: "
                 f"{(proc.stderr or '').strip()[:200]}")
-        return proc.stdout
+        stdout = proc.stdout or ""
+        return _extract_json_text(stdout) or stdout
 
-    return channel, AIBudgetGuard(store, max_calls=max_calls)
+    budget = AIBudgetGuard(store, max_calls=max_calls,
+                           breaker_empty=breaker_empty,
+                           breaker_rate_limit=breaker_rate_limit)
+    return channel, budget
 
 
 def _tg_watch_banner(*, handoff_enabled: bool, channel_enabled: bool) -> str:
@@ -1677,12 +1789,13 @@ def _cmd_telegram_watch(config: AppConfig, args) -> int:
         # 会自动创建 k2c job（真实 LLM 成本），由运维显式启用
         runner = TelegramHandoffRunner(store, config)
         handoff_scan = runner.scan
+    # flush：launchd/nohup 下 stdout 是块缓冲，不刷新就看不到横幅
     print(_tg_watch_banner(handoff_enabled=handoff_scan is not None,
-                           channel_enabled=channel is not None))
+                           channel_enabled=channel is not None), flush=True)
     try:
         asyncio.run(watcher.run(handoff_scan=handoff_scan))
     except KeyboardInterrupt:
-        print("watcher stopped")
+        print("watcher stopped", flush=True)
     return 0
 
 
@@ -1729,6 +1842,91 @@ def _cmd_telegram_download(config: AppConfig, args, *, client=None) -> int:
           f"{row['attempts'] if row else 0} attempts); "
           "see: knowledge-ingest telegram review list")
     return 1
+
+
+def _cmd_telegram_handoff(config: AppConfig, args) -> int:
+    """§8.2：人工显式把一个 Source Item 交给 knowledge-ingest。
+
+    自动扫描（KI_TELEGRAM_HANDOFF=1）之外的入口：由人挑定的样本走
+    handoff → KI job（幂等：同一 item 绝不建第二个 Job），符合"人工
+    门控、自动化止于 staged"。
+    """
+    from knowledge_ingest.telegram.handoff import TelegramHandoffRunner
+
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("error: telegram state not initialized", file=sys.stderr)
+        return 2
+    item = store.get_source_item(args.item_id)
+    if item is None:
+        print(f"error: item not found: {args.item_id}", file=sys.stderr)
+        return 2
+    runner = TelegramHandoffRunner(store, config)
+    already = item["knowledge_ingest_job_id"]
+    result = runner.prepare_handoff(args.item_id)
+    if result is None:
+        reason = runner.gate(item)
+        print(f"not handed off: {reason or 'unknown'}")
+        return 1
+    verb = "already handed off" if already else "handoff created"
+    print(f"{verb}: item={result['item_id']} job={result['job_id']} "
+          f"status={result['status']}")
+    print(f"next: knowledge-ingest job show {result['job_id']}")
+    return 0
+
+
+def _cmd_telegram_budget(config: AppConfig, args) -> int:
+    """§21.1 运维面：分类通道账本可见 + 可恢复（评审 R9）。"""
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("telegram state not initialized (no state.db)")
+        return 0
+    if args.telegram_budget_command == "show":
+        return _render_telegram_budget(store)
+    source = getattr(args, "source", None)
+    kind = getattr(args, "kind", None)
+    removed = store.reset_ai_budget(source_id=source,
+                                    classifier_kind=kind)
+    scope = []
+    if source:
+        scope.append(f"source={source}")
+    if kind:
+        scope.append(f"kind={kind}")
+    suffix = f" ({', '.join(scope)})" if scope else " (all)"
+    print(f"budget ledger reset: {removed} row(s) removed{suffix}")
+    if removed:
+        print("channel is callable again; classification history stays in "
+              "classifier_audit")
+    return 0
+
+
+def _render_telegram_budget(store) -> int:
+    max_calls, breaker_empty, breaker_rate_limit = _tg_budget_limits()
+    rows = store.list_ai_budgets()
+    print(f"budget limits: max_calls={max_calls} "
+          f"breaker_empty={breaker_empty} "
+          f"breaker_rate_limit={breaker_rate_limit}")
+    if not rows:
+        print("budget: no ledger rows (channel never called)")
+        return 0
+    for row in rows:
+        permits = len(json.loads(row["permits_json"] or "{}"))
+        open_breakers = []
+        if row["consecutive_empty"] >= breaker_empty:
+            open_breakers.append("empty")
+        if row["consecutive_rate_limit"] >= breaker_rate_limit:
+            open_breakers.append("rate_limit")
+        if row["calls"] >= max_calls:
+            open_breakers.append("exhausted")
+        state = "OPEN:" + ",".join(open_breakers) if open_breakers \
+            else "closed"
+        print(f"budget: {row['source_id']}:{row['classifier_kind']} "
+              f"calls={row['calls']}/{max_calls} "
+              f"attempts={row['attempts']} permits={permits} "
+              f"empty={row['consecutive_empty']} "
+              f"rate_limit={row['consecutive_rate_limit']} "
+              f"breaker={state}")
+    return 0
 
 
 def _cmd_telegram_sources_discover(config: AppConfig, args) -> int:

@@ -609,3 +609,129 @@ def test_r2_cli_resolve_applies_decision(tmp_path, capsys):
     item = store.get_source_item("tg_a:7")
     assert item["processing_status"] == "materialized"
     assert Path(item["materialized_path"]).is_file()
+
+
+# ---------- 评审 R9：分类通道运维面（预算可见/可恢复 + 输出容错） ----------
+
+
+def test_r9_budget_show_and_reset(tmp_path, capsys, monkeypatch):
+    from knowledge_ingest.cli import _cmd_telegram_budget
+    from knowledge_ingest.telegram.event_store import AIBudgetGuard
+
+    monkeypatch.setenv("KI_TELEGRAM_LLM_MAX_CALLS", "5")
+    config = make_config(tmp_path)
+    store = TelegramEventStore(config.pipeline_root / "telegram" / "state.db")
+    guard = AIBudgetGuard(store, max_calls=5, breaker_empty=3)
+    guard.acquire("tg_a", "noise_classifier", "r1")
+    guard.outcome("tg_a", "noise_classifier", "r1", "empty")
+
+    assert _cmd_telegram_budget(
+        config, Namespace(telegram_budget_command="show")) == 0
+    out = capsys.readouterr().out
+    assert "tg_a:noise_classifier" in out and "calls=1/5" in out
+    assert "breaker=closed" in out
+
+    assert _cmd_telegram_budget(
+        config, Namespace(telegram_budget_command="reset", source=None,
+                          kind=None)) == 0
+    assert "1 row(s) removed" in capsys.readouterr().out
+    assert store.list_ai_budgets() == []
+
+
+def test_r9_budget_show_marks_open_breaker(tmp_path, capsys, monkeypatch):
+    from knowledge_ingest.cli import _cmd_telegram_budget
+    from knowledge_ingest.telegram.event_store import AIBudgetGuard
+
+    # 展示口径 = 当前 env 阈值（运行中的 watcher 用的就是这套）
+    monkeypatch.setenv("KI_TELEGRAM_LLM_BREAKER_EMPTY", "2")
+    config = make_config(tmp_path)
+    store = TelegramEventStore(config.pipeline_root / "telegram" / "state.db")
+    guard = AIBudgetGuard(store, max_calls=99, breaker_empty=2)
+    for i in range(2):
+        rid = f"r{i}"
+        guard.acquire("tg_a", "noise_classifier", rid)
+        guard.outcome("tg_a", "noise_classifier", rid, "empty")
+
+    _cmd_telegram_budget(config, Namespace(telegram_budget_command="show"))
+    assert "breaker=OPEN:empty" in capsys.readouterr().out
+
+
+def test_r9_budget_reset_scoped(tmp_path, capsys):
+    from knowledge_ingest.cli import _cmd_telegram_budget
+    from knowledge_ingest.telegram.event_store import AIBudgetGuard
+
+    config = make_config(tmp_path)
+    store = TelegramEventStore(config.pipeline_root / "telegram" / "state.db")
+    guard = AIBudgetGuard(store)
+    guard.acquire("tg_a", "noise_classifier", "r1")
+    guard.acquire("tg_b", "noise_classifier", "r2")
+
+    assert _cmd_telegram_budget(
+        config, Namespace(telegram_budget_command="reset", source="tg_a",
+                          kind=None)) == 0
+    remaining = {row["source_id"] for row in store.list_ai_budgets()}
+    assert remaining == {"tg_b"}
+
+
+def test_r9_status_reports_channel_budget(tmp_path, capsys):
+    from knowledge_ingest.cli import _cmd_telegram_status
+    from knowledge_ingest.telegram.event_store import AIBudgetGuard
+
+    config = make_config(tmp_path)
+    store = TelegramEventStore(config.pipeline_root / "telegram" / "state.db")
+    AIBudgetGuard(store).acquire("tg_a", "noise_classifier", "r1")
+    assert _cmd_telegram_status(config, Namespace()) == 0
+    out = capsys.readouterr().out
+    assert "classifier channel budget: tg_a:noise_classifier=1/100" in out
+
+
+def test_r9_extract_json_tolerates_fences_and_prose():
+    from knowledge_ingest.cli import _extract_json_text
+
+    payload = '{"decision": "KEEP", "reason_code": "ok", "confidence": 1.0}'
+    assert _extract_json_text(payload) == payload
+    assert _extract_json_text(f"```json\n{payload}\n```") == payload
+    assert _extract_json_text(f"好的：\n{payload}\n以上。") == payload
+    assert _extract_json_text("完全没有 JSON") is None
+    assert _extract_json_text("") is None
+    # 嵌套对象按最外层括号配对取（字符串内的花括号不误判）
+    nested = '{"decision": "KEEP", "note": "a { b }", "x": {"y": 1}}'
+    assert _extract_json_text(f"前缀 {nested} 后缀") == nested
+
+
+def test_r9_channel_normalizes_fenced_model_output(tmp_path, monkeypatch):
+    """模型输出带围栏/寒暄也必须解析成决定（否则 3 次就熔断）。"""
+    import sys
+
+    from knowledge_ingest.cli import _tg_classifier_channel
+    from knowledge_ingest.telegram.classify import classify_noise
+
+    store = TelegramEventStore(tmp_path / "state.db")
+    script = tmp_path / "channel.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdin.read()\n"
+        "print('```json')\n"
+        "print('{\"decision\": \"KEEP\", \"reason_code\": \"ok\","
+        " \"confidence\": 0.9}')\n"
+        "print('```')\n", encoding="utf-8")
+    monkeypatch.setenv("KI_TELEGRAM_LLM_CMD", f"{sys.executable} {script}")
+    channel, budget = _tg_classifier_channel(store)
+    decision = classify_noise("私聊领取完整版资料，加微信", llm=channel,
+                              budget=budget, source_id="tg_a")
+    assert decision.decision == "KEEP"
+    row = store.get_ai_budget("tg_a", "noise_classifier")
+    assert row["calls"] == 1 and row["consecutive_empty"] == 0
+
+
+def test_r9_budget_limits_from_env(monkeypatch):
+    from knowledge_ingest.cli import _tg_budget_limits
+
+    monkeypatch.delenv("KI_TELEGRAM_LLM_MAX_CALLS", raising=False)
+    assert _tg_budget_limits() == (100, 3, 2)
+    monkeypatch.setenv("KI_TELEGRAM_LLM_MAX_CALLS", "20")
+    monkeypatch.setenv("KI_TELEGRAM_LLM_BREAKER_RATE_LIMIT", "5")
+    assert _tg_budget_limits() == (20, 3, 5)
+    monkeypatch.setenv("KI_TELEGRAM_LLM_MAX_CALLS", "abc")
+    with pytest.raises(ValueError):
+        _tg_budget_limits()

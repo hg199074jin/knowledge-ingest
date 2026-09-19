@@ -595,6 +595,32 @@ class TelegramEventStore:
             "AND classifier_kind = ?", (source_id,
                                         classifier_kind)).fetchone()
 
+    def list_ai_budgets(self) -> list[sqlite3.Row]:
+        """§21.1 运维面：分类通道账本（调用数/熔断计数/许可）。"""
+        return self._conn.execute(
+            "SELECT * FROM source_ai_budget ORDER BY source_id, "
+            "classifier_kind").fetchall()
+
+    def reset_ai_budget(self, source_id: str | None = None,
+                        classifier_kind: str | None = None) -> int:
+        """人工恢复通道：清掉计数/熔断/许可（返回删除行数）。
+
+        分类历史仍在 classifier_audit；这里只重置"还能不能调用"的
+        状态——否则 budget_exhausted / breaker_open 一旦出现，通道会
+        永久静默退化成"全部 REVIEW"，运维无从恢复（评审 R9）。
+        """
+        sql = "DELETE FROM source_ai_budget WHERE 1 = 1"
+        params: list = []
+        if source_id is not None:
+            sql += " AND source_id = ?"
+            params.append(source_id)
+        if classifier_kind is not None:
+            sql += " AND classifier_kind = ?"
+            params.append(classifier_kind)
+        with self._conn:
+            cursor = self._conn.execute(sql, params)
+        return cursor.rowcount
+
     def create_classifier_audit(self, item_id: str, kind: str,
                                 decision: str, *, reason_code=None,
                                 confidence=None, policy_version: str,

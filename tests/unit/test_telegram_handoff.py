@@ -6,6 +6,7 @@
 
 import asyncio
 import json
+from argparse import Namespace
 from pathlib import Path
 
 from knowledge_ingest.config import AppConfig
@@ -382,3 +383,68 @@ def test_r6_post_handoff_delete_refreshes_downstream_provenance(tmp_path):
     assert manifest.source["provenance"]["source_deleted"] is True
     # 跨层不回滚：Corpus 侧文件与 job 状态不动
     assert manifest.status == "DOWNLOADED"
+
+
+# ---------- 评审 R9：显式单条 handoff（H3-A 的人工入口） ----------
+
+
+def _cli_config(tmp_path: Path) -> AppConfig:
+    """CLI 找 <pipeline_root>/telegram/state.db；seeded_item 建在 tmp_path 下。"""
+    raw = make_config(tmp_path).model_dump()
+    raw["pipeline_root"] = tmp_path
+    return AppConfig.model_validate(raw)
+
+
+def test_r9_cli_handoff_creates_job(tmp_path, capsys):
+    from knowledge_ingest.cli import _cmd_telegram_handoff
+
+    store, _ = seeded_item(tmp_path)
+    config = _cli_config(tmp_path)
+    rc = _cmd_telegram_handoff(config, Namespace(item_id="tg_a:1"))
+    out = capsys.readouterr().out
+    assert rc == 0 and "handoff created" in out
+    item = store.get_source_item("tg_a:1")
+    assert item["knowledge_ingest_job_id"]
+    assert item["handoff_completed"] == 1
+    manifest = registered_manifest(config, item["knowledge_ingest_job_id"])
+    assert manifest.request.provider == "telegram"
+    assert manifest.request.targets == ["k2c"]
+
+
+def test_r9_cli_handoff_idempotent(tmp_path, capsys):
+    from knowledge_ingest.cli import _cmd_telegram_handoff
+
+    store, _ = seeded_item(tmp_path)
+    config = _cli_config(tmp_path)
+    assert _cmd_telegram_handoff(config, Namespace(item_id="tg_a:1")) == 0
+    job_id = store.get_source_item("tg_a:1")["knowledge_ingest_job_id"]
+    capsys.readouterr()
+
+    rc = _cmd_telegram_handoff(config, Namespace(item_id="tg_a:1"))
+    out = capsys.readouterr().out
+    assert rc == 0 and "already handed off" in out
+    assert store.get_source_item("tg_a:1")["knowledge_ingest_job_id"] == job_id
+    jobs = list((config.pipeline_root / "jobs").iterdir())
+    assert len(jobs) == 1                       # 绝不建第二个 Job
+
+
+def test_r9_cli_handoff_blocked_reports_reason(tmp_path, capsys):
+    from knowledge_ingest.cli import _cmd_telegram_handoff
+
+    store, _ = seeded_item(tmp_path, status="noise_review")
+    config = _cli_config(tmp_path)
+    rc = _cmd_telegram_handoff(config, Namespace(item_id="tg_a:1"))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "not handed off: blocked:noise_review" in out
+    assert store.get_source_item("tg_a:1")["knowledge_ingest_job_id"] is None
+
+
+def test_r9_cli_handoff_unknown_item(tmp_path, capsys):
+    from knowledge_ingest.cli import _cmd_telegram_handoff
+
+    _store, _ = seeded_item(tmp_path)
+    config = _cli_config(tmp_path)
+    rc = _cmd_telegram_handoff(config, Namespace(item_id="tg_a:missing"))
+    assert rc == 2
+    assert "not found" in capsys.readouterr().err
