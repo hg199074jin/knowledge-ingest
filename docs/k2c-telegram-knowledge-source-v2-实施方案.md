@@ -11,6 +11,7 @@
 - 实施方案终审输入：`docs/k2c-telegram-knowledge-source-v2-实施方案-本机审阅意见.md`
 - 实施目标：在不修改 K2C V5 FROZEN 边界、不重做 knowledge-ingest Job OS 的前提下，实现 `Telegram → knowledge-ingest → target=k2c → staged` 的持续知识采集链路。
 - 本次修订：吸收本机实施方案初审 M1–M4、F1、E1/E2，以及终审 E3–E6；不修改 FROZEN Design。
+- V2.1 修订（2026-09-19）：依据 TG0–TG6 全部落地与通道灰度实测，修订后续（P0 / TG6 收尾 / TG7 / TG8）的顺序与范围，见文末《修订记录 V2.1》；FROZEN Design 仍不变，执行待用户逐项放行。
 
 ---
 
@@ -2129,3 +2130,98 @@ Publish / Activate 没有被自动越权
 ```
 
 达到以上条件，Telegram Source V2 才算正式完成。
+
+---
+
+# 修订记录 V2.1（2026-09-19，TG0–TG6 落地 + 通道灰度实测后）
+
+> 依据：TG0–TG6 代码全部落地（main=b599aeb，513 测试绿，六轮评审 R1–R11 全部闭环）；
+> 分类通道灰度上线（21 次真实调用、熔断零异常）；14 源真实运行。
+> 本修订只调整**后续**实施的顺序与范围；FROZEN Design（SHA 0d6e45de…）不变；
+> 附件分类学等 schema 级变更随 TG7 的 `user_version 1→2` 迁移实施，
+> 并按设计文档"显式版本升级"规则补记。执行时机由用户逐项放行（P0 优先）。
+
+## V2.1-0 状态基线（本修订的事实前提）
+
+- 已交付（超出原方案范围的部分）：
+  `telegram handoff <item_id>`（显式单条交付，幂等）、
+  `telegram budget show|reset`（通道账本运维面，熔断/耗尽可恢复）、
+  `telegram classify-dryrun [--limit N]`（只读试跑通道）、
+  `telegram download <item_id>`（人工下载入口）、
+  通道 env 配置（`KI_TELEGRAM_LLM_CMD/_TIMEOUT/_MAX_CALLS/_BREAKER_*/_CWD`）。
+- 真实运行证据：视频附件可经既有媒体腿本地转写（router 原生认 `.mp4`；
+  Fun-ASR-Nano 本地推理零网络流量；实测 23s / 153s 视频的 preprocess
+  墙钟分别 30s / 53s）；5 条附件下载 complete（~39 MB，SHA 均落盘）。
+- 实测缺陷/欠账（本修订要吸收的）：
+  ① 4/5 个"PDF"实为 MP4（`classify_kind` 只看有无 document，kind 误标）；
+  ② 同一 SHA 附件被两个源各下载一遍（浪费 9.3 MB）；
+  ③ 8 条 text item 永悬 `open`（安静源无关窗定时器，14 源后只会更多）；
+  ④ CLI 与 watcher 抢 telethon session 报 `database is locked`
+  （实测三次连续失败，登记源时须停 watcher）；
+  ⑤ review #23（10.87 MB 真 PDF）开放 1.5 小时无任何通知渠道。
+
+## V2.1-1 【P0，提前自 TG7】watcher 持久化
+
+理由：watcher 当前为 nohup 裸进程——**重启即死**，且通道环境变量仅存在于
+启动命令中，重启后无人带参拉起，reconcile 不会自愈；本机存在凌晨自动重启
+场景，此为当前最高运维风险。
+
+1. LaunchAgent（RunAtLoad + KeepAlive）承载 `telegram watch`，
+   路径动态生成（沿用 `watchdog install` 的动态模板纪律，不硬编码）。
+2. 通道与开关环境变量写入 plist（LLM_CMD/TIMEOUT/MAX_CALLS/
+   BREAKER_*/LLM_CWD）；`KI_TELEGRAM_HANDOFF` 显式写 0（可审计）。
+3. `telegram watch install|status|uninstall` 子命令。
+4. 验收：kill -9 后自动复活；`launchctl kickstart` 模拟重启后，
+   无人工干预恢复采集与通道（横幅/账本可证）。
+
+## V2.1-2 TG6 收尾（锚点变更）
+
+1. H3-A 验收路径由"KI_TELEGRAM_HANDOFF=1 自动扫描"改为
+   **`telegram handoff <item_id>` 显式交付**（§8.10 证据清单不变）。
+   已实跑：text（tg_trivia:30481，TARGET_RUNNING，checkpoint
+   `awaiting_richer_sample`）、video ×2（CORPUS_READY）。
+   收尾 = 挑一个够厚的样本（候选：tg_vip_docs:3084 真 PDF，
+   待 review #23 人工 KEEP）编译至 staged，归档 §8.10 证据与
+   IMPORTANT_CAPABILITY 生产者核对（无显式信号 = 无生产者）。
+2. 自动扫描（KI_TELEGRAM_HANDOFF=1）开启条件（硬性，写死）：
+   ① 通道灰度稳定 ≥2–3 天且熔断零误开；② 人工抽检 20 条
+   materialized 正文，可用比例达标（阈值由用户定）；
+   ③ V2.1-4.1 积压清扫完成、open review 清零。
+   首次开启仍配小 max_calls。
+
+## V2.1-3 TG7 载荷扩充（user_version 1→2 一次装齐）
+
+原范围（通知/digest 持久化、幂等迁移 + maintenance lock、H2 WxPusher）
+保留，新增：
+
+1. **附件分类学**：kind 按 mime/扩展名细分——`video`（.mp4/.mov/…，
+   走既有媒体转写腿，已实测）、`pdf`（application/pdf 与文档扩展名）、
+   其余 `skipped_unsupported`；迁移时为存量误标数据回填。
+2. **下载内容寻址去重**：跨源相同 SHA-256 不重复下载。
+3. **open 窗口墙钟关闭**：reconcile 时按 `first_message_at + 300s`
+   关窗，安静源的 item 不再永悬。
+4. **session 互斥**：adapter 对 `database is locked` 加退避重试；
+   LaunchAgent 化后明确 session 所有权归 watcher，CLI 侧排队/让出。
+5. **digest 增补两行**：待审 REVIEW（item/原因/大小）与通道预算/熔断
+   状态（H2 凭据交付后生效；实测依据：review #23 等待 1.5h 无人知晓）。
+
+## V2.1-4 TG8 增补
+
+1. **积压 curation 清扫**（自动扫描的硬前置）：tg_search 时代的
+   ~227 条 materialized 以搜索关键词堆为主，逐条或按源处置为
+   skipped/excluded，建立"未来自动扫描只会遇到干净语料"的基线。
+2. Real Acceptance Matrix 增补真实路径：视频→本地转写→docchunk、
+   通道开启下的分类准确率（已有 21 次调用零熔断的样本起点）、
+   显式 handoff、14 源工况、LaunchAgent 重启自愈。
+3. doctor / retention / crash-restart 原范围不变。
+
+## V2.1-5 执行顺序（替代原阶段总览中尚未执行的部分）
+
+```
+P0（V2.1-1 watcher 持久化）
+→ TG6 收尾（V2.1-2，等 #23 或更厚样本编译到 staged）
+→ TG7（V2.1-3，迁移 + 通知，载荷一次装齐）
+→ TG8（V2.1-4，清扫 + 矩阵 + 原范围）
+```
+
+人工环节不变：H2 WxPusher 凭据、H3 样本确认、自动扫描开启确认。
