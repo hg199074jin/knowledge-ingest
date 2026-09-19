@@ -1938,7 +1938,7 @@ def _cmd_telegram_classify_dryrun(config: AppConfig, args, *,
     for row in rows:
         started = time.monotonic()
         try:
-            if row["kind"] == "pdf":
+            if row["kind"] in ("pdf", "video"):
                 message = store.get_message(row["source_id"],
                                             row["last_message_id"])
                 source = store.get_source(row["source_id"])

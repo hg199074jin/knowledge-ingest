@@ -146,6 +146,13 @@ class TelegramWatcher:
                 # R2/§16.3：把人工 KEEP/SKIP 决定落到 Item 上（不依赖
                 # handoff 开关——决定消费是 Item 层语义）
                 self.pipeline.consume_review_decisions()
+                # TG7：安静源的 open 窗口按墙钟补关（评审 C1：原实现
+                # 未接线，是死代码）
+                try:
+                    self.pipeline.close_stale_windows()
+                except Exception as exc:        # noqa: BLE001
+                    print(f"close_stale_windows error: {exc}",
+                          file=sys.stderr, flush=True)
                 self.pipeline.recover_stranded()
             except Exception as exc:        # noqa: BLE001 —— 恢复不致命
                 print(f"pipeline recovery error: {exc}",

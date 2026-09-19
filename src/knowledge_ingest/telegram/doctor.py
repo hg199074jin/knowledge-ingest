@@ -31,6 +31,16 @@ def _check(name: str, status: str, detail: str) -> tuple[str, str, str]:
     return (name, status, detail)
 
 
+def _report_empty(db: str) -> int:
+    checks = [_check("state.db 存在", "FAIL", f"{db} 不存在"),
+              _check("LaunchAgent", "WARN",
+                     str(watch_agent.plist_install_path()))]
+    for name, status, detail in checks:
+        print(f"[{status:4}] {name}: {detail}")
+    print("doctor: 1 FAIL / 0 WARN / 2 checks")
+    return 1
+
+
 def session_dir(config: AppConfig) -> Path:
     return Path.home() / ".config" / "knowledge-ingest" / "telegram"
 
@@ -38,6 +48,7 @@ def session_dir(config: AppConfig) -> Path:
 def run_checks(config: AppConfig, *,
                store: TelegramEventStore | None = None) -> list[tuple[str, str, str]]:
     checks: list[tuple[str, str, str]] = []
+    db_path = config.pipeline_root / "telegram" / "state.db"
     session_dir_ = session_dir(config)
     session_files = list(session_dir_.glob("*.session")) \
         if session_dir_.is_dir() else []
@@ -64,11 +75,7 @@ def run_checks(config: AppConfig, *,
                          "/Volumes/ORICO"))
 
     # 5-16 state.db 各项
-    db = config.pipeline_root / "telegram" / "state.db"
-    if not db.is_file():
-        checks.append(_check("state.db", "FAIL", f"{db} 不存在"))
-        checks += [_check("LaunchAgent", "WARN", "watch-agent 未评估")]
-        return checks
+    checks.append(_check("state.db 存在", "PASS", str(db_path)))
     try:
         quick = store and store._conn.execute(
             "PRAGMA quick_check").fetchone()[0] if store else None
@@ -196,8 +203,11 @@ def run_checks(config: AppConfig, *,
 
 
 def run(config: AppConfig, *, store: TelegramEventStore | None = None) -> int:
-    store = store or TelegramEventStore(
-        config.pipeline_root / "telegram" / "state.db")
+    db_path = config.pipeline_root / "telegram" / "state.db"
+    if store is None:
+        if not db_path.is_file():
+            # §4.6：只读体检不得创建 state.db（评审 I4）
+            return _report_empty(str(db_path))
     checks = run_checks(config, store=store)
     for name, status, detail in checks:
         print(f"[{status:4}] {name}: {detail}")

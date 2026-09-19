@@ -38,6 +38,11 @@ def candidates(store: TelegramEventStore, *, days: int) -> list[dict]:
              AND NOT EXISTS (SELECT 1 FROM reviews r
                              WHERE r.item_id = d.item_id
                                AND r.resolved_at IS NULL)
+             -- 去重共享：其他 complete 行还引用同一文件（可能属 KEEP 侧）
+             AND NOT EXISTS (SELECT 1 FROM downloads d2
+                             WHERE d2.local_path = d.local_path
+                               AND d2.item_id != d.item_id
+                               AND d2.status = 'complete')
         """, (cutoff,)).fetchall()
     return [dict(r) for r in rows]
 

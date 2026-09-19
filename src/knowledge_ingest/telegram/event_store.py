@@ -210,8 +210,12 @@ class TelegramEventStore:
         # downloads/reviews 引用本表——重建期间按 SQLite 官方流程临时
         # 关闭 foreign_keys，换表+改名后恢复（引用名同步更新，数据一致）。
         cur.execute("PRAGMA foreign_keys=OFF")
+        # 事务原子性：executescript 会先隐式 COMMIT，故 BEGIN/COMMIT 必须
+        # 写进脚本内（评审 I3：中断不能留下半迁移状态或丢表）
         cur.executescript("""
-        CREATE TABLE IF NOT EXISTS source_items_v2 (
+        BEGIN IMMEDIATE;
+        DROP TABLE IF EXISTS source_items_v2;
+        CREATE TABLE source_items_v2 (
             item_id                 TEXT PRIMARY KEY,
             source_id               TEXT NOT NULL REFERENCES tg_sources(source_id),
             kind                    TEXT NOT NULL CHECK (kind IN
@@ -236,6 +240,7 @@ class TelegramEventStore:
             FROM source_items;
         DROP TABLE source_items;
         ALTER TABLE source_items_v2 RENAME TO source_items;
+        COMMIT;
         """)
         cur.execute("PRAGMA foreign_keys=ON")
         # 回填：mime 或扩展名为视频的 pdf → video（基于 tg_messages 事实）

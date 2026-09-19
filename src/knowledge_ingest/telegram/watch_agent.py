@@ -141,16 +141,24 @@ def _sha(data: bytes) -> str:
 
 
 def running_watcher_pids() -> list[int]:
-    """检测已运行的 telegram watch 进程（nohup 迁移竞态防护）。"""
+    """检测已运行的 telegram watch 进程（nohup 迁移竞态防护）。
+
+    精确匹配行尾的 `telegram watch`——排除 watch-agent/digest 等自身
+    子命令（评审 Minor：pgrep 子串匹配会把 install 进程误报成 watcher）。
+    """
+    import os as _os
+
     try:
-        proc = subprocess.run(["pgrep", "-f", "telegram watch"],
+        proc = subprocess.run(["pgrep", "-f", "telegram watch$"],
                               text=True, capture_output=True, check=False,
                               timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return []
     if proc.returncode != 0:
         return []
-    return [int(line) for line in proc.stdout.split() if line.isdigit()]
+    me = _os.getpid()
+    return [int(line) for line in proc.stdout.split()
+            if line.isdigit() and int(line) != me]
 
 
 def install(config: AppConfig, *, environ: dict[str, str] | None = None,

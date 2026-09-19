@@ -29,7 +29,8 @@ _COLLECTION_RE = re.compile(
 # 绝不改写这些状态（原缺陷：部分删除会经 _materialize 复活成可交付）。
 TERMINAL_ITEM_STATUSES = (
     "skipped_noise", "skipped_interest", "skipped_too_short", "empty_item",
-    "noise_review", "interest_review", "deleted_source")
+    "skipped_unsupported", "noise_review", "interest_review",
+    "deleted_source")
 # 评审 R1：正文派生仍在进行中/已完成 → 删除后需要按幸存正文重建
 _TEXT_REBUILDABLE_STATUSES = ("finalized", "materialized")
 # 评审 R2：人工决定的审计来源标记（与模型分类器区分）
@@ -402,7 +403,12 @@ class SourceItemPipeline:
                 continue
             anchor = datetime.fromisoformat(str(first["message_date"]))
             if (now - anchor).total_seconds() > self.window_seconds:
-                self._finalize_text(item["item_id"])
+                try:
+                    self._finalize_text(item["item_id"])
+                except Exception as exc:    # noqa: BLE001 —— 逐条隔离
+                    print(f"close window {item['item_id']}: {exc}",
+                          file=sys.stderr, flush=True)
+                    continue
                 closed += 1
         return closed
 
