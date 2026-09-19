@@ -408,6 +408,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "classify-dryrun", parents=[common],
         help="run the classifier channel over parked samples (read-only)")
     tg_dryrun.add_argument("--limit", type=int, default=None)
+    tg_sub.add_parser(
+        "notify", parents=[common],
+        help="send a test notification (WxPusher; H2 credentials)")
+    tg_digest = tg_sub.add_parser(
+        "digest", parents=[common],
+        help="build (and optionally send) the collection digest")
+    tg_digest.add_argument("--send", action="store_true",
+                           help="send via WxPusher (needs wxpusher.env)")
+    tg_digest_agent = tg_sub.add_parser(
+        "digest-agent", parents=[common],
+        help="schedule the digest as a LaunchAgent (08:00/12:00/20:00)")
+    wa_sub2 = tg_digest_agent.add_subparsers(
+        dest="telegram_digest_agent_command", required=True)
+    for name, hlp in (
+            ("install", "generate + load the digest agent (idempotent)"),
+            ("status", "report digest agent state"),
+            ("uninstall", "unload and remove the digest agent")):
+        wa_sub2.add_parser(name, parents=[common], help=hlp)
     tg_watch_agent = tg_sub.add_parser(
         "watch-agent", parents=[common],
         help="persist the watcher as a LaunchAgent (reboot-survival)")
@@ -1421,6 +1439,12 @@ def _cmd_telegram(config: AppConfig, args) -> int:
         return _cmd_telegram_budget(config, args)
     if args.telegram_command == "watch-agent":
         return _cmd_telegram_watch_agent(config, args)
+    if args.telegram_command == "notify":
+        return _cmd_telegram_notify(config, args)
+    if args.telegram_command == "digest":
+        return _cmd_telegram_digest(config, args)
+    if args.telegram_command == "digest-agent":
+        return _cmd_telegram_digest_agent(config, args)
     if args.telegram_command == "sources":
         sub = args.telegram_sources_command
         if sub == "list":
@@ -2169,3 +2193,77 @@ if __name__ == "__main__":
     sys.exit(main())
 
 
+
+
+def _tg_ports(config: AppConfig):
+    """组装通知端口：有 WxPusher 凭据用真适配器，否则降级打印。"""
+    from knowledge_ingest.telegram import auth as tg_auth
+    from knowledge_ingest.telegram.notification import (
+        WxPusherAdapter,
+        load_wxpusher_credentials,
+        null_port,
+    )
+
+    creds = load_wxpusher_credentials(
+        tg_auth.__file__ and _tg_session_dir() / "wxpusher.env")
+    if creds:
+        port = WxPusherAdapter(creds["WXPUSHER_APP_TOKEN"],
+                               creds["WXPUSHER_UID"])
+        return port, creds["WXPUSHER_UID"]
+    return null_port, ""
+
+
+def _cmd_telegram_notify(config: AppConfig, args) -> int:
+    """H2：测试通知链路（凭据来自 wxpusher.env；缺失则降级打印）。"""
+    from knowledge_ingest.telegram.notification import notify
+
+    store = _open_telegram_store(config, create=True)
+    port, uid = _tg_ports(config)
+    delivered = notify(
+        store, port, event_id=f"notify-test-{uuid.uuid4().hex[:8]}",
+        channel="wxpusher", uid=uid,
+        summary="knowledge-ingest 通知测试",
+        content="如果你看到这条消息，说明 Telegram 采集通知链路已打通。")
+    print("delivered" if delivered else
+          "degraded: 无凭据或投递失败（事件已落库，补凭据后可重发）")
+    return 0
+
+
+def _cmd_telegram_digest(config: AppConfig, args) -> int:
+    from datetime import UTC, datetime
+
+    from knowledge_ingest.telegram.notification import build_digest, notify
+
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("telegram state not initialized")
+        return 0
+    since = store.get_digest_state("digest:last_sent_at")
+    digest = build_digest(store, since=since)
+    print(digest)
+    if args.send:
+        port, uid = _tg_ports(config)
+        event_id = f"digest-{uuid.uuid4().hex[:8]}"
+        delivered = notify(store, port, event_id=event_id,
+                           channel="wxpusher", uid=uid,
+                           summary="Telegram 采集日报", content=digest)
+        print("digest sent" if delivered else
+              "digest not delivered（无凭据或投递失败）")
+        store.set_digest_state("digest:last_sent_at",
+                               datetime.now(UTC).isoformat(timespec="seconds"))
+    else:
+        print("(dry-run: 加 --send 才会投递)")
+    return 0
+
+
+def _cmd_telegram_digest_agent(config: AppConfig, args) -> int:
+    """TG7：digest 定时 LaunchAgent（08:00/12:00/20:00 自动发日报）。"""
+    from knowledge_ingest.telegram import digest_agent
+
+    if args.telegram_digest_agent_command == "install":
+        return digest_agent.install(config)
+    if args.telegram_digest_agent_command == "status":
+        return digest_agent.status(config)
+    if args.telegram_digest_agent_command == "uninstall":
+        return digest_agent.uninstall(config)
+    return 2
