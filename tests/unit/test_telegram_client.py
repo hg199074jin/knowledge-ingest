@@ -314,6 +314,37 @@ def test_no_extra_core_import_contract():
     assert "CONTRACT_OK" in result.stdout
 
 
+def test_adapter_connects_before_requests(tmp_path):
+    """§7：所有请求前必须自动连接（Telethon 不读环境变量也不自动连）。"""
+    from knowledge_ingest.telegram.telethon_adapter import TelethonAdapter
+
+    connect_calls = []
+
+    class DuckClient:
+        def __init__(self):
+            self._connected = False
+
+        def is_connected(self):
+            return self._connected
+
+        async def connect(self):
+            connect_calls.append(1)
+            self._connected = True
+            return self
+
+        async def iter_dialogs(self):
+            if not self._connected:
+                raise ConnectionError("Cannot send requests while "
+                                      "disconnected")
+            yield SimpleNamespace(id=-100, name="g", username="g")
+
+    adapter = TelethonAdapter(session_dir=tmp_path / "s", credentials={})
+    adapter._client = DuckClient()
+    dialogs = asyncio.run(adapter.list_dialogs())
+    assert [d.chat_id for d in dialogs] == [-100]
+    assert connect_calls == [1]  # 请求前自动补了连接
+
+
 # ---------- CLI：sources add（H3 前的 fake 验证） ----------
 
 def test_cli_sources_add_with_fake_client(tmp_path, capsys):

@@ -74,6 +74,14 @@ def extract_cloud_links(text: str | None) -> tuple[str, ...]:
                  if any(hint in line for hint in CLOUD_LINK_HINTS))
 
 
+def as_entity_ref(ref: str):
+    """数字串（含负号）按 chat_id 解析；其余按 username/链接。"""
+    stripped = str(ref).strip()
+    if stripped.lstrip("-").isdigit():
+        return int(stripped)
+    return stripped
+
+
 def _proxy_from_credentials(credentials: dict):
     """可选代理配置（PROXY_TYPE / PROXY_HOST / PROXY_PORT）。
 
@@ -136,6 +144,12 @@ class TelethonAdapter:
         return self._client if self._client is not None \
             else self._build_client()
 
+    async def _connected(self, client):
+        """所有请求前确保 MTProto 已连接（Telethon 不自动重连）。"""
+        if not client.is_connected():
+            await self._guard(client.connect())
+        return client
+
     async def _guard(self, coro):
         """把 Telethon 专属错误收口映射为领域错误（§7.1）。"""
         try:
@@ -174,7 +188,7 @@ class TelethonAdapter:
     # ---- port 实现 ----
 
     async def list_dialogs(self) -> list[TelegramDialog]:
-        client = self._client_or_new()
+        client = await self._connected(self._client_or_new())
 
         async def call():
             return [dialog async for dialog in client.iter_dialogs()]
@@ -188,10 +202,10 @@ class TelethonAdapter:
 
     async def resolve_chat(self, ref: str) -> TelegramDialog:
         telethon = self._require_telethon()
-        client = self._client_or_new()
+        client = await self._connected(self._client_or_new())
 
         async def call():
-            return await client.get_entity(ref)
+            return await client.get_entity(as_entity_ref(ref))
 
         entity = await self._guard(call())
         return TelegramDialog(
@@ -202,7 +216,7 @@ class TelethonAdapter:
         )
 
     async def latest_message(self, chat_id: int) -> TelegramEvent | None:
-        client = self._client_or_new()
+        client = await self._connected(self._client_or_new())
 
         async def call():
             return await client.get_messages(chat_id, limit=1)
@@ -213,7 +227,7 @@ class TelethonAdapter:
 
     async def fetch_messages_after(
         self, chat_id: int, after_message_id: int) -> list[TelegramEvent]:
-        client = self._client_or_new()
+        client = await self._connected(self._client_or_new())
 
         async def call():
             return await client.get_messages(
@@ -225,7 +239,7 @@ class TelethonAdapter:
 
     async def get_message(self, chat_id: int,
                           message_id: int) -> TelegramEvent | None:
-        client = self._client_or_new()
+        client = await self._connected(self._client_or_new())
 
         async def call():
             return await client.get_messages(chat_id, ids=message_id)
@@ -237,7 +251,7 @@ class TelethonAdapter:
 
     async def download_document(self, chat_id: int, message_id: int,
                                 dest_dir: Path) -> Path:
-        client = self._client_or_new()
+        client = await self._connected(self._client_or_new())
         messages = await self._guard(
             client.get_messages(chat_id, ids=message_id))
         if not messages or messages[0] is None:
@@ -254,9 +268,7 @@ class TelethonAdapter:
     async def watch_updates(self) -> AsyncIterator[TelegramEvent]:
         from telethon import events  # 延迟导入（§5.2）
 
-        client = self._client_or_new()
-        if not client.is_connected():
-            await self._guard(client.connect())
+        client = await self._connected(self._client_or_new())
         queue: asyncio.Queue[TelegramEvent] = asyncio.Queue()
 
         def make_handler(kind: TelegramEventKind):
