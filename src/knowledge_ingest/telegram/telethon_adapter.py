@@ -74,6 +74,36 @@ def extract_cloud_links(text: str | None) -> tuple[str, ...]:
                  if any(hint in line for hint in CLOUD_LINK_HINTS))
 
 
+def _proxy_from_credentials(credentials: dict):
+    """可选代理配置（PROXY_TYPE / PROXY_HOST / PROXY_PORT）。
+
+    国内网络直连 Telegram DC 被墙时，经本机代理（如 Clash Verge
+    的 mixed 口）连接；三个键都不在 = 直连（返回 None）。
+    PROXY_TYPE 一旦出现，HOST/PORT 必须齐全且合法。
+    """
+    proxy_type = credentials.get("PROXY_TYPE")
+    if not proxy_type:
+        return None
+    from python_socks import ProxyType
+
+    mapping = {"socks5": ProxyType.SOCKS5, "socks4": ProxyType.SOCKS4,
+               "http": ProxyType.HTTP}
+    key = str(proxy_type).strip().lower()
+    if key not in mapping:
+        raise ValueError(
+            f"unsupported PROXY_TYPE: {proxy_type!r}; expected one of "
+            f"{sorted(mapping)}")
+    host = credentials.get("PROXY_HOST")
+    if not host:
+        raise ValueError("PROXY_HOST is required when PROXY_TYPE is set")
+    raw_port = credentials.get("PROXY_PORT")
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid PROXY_PORT: {raw_port!r}") from exc
+    return (mapping[key], str(host), port)
+
+
 class TelethonAdapter:
     """延迟导入 Telethon 的 TelegramClientPort 实现。"""
 
@@ -97,7 +127,8 @@ class TelethonAdapter:
         client = telethon.TelegramClient(
             str(self.session_path()),
             int(self.credentials["API_ID"]),
-            self.credentials["API_HASH"])
+            self.credentials["API_HASH"],
+            proxy=_proxy_from_credentials(self.credentials))
         self._client = client
         return client
 

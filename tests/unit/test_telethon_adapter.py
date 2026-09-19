@@ -33,6 +33,75 @@ def test_lazy_import_available():
     assert adapter.session_path().name == "session.session"
 
 
+# ---------- 代理配置（国内网络经本机代理连 Telegram DC） ----------
+
+
+def test_proxy_from_credentials_absent():
+    from knowledge_ingest.telegram.telethon_adapter import (
+        _proxy_from_credentials,
+    )
+
+    assert _proxy_from_credentials({}) is None
+    assert _proxy_from_credentials({"API_ID": "1"}) is None
+
+
+def test_proxy_from_credentials_socks5():
+    from python_socks import ProxyType
+
+    from knowledge_ingest.telegram.telethon_adapter import (
+        _proxy_from_credentials,
+    )
+
+    proxy = _proxy_from_credentials({
+        "PROXY_TYPE": "socks5", "PROXY_HOST": "127.0.0.1",
+        "PROXY_PORT": "7897"})
+    assert proxy == (ProxyType.SOCKS5, "127.0.0.1", 7897)
+
+
+def test_proxy_from_credentials_http():
+    from python_socks import ProxyType
+
+    from knowledge_ingest.telegram.telethon_adapter import (
+        _proxy_from_credentials,
+    )
+
+    proxy = _proxy_from_credentials({
+        "PROXY_TYPE": "HTTP", "PROXY_HOST": "127.0.0.1",
+        "PROXY_PORT": "7897"})
+    assert proxy == (ProxyType.HTTP, "127.0.0.1", 7897)
+
+
+def test_proxy_from_credentials_bad_type():
+    from knowledge_ingest.telegram.telethon_adapter import (
+        _proxy_from_credentials,
+    )
+
+    with pytest.raises(ValueError, match="PROXY_TYPE"):
+        _proxy_from_credentials({
+            "PROXY_TYPE": "mtproto", "PROXY_HOST": "h",
+            "PROXY_PORT": "1"})
+
+
+def test_proxy_from_credentials_bad_port():
+    from knowledge_ingest.telegram.telethon_adapter import (
+        _proxy_from_credentials,
+    )
+
+    with pytest.raises(ValueError, match="PROXY_PORT"):
+        _proxy_from_credentials({
+            "PROXY_TYPE": "socks5", "PROXY_HOST": "h",
+            "PROXY_PORT": "abc"})
+
+
+def test_proxy_from_credentials_missing_host():
+    from knowledge_ingest.telegram.telethon_adapter import (
+        _proxy_from_credentials,
+    )
+
+    with pytest.raises(ValueError, match="PROXY_HOST"):
+        _proxy_from_credentials({"PROXY_TYPE": "socks5"})
+
+
 def test_flood_wait_mapping(tmp_path):
     from telethon.errors import FloodWaitError
 

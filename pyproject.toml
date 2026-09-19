@@ -14,8 +14,10 @@ knowledge-ingest = "knowledge_ingest.cli:main"
 [project.optional-dependencies]
 # TG3：Telegram MTProto 支持为可选 extra；核心 KI 不安装 Telethon
 # 也能完整工作（冻结设计 §3.4/§5.2）。版本由 uv 求解，不硬编码失真值。
+# python-socks：国内网络经本机代理（如 Clash mixed 口）连 Telegram DC。
 telegram = [
   "Telethon>=1.41,<2",
+  "python-socks[asyncio]>=2,<3",
 ]
 
 [dependency-groups]
