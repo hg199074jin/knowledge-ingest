@@ -120,3 +120,31 @@ def test_run_auth_blocked_by_gitignore_gate(tmp_path: Path):
     with pytest.raises(TelegramAuthRequiredError, match="gitignore"):
         run_auth(repo_root=repo_root, session_dir=session_dir,
                  signer=None)
+
+
+def test_gitignore_gate_skips_commented_and_negated(tmp_path: Path):
+    """注释行 / 否定行（!pattern）不得视为有效规则。"""
+    (tmp_path / ".gitignore").write_text(
+        "# *.session\n!credentials.env\n*.session-journal\n",
+        encoding="utf-8")
+    missing = ensure_gitignore_gate(tmp_path)
+    assert "*.session" in missing          # 注释行不算
+    assert "credentials.env" in missing    # 否定行不算
+    assert "*.session-journal" not in missing
+
+
+def test_session_security_accepts_stricter_mode(tmp_path: Path):
+    """收紧权限（如 0400）应通过，而不是误报。"""
+    session = make_session(tmp_path / "telegram", mode_file=0o400)
+    report = check_session_security(session)
+    assert report["file_mode_ok"] is True
+    assert report["dir_mode_ok"] is True
+
+
+def test_auth_error_class_is_canonical():
+    from knowledge_ingest.telegram import auth as tg_auth
+    from knowledge_ingest.telegram.client_port import (
+        TelegramAuthRequiredError as canonical,
+    )
+
+    assert tg_auth.TelegramAuthRequiredError is canonical

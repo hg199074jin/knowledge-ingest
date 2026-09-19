@@ -12,7 +12,12 @@ import asyncio
 import time
 from datetime import UTC, datetime
 
-from .client_port import TelegramClientPort, TelegramEventKind
+from .client_port import (
+    TelegramClientPort,
+    TelegramEventKind,
+    TelegramFloodWaitError,
+    TelegramRPCError,
+)
 from .event_store import MessageBeforeStartError, TelegramEventStore
 
 
@@ -102,19 +107,32 @@ class TelegramWatcher:
 
     async def run(self, *, max_ticks: int | None = None,
                   idle_seconds: float = 60.0,
-                  reconcile_interval_seconds: float = 300.0) -> None:
+                  reconcile_interval_seconds: float = 300.0,
+                  error_backoff_seconds: float = 10.0,
+                  flood_wait_cap_seconds: float = 300.0) -> None:
         """live 主循环（§5.7 A+B）：排空 updates，并按墙钟周期
         强制 reconcile 兜底——高频群 updates 不断流时也必须定期
-        跑安全网，不能等空闲。max_ticks 仅用于测试/一次性运行。"""
+        跑安全网，不能等空闲。max_ticks 仅用于测试/一次性运行。
+
+        瞬时错误（FloodWait/RPC/网络）不退出（§3.1：FloodWait 是
+        正常运行状态）：FloodWait 按其秒数（封顶）等待，其余退避
+        error_backoff_seconds 后继续下一 tick。
+        """
         tick = 0
         last_reconcile = 0.0
         while max_ticks is None or tick < max_ticks:
             tick += 1
-            await self._drain_updates(timeout=idle_seconds)
-            now = time.monotonic()
-            if now - last_reconcile >= reconcile_interval_seconds:
-                await self.reconcile_all()
-                last_reconcile = now
+            try:
+                await self._drain_updates(timeout=idle_seconds)
+                now = time.monotonic()
+                if now - last_reconcile >= reconcile_interval_seconds:
+                    await self.reconcile_all()
+                    last_reconcile = now
+            except TelegramFloodWaitError as exc:
+                await asyncio.sleep(
+                    min(exc.seconds, flood_wait_cap_seconds))
+            except (TelegramRPCError, ConnectionError, OSError):
+                await asyncio.sleep(error_backoff_seconds)
 
     async def _drain_updates(self, timeout: float) -> None:
         try:

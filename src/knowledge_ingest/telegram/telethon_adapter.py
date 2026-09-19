@@ -45,7 +45,11 @@ def _document_filename(message) -> str | None:
 
 
 def _to_event(kind: TelegramEventKind, message) -> TelegramEvent:
-    """Telethon message → 领域事件（鸭子类型访问，便于 fake 测试）。"""
+    """Telethon message → 领域事件（鸭子类型访问，便于 fake 测试）。
+
+    edit_date → edited_at；正文中的夸克/百度链接 → cloud_links
+    （评审 I2/I3：真实路径必须填充，否则下游两列恒为 NULL）。
+    """
     document = getattr(message, "document", None)
     ref = None
     if document is not None:
@@ -55,14 +59,17 @@ def _to_event(kind: TelegramEventKind, message) -> TelegramEvent:
                        or _document_filename(message)),
             mime_type=getattr(document, "mime_type", None),
             size_bytes=getattr(document, "size", None))
+    text = getattr(message, "message", None)
     return TelegramEvent(
         kind=kind,
         chat_id=getattr(message, "chat_id", 0) or 0,
         message_id=message.id,
         message_date=getattr(message, "date", None),
         sender_id=getattr(message, "sender_id", None),
-        text=getattr(message, "message", None),
+        text=text,
+        edited_at=getattr(message, "edit_date", None),
         document=ref,
+        cloud_links=extract_cloud_links(text),
     )
 
 
@@ -109,6 +116,8 @@ def _proxy_from_credentials(credentials: dict):
         port = int(raw_port)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid PROXY_PORT: {raw_port!r}") from exc
+    if not 0 < port < 65536:
+        raise ValueError(f"invalid PROXY_PORT: {raw_port!r}")
     return (mapping[key], str(host), port)
 
 
@@ -158,7 +167,10 @@ class TelethonAdapter:
                 TelegramRPCError):
             raise
         except Exception as exc:
-            errors = _require_telethon().errors
+            try:
+                errors = _require_telethon().errors
+            except TelegramDependencyMissingError:
+                raise exc  # 保留原始错误，不误报依赖缺失（评审 M10）
             if isinstance(exc, errors.FloodWaitError):
                 raise TelegramFloodWaitError(
                     int(getattr(exc, "seconds", 0))) from exc
@@ -234,8 +246,15 @@ class TelethonAdapter:
                 chat_id, min_id=after_message_id, reverse=True, limit=1000)
 
         messages = await self._guard(call())
-        return [_to_event(TelegramEventKind.NEW, message)
-                for message in messages]
+        # §5.7：reconcile 发现的已编辑消息走 EDIT 事实更新
+        #（edit_date 存在 ⇒ kind=EDIT，upsert 刷新 text + edited_at）
+        return [
+            _to_event(
+                TelegramEventKind.EDIT
+                if getattr(message, "edit_date", None)
+                else TelegramEventKind.NEW,
+                message)
+            for message in messages]
 
     async def get_message(self, chat_id: int,
                           message_id: int) -> TelegramEvent | None:
@@ -286,20 +305,19 @@ class TelethonAdapter:
                         chat_id=chat_id, message_id=deleted_id))
             return handler
 
-        client.add_event_handler(
-            make_handler(TelegramEventKind.NEW), events.NewMessage)
-        client.add_event_handler(
-            make_handler(TelegramEventKind.EDIT), events.MessageEdited)
-        client.add_event_handler(
-            make_handler(TelegramEventKind.DELETE), events.MessageDeleted)
+        # 评审 C1：移除必须复用注册时的同一闭包对象——telethon 按
+        # 回调身份匹配，重新 make_handler() 生成的是新对象，移除会
+        # 变成空操作，导致常驻 watcher 无限泄漏 handler。
+        handlers = (
+            (make_handler(TelegramEventKind.NEW), events.NewMessage),
+            (make_handler(TelegramEventKind.EDIT), events.MessageEdited),
+            (make_handler(TelegramEventKind.DELETE), events.MessageDeleted),
+        )
+        for callback, event in handlers:
+            client.add_event_handler(callback, event)
         try:
             while True:
                 yield await self._guard(queue.get())
         finally:
-            client.remove_event_handler(
-                make_handler(TelegramEventKind.NEW), events.NewMessage)
-            client.remove_event_handler(
-                make_handler(TelegramEventKind.EDIT), events.MessageEdited)
-            client.remove_event_handler(
-                make_handler(TelegramEventKind.DELETE),
-                events.MessageDeleted)
+            for callback, event in handlers:
+                client.remove_event_handler(callback, event)

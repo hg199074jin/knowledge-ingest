@@ -23,9 +23,8 @@ GITIGNORE_REQUIRED_PATTERNS = (
 
 REQUIRED_CREDENTIAL_KEYS = ("API_ID", "API_HASH")
 
-
-class TelegramAuthRequiredError(RuntimeError):
-    """认证前置条件不满足（缺凭据 / 安全门未过 / session 缺失）。"""
+# 评审 M8：client_port 已有同名领域错误，此处直接复用为唯一权威类
+from .client_port import TelegramAuthRequiredError
 
 
 def parse_credentials(text: str) -> dict[str, str]:
@@ -55,12 +54,21 @@ def load_credentials(path: Path) -> dict[str, str]:
 
 
 def ensure_gitignore_gate(repo_root: str | Path) -> list[str]:
-    """H1 前置安全门：返回缺失的 .gitignore 模式列表（空 = 通过）。"""
+    """H1 前置安全门：返回缺失的 .gitignore 模式列表（空 = 通过）。
+
+    逐行匹配；注释（#）与否定（!pattern）行不算有效规则——
+    子串包含会被 "# *.session" 或 "!credentials.env" 骗过（评审 M7）。
+    """
     gitignore = Path(repo_root) / ".gitignore"
-    content = (gitignore.read_text(encoding="utf-8")
-               if gitignore.is_file() else "")
+    active: set[str] = set()
+    if gitignore.is_file():
+        for line in gitignore.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", "!")):
+                continue
+            active.add(stripped)
     return [pattern for pattern in GITIGNORE_REQUIRED_PATTERNS
-            if pattern not in content]
+            if pattern not in active]
 
 
 def has_session(session_dir: Path) -> bool:
@@ -72,13 +80,15 @@ def check_session_security(session_path: Path) -> dict:
     session_path = Path(session_path)
     directory = session_path.parent
 
-    def exact_mode(path: Path, expected: int) -> bool:
-        return path.exists() and stat.S_IMODE(path.stat().st_mode) == expected
+    def private_mode(path: Path) -> bool:
+        """组/其他位必须为零；比 600 更严（如 400）同样通过（评审 M6）。"""
+        return path.exists() \
+            and stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
 
     return {
         "session_exists": session_path.is_file(),
-        "dir_mode_ok": exact_mode(directory, 0o700),
-        "file_mode_ok": exact_mode(session_path, 0o600),
+        "dir_mode_ok": private_mode(directory),
+        "file_mode_ok": private_mode(session_path),
     }
 
 

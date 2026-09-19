@@ -18,6 +18,7 @@ import pytest
 from knowledge_ingest.cli import (
     _cmd_telegram_auth,
     _cmd_telegram_sources_add,
+    _cmd_telegram_watch,
 )
 from knowledge_ingest.config import AppConfig
 from knowledge_ingest.telegram.client_port import (
@@ -315,6 +316,70 @@ def test_run_reconciles_even_when_updates_keep_flowing(tmp_path):
                             reconcile_interval_seconds=0.0))
     assert store.get_source("tg_a")["last_reconciled_at"] is not None
     assert client.fetched_after  # reconcile 确实发起了增量拉取
+
+
+def test_watcher_survives_flood_wait(tmp_path):
+    """FloodWait 是正常运行状态（§3.1）：单次瞬时错误不得杀死 watch。"""
+    from knowledge_ingest.telegram.client_port import TelegramFloodWaitError
+
+    class FloodClient(FakeTelegramClient):
+        def __init__(self):
+            super().__init__()
+            self.boomed = False
+
+        async def fetch_messages_after(self, chat_id, after_message_id):
+            if not self.boomed:
+                self.boomed = True
+                raise TelegramFloodWaitError(seconds=0)
+            return []
+
+    store = make_ready_store(tmp_path)
+    watcher = TelegramWatcher(store, client=FloodClient())
+    asyncio.run(watcher.run(max_ticks=2, idle_seconds=0.01,
+                            reconcile_interval_seconds=0.0,
+                            error_backoff_seconds=0.01))
+    assert store.count_messages("tg_a") == 0  # 只证明没崩，无消息入库
+
+
+def test_watcher_restart_resume_cycle(tmp_path):
+    """§5.8 服务重启：重开连接后，重放不重复、游标续走。"""
+    db = tmp_path / "telegram" / "state.db"
+    store1 = TelegramEventStore(db)
+    store1.add_source(source_id="tg_a", chat_id=-1001234567890, start_at=T0)
+    TelegramWatcher(store1).handle_event(make_event(message_id=41))
+    store1.close()
+
+    store2 = TelegramEventStore(db)  # 模拟重启后的新进程
+    watcher2 = TelegramWatcher(store2)
+    watcher2.handle_event(make_event(message_id=41, text="重放"))
+    watcher2.handle_event(make_event(message_id=42))
+    assert store2.count_messages("tg_a") == 2
+    assert store2.get_source("tg_a")["last_seen_message_id"] == 42
+    store2.close()
+
+
+def test_cli_watch_requires_initialized_state(tmp_path, capsys, monkeypatch):
+    config = make_config(tmp_path)
+    monkeypatch.setattr("knowledge_ingest.cli._tg_build_adapter",
+                        lambda cfg: object())
+    rc = _cmd_telegram_watch(config, Namespace())
+    assert rc == 2
+    assert "not initialized" in capsys.readouterr().err
+    assert not (config.pipeline_root / "telegram" / "state.db").exists()
+
+
+def test_cli_sources_add_maps_rpc_error(tmp_path, capsys):
+    from knowledge_ingest.telegram.client_port import TelegramRPCError
+
+    class BadClient(FakeTelegramClient):
+        async def resolve_chat(self, ref: str):
+            raise TelegramRPCError("cannot resolve", code=400)
+
+    config = make_config(tmp_path)
+    args = Namespace(ref="@nope", source_id="tg_x", display_name=None)
+    rc = _cmd_telegram_sources_add(config, args, client=BadClient())
+    assert rc == 2
+    assert "error" in capsys.readouterr().err.lower()
 
 
 # ---------- 无 extra CI 契约（§5.2） ----------

@@ -1580,7 +1580,11 @@ def _cmd_telegram_watch(config: AppConfig, args) -> int:
     adapter = _tg_build_adapter(config)
     if adapter is None:
         return 2
-    store = TelegramEventStore(_telegram_db_path(config))
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("error: telegram state not initialized "
+              "(run: telegram sources add first)", file=sys.stderr)
+        return 2
     watcher = TelegramWatcher(store, client=adapter)
     print("telegram watcher running (Ctrl-C to stop); "
           "live updates + periodic reconcile")
@@ -1608,6 +1612,11 @@ def _cmd_telegram_sources_discover(config: AppConfig, args) -> int:
 def _cmd_telegram_sources_add(config: AppConfig, args, *, client=None):
     """§5.6：首次 add 即写 start_at（当前时刻）+ last_seen（当前边界），
     绝不导入历史消息。client 参数供测试注入 fake。"""
+    from knowledge_ingest.telegram.client_port import (
+        TelegramFloodWaitError,
+        TelegramRPCError,
+    )
+
     if client is None:
         client = _tg_build_adapter(config)
         if client is None:
@@ -1630,6 +1639,9 @@ def _cmd_telegram_sources_add(config: AppConfig, args, *, client=None):
         asyncio.run(flow())
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (TelegramFloodWaitError, TelegramRPCError) as exc:
+        print(f"error: telegram call failed: {exc}", file=sys.stderr)
         return 2
     return 0
 
