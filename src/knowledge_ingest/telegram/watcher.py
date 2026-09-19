@@ -60,6 +60,17 @@ class TelegramWatcher:
                 return "ignored"  # 从未入库的消息：无需标记
             self._pipeline_safe(event, "deleted", source_id)
             return "deleted"
+        if event.kind is TelegramEventKind.EDIT:
+            # R10：live + reconcile 会把同一条编辑重投多次（生产实测：一条
+            # 编辑产生 13 条审计行）。事实没变就不重建、不重分类——通道
+            # 开启时这还会重复调用模型烧预算。
+            existing = self.store.get_message(source_id, event.message_id)
+            edited_at = (_iso(event.edited_at)
+                         if event.edited_at else None)
+            if existing is not None and existing["text"] == event.text \
+                    and existing["edited_at"] == edited_at:
+                self.store.advance_seen(source_id, event.message_id)
+                return "unchanged"
         document = event.document
         try:
             self.store.upsert_message(

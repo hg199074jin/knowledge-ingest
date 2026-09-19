@@ -1050,3 +1050,44 @@ def test_r2_interest_keep_unknown_size_flags_review(tmp_path):
     reasons = [row["reason"] for row in store.list_open_reviews()
                if row["item_id"] == item_id]
     assert "pdf size unknown" in reasons
+
+
+# ---------- 评审 R10：编辑重投不得重复分类 ----------
+
+def test_r10_replayed_edit_is_noop(tmp_path):
+    """R10：同一条编辑被 live+reconcile 重投时，事实没变 → 不得重建/重分类。
+
+    生产实证（tg_search:227648 单条编辑 13 条审计行）：重投会重复
+    classify + 审计；通道开启时疑似正文还会重复调用模型（烧预算）。
+    """
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=1, second=1, text="v1"))
+    item_id = "tg_a:1"
+    store.finalize_item(item_id)
+    materialize_text_item(store, item_id, tmp_path)
+
+    edited = TelegramEvent(kind=TelegramEventKind.EDIT,
+                           chat_id=-1001234567890, message_id=1,
+                           message_date=dt(1), sender_id=99, text="v2",
+                           edited_at=dt(60))
+    assert watcher.handle_event(edited) == "updated"
+    audits = len(store.list_classifier_audit(item_id))
+    assert audits >= 1
+    assert "v2" in Path(store.get_source_item(
+        item_id)["materialized_path"]).read_text(encoding="utf-8")
+
+    assert watcher.handle_event(edited) == "unchanged"      # 重投
+    assert len(store.list_classifier_audit(item_id)) == audits
+    assert store.get_source_item(item_id)["processing_status"] == \
+        "materialized"
+
+    # 真正的新编辑（edited_at 变化）仍然重建
+    newer = TelegramEvent(kind=TelegramEventKind.EDIT,
+                          chat_id=-1001234567890, message_id=1,
+                          message_date=dt(1), sender_id=99, text="v3",
+                          edited_at=dt(120))
+    assert watcher.handle_event(newer) == "updated"
+    assert len(store.list_classifier_audit(item_id)) > audits
+    assert "v3" in Path(store.get_source_item(
+        item_id)["materialized_path"]).read_text(encoding="utf-8")
