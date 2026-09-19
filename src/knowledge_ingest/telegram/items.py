@@ -168,6 +168,8 @@ class SourceItemPipeline:
         self.store.reset_item_policy(item_id)
         if item["kind"] == "text":
             self._finalize_text(item_id)   # 重建即重分类（policy 已清）
+        elif item["kind"] == "pdf":
+            self._classify_pdf(item_id)    # I3：caption 变了 → 重判兴趣
         return "rebuilt"
 
     # ---- DELETE：§6.4 D ----
@@ -257,10 +259,20 @@ class SourceItemPipeline:
         if decision.decision == "SKIP":
             self.store.set_item_processing_status(item_id, "skipped_noise")
             return
-        self._materialize(item_id)
+        body = "\n\n".join(texts)
+        if not body.strip():
+            # I4：空正文（全删/无文本）→ 终态，不物化、不进人工队列
+            self.store.set_item_processing_status(item_id, "empty_item")
+            return
         if decision.decision == "REVIEW":
-            self.store.create_review(item_id, "noise_uncertain",
-                                     kind="text")
+            # I4：§24.1 只在 KEEP 物化；REVIEW 停车等待人工，
+            # resolve→KEEP 后由 TG6 handoff runner 补物化
+            self.store.set_item_processing_status(item_id, "noise_review")
+            if not self.store.has_open_review(item_id, "noise_uncertain"):
+                self.store.create_review(item_id, "noise_uncertain",
+                                         kind="text")
+            return
+        self._materialize(item_id)
 
     def _classify_pdf(self, item_id: str) -> None:
         """§11.4/§12：Interest（下载前）→ INCLUDE 且 ≤50MiB 才待下载；
@@ -297,13 +309,18 @@ class SourceItemPipeline:
         elif decision.decision == "REVIEW":
             self.store.set_item_processing_status(item_id,
                                                   "interest_review")
-            self.store.create_review(item_id, "interest_uncertain",
-                                     kind="pdf", size_bytes=size)
+            if not self.store.has_open_review(item_id,
+                                              "interest_uncertain"):
+                self.store.create_review(item_id, "interest_uncertain",
+                                         kind="pdf", size_bytes=size)
         else:                                   # INCLUDE
             self.store.set_item_processing_status(item_id,
                                                   "interest_include")
-            if size is None or size > MAX_AUTO_DOWNLOAD_BYTES:
-                self.store.create_review(item_id, "size over 50 MiB",
+            reason = ("pdf size unknown" if size is None
+                      else "size over 50 MiB")
+            if (size is None or size > MAX_AUTO_DOWNLOAD_BYTES) \
+                    and not self.store.has_open_review(item_id, reason):
+                self.store.create_review(item_id, reason,
                                          kind="pdf", size_bytes=size)
 
     def _materialize(self, item_id: str):

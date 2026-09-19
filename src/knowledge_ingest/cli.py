@@ -1451,6 +1451,10 @@ def _render_telegram_status(store) -> int:
               f"reconciled={reconciled}")
     print(f"messages: {summary['messages_total']}")
     print(f"open_reviews: {summary['open_reviews']}")
+    for reason, count in sorted(summary["reviews_by_reason"].items()):
+        print(f"  review[{reason}]: {count}")
+    if summary["oldest_open_review_at"]:
+        print(f"oldest_open_review: {summary['oldest_open_review_at']}")
     print(f"pending_resources: {summary['pending_resources']}")
     downloads = summary["downloads_by_status"]
     print("downloads: " + (", ".join(

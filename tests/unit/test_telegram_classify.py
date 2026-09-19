@@ -20,7 +20,6 @@ from knowledge_ingest.telegram.event_store import TelegramEventStore
 
 T0 = "2026-09-18T09:00:00+08:00"
 
-
 class CountingLLM:
     """可注入的假模型：按脚本返回，并计数调用。"""
 
@@ -37,15 +36,12 @@ class CountingLLM:
             raise item
         return item
 
-
 def make_store(tmp_path: Path) -> TelegramEventStore:
     return TelegramEventStore(tmp_path / "telegram" / "state.db")
-
 
 def dt(second):
     return datetime(2026, 9, 18, 10, 0, 0, tzinfo=UTC) + timedelta(
         seconds=second)
-
 
 # ---------- Noise：规则优先 ----------
 
@@ -55,7 +51,6 @@ def test_plain_text_keeps_with_zero_llm_calls():
                               "情景记忆与语义记忆……", llm=llm)
     assert decision.decision == "KEEP"
     assert llm.calls == []
-
 
 def test_explicit_ad_skips_with_zero_llm_calls():
     llm = CountingLLM()
@@ -70,7 +65,6 @@ def test_explicit_ad_skips_with_zero_llm_calls():
         assert decision.confidence == 1.0
     assert llm.calls == []
 
-
 def test_suspected_ad_uses_llm_once():
     llm = CountingLLM(script=[json.dumps(
         {"decision": "SKIP", "reason_code": "ad_mixed", "confidence": 0.9})])
@@ -80,18 +74,15 @@ def test_suspected_ad_uses_llm_once():
     assert decision.reason_code == "ad_mixed"
     assert len(llm.calls) == 1
 
-
 def test_llm_failure_falls_back_to_review():
     llm = CountingLLM(script=[RuntimeError("boom")])
     decision = classify_noise("私聊我拿完整版方法论", llm=llm)
     assert decision.decision == "REVIEW"
 
-
 def test_invalid_json_falls_back_to_review():
     llm = CountingLLM(script=["not json at all"])
     decision = classify_noise("私聊我拿完整版", llm=llm)
     assert decision.decision == "REVIEW"
-
 
 def test_unknown_enum_falls_back_to_review():
     llm = CountingLLM(script=[json.dumps(
@@ -99,24 +90,20 @@ def test_unknown_enum_falls_back_to_review():
     decision = classify_noise("私聊我拿完整版", llm=llm)
     assert decision.decision == "REVIEW"
 
-
 def test_no_llm_channel_suspect_goes_review():
     decision = classify_noise("私聊我拿完整版方法论")
     assert decision.decision == "REVIEW"
-
 
 def test_parse_noise_json_valid():
     decision = parse_noise_json(json.dumps(
         {"decision": "KEEP", "reason_code": "knowledge", "confidence": 0.8}))
     assert decision is not None and decision.decision == "KEEP"
 
-
 # ---------- Interest：可注入 + 正例保护 ----------
 
 def pdf_meta(caption="课程说明", filename="课.pdf"):
     return {"caption": caption, "filename": filename, "size_bytes": 1024,
             "source_display_name": "AI探索指南"}
-
 
 def test_interest_include_by_llm():
     llm = CountingLLM(script=[json.dumps({
@@ -126,7 +113,6 @@ def test_interest_include_by_llm():
     assert decision.decision == "INCLUDE"
     assert decision.primary_topic == "AI"
 
-
 def test_interest_exclude_by_llm():
     llm = CountingLLM(script=[json.dumps({
         "decision": "EXCLUDE", "primary_topic": "荐股",
@@ -134,7 +120,6 @@ def test_interest_exclude_by_llm():
     decision = classify_interest(
         pdf_meta(caption="明日涨停黑马股推荐", filename="荐股.pdf"), llm=llm)
     assert decision.decision == "EXCLUDE"
-
 
 def test_interest_prompt_carries_positive_protection():
     """冻结 §11.3：投资认知正例必须随 prompt 下发（防语义误杀）。"""
@@ -146,11 +131,9 @@ def test_interest_prompt_carries_positive_protection():
         llm=llm)
     assert any("上市公司商业模式分析" in prompt for prompt in llm.calls)
 
-
 def test_interest_insufficient_info_review_without_llm():
     decision = classify_interest(pdf_meta(caption="", filename="file.pdf"))
     assert decision.decision == "REVIEW"
-
 
 def test_interest_ad_prescreen_skips_llm():
     llm = CountingLLM()
@@ -159,7 +142,6 @@ def test_interest_ad_prescreen_skips_llm():
     assert decision.decision == "EXCLUDE"
     assert decision.reason == "contact_sale"
     assert llm.calls == []
-
 
 # ---------- Source AI Budget（SQLite 分账） ----------
 
@@ -174,7 +156,6 @@ def test_budget_acquire_replay_idempotent(tmp_path):
         ("permit", "req-1")            # 重放不重复计数
     row = store.get_ai_budget("tg_a", "noise_classifier")
     assert row["calls"] == 1
-
 
 def test_budget_exhausted_denies(tmp_path):
     store = make_store(tmp_path)
@@ -192,7 +173,6 @@ def test_budget_exhausted_denies(tmp_path):
     assert decision.decision == "REVIEW"
     assert llm.calls == []             # 拒绝后不调用模型
 
-
 def test_budget_breaker_opens_on_empties(tmp_path):
     store = make_store(tmp_path)
     from knowledge_ingest.telegram.event_store import AIBudgetGuard
@@ -203,7 +183,6 @@ def test_budget_breaker_opens_on_empties(tmp_path):
         guard.outcome("tg_a", "noise_classifier", f"req-{i}", "empty")
     status, reason = guard.acquire("tg_a", "noise_classifier", "req-x")
     assert (status, reason) == ("denied", "breaker_open")
-
 
 def test_budget_outcome_idempotent_and_success_resets(tmp_path):
     store = make_store(tmp_path)
@@ -218,7 +197,6 @@ def test_budget_outcome_idempotent_and_success_resets(tmp_path):
     row = store.get_ai_budget("tg_a", "noise_classifier")
     assert row["consecutive_empty"] == 0   # success 双清零
 
-
 def test_budget_separate_ledger_per_kind(tmp_path):
     store = make_store(tmp_path)
     from knowledge_ingest.telegram.event_store import AIBudgetGuard
@@ -227,7 +205,6 @@ def test_budget_separate_ledger_per_kind(tmp_path):
     guard.acquire("tg_a", "noise_classifier", "r1")
     assert guard.acquire("tg_a", "pdf_interest_classifier", "r2") == \
         ("permit", "r2")               # 分账：互不挤占
-
 
 # ---------- pipeline 集成（§7.2 顺序落地） ----------
 
@@ -264,7 +241,6 @@ def make_pipeline(tmp_path, store, **kwargs):
 
     return pipeline, send_text, send_pdf
 
-
 def test_pipeline_text_keep_then_materialized(tmp_path):
     store = make_store(tmp_path)
     store.add_source(source_id="tg_a", chat_id=-1001234567890,
@@ -279,7 +255,6 @@ def test_pipeline_text_keep_then_materialized(tmp_path):
     assert audit and audit[0]["policy_version"] == POLICY_VERSION
     assert audit[0]["classifier_version"] == CLASSIFIER_VERSION
 
-
 def test_pipeline_text_ad_skip(tmp_path):
     store = make_store(tmp_path)
     store.add_source(source_id="tg_a", chat_id=-1001234567890,
@@ -291,7 +266,6 @@ def test_pipeline_text_ad_skip(tmp_path):
     assert item["noise_decision"] == "SKIP"
     assert item["processing_status"] == "skipped_noise"
     assert llm.calls == []
-
 
 def test_pipeline_pdf_interest_flow(tmp_path):
     store = make_store(tmp_path)
@@ -306,7 +280,6 @@ def test_pipeline_pdf_interest_flow(tmp_path):
     item = store.get_source_item("tg_a:1")
     assert item["interest_decision"] == "INCLUDE"
     assert item["processing_status"] == "interest_include"  # 待 TG6 下载
-
 
 def test_pipeline_pdf_oversize_include_creates_review(tmp_path):
     store = make_store(tmp_path)
@@ -323,7 +296,6 @@ def test_pipeline_pdf_oversize_include_creates_review(tmp_path):
     reasons = [r["reason"] for r in store.list_open_reviews()]
     assert "size over 50 MiB" in reasons
 
-
 def test_pipeline_pdf_exclude_skips(tmp_path):
     store = make_store(tmp_path)
     store.add_source(source_id="tg_a", chat_id=-1001234567890,
@@ -337,7 +309,6 @@ def test_pipeline_pdf_exclude_skips(tmp_path):
     item = store.get_source_item("tg_a:1")
     assert item["interest_decision"] == "EXCLUDE"
     assert item["processing_status"] == "skipped_interest"
-
 
 def test_pipeline_cloud_link_stays_pending_zero_calls(tmp_path):
     from knowledge_ingest.telegram.client_port import (
@@ -361,3 +332,146 @@ def test_pipeline_cloud_link_stays_pending_zero_calls(tmp_path):
     item = store.get_source_item("tg_a:5")
     assert item["processing_status"] == "PENDING_RESOURCE"
     assert llm.calls == []
+
+# ---------- TG5 评审加固（C1 churn / I2 dedup / I3 pdf rebuild / I4 park /
+# I6 长正文保护 / I7 可见性 / M8 reason 文案） ----------
+
+def _prep(tmp_path, source_id="tg_a"):
+    store = make_store(tmp_path)
+    store.add_source(source_id=source_id, chat_id=-1001234567890,
+                     start_at=T0)
+    return store
+
+def test_c1_skipped_item_not_rescanned_by_recovery(tmp_path):
+    store = _prep(tmp_path)
+    llm = CountingLLM()
+    _pipeline, send_text, _ = make_pipeline(tmp_path, store, noise_llm=llm)
+    send_text(1, 1, "加微信 vk123456 优惠券返利下单立减")   # 规则 SKIP
+    item_id = "tg_a:1"
+    assert store.get_source_item(item_id)["processing_status"] == \
+        "skipped_noise"
+    audits_before = len(store.list_classifier_audit(item_id))
+    calls_before = len(llm.calls)
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+    pipeline2 = SourceItemPipeline(store, data_root=tmp_path,
+                                   orico_check=lambda: True, noise_llm=llm)
+    assert pipeline2.recover_stranded() == 0            # 不再重扫 SKIP 项
+    assert len(store.list_classifier_audit(item_id)) == audits_before
+    assert len(llm.calls) == calls_before
+
+def test_i6_long_methodology_with_ad_tail_not_rule_skipped(tmp_path):
+    """§10.3：长方法论正文 + 广告尾巴 → 不允许规则级 SKIP。"""
+    body = ("工作记忆的容量限制是认知负荷理论的核心：一次只能主动 "
+            "保持约 4 个组块。" * 30) + "\n文末优惠券返利，加微信领取"
+    assert len(body) >= 400
+    llm = CountingLLM(script=[json.dumps({
+        "decision": "KEEP", "reason_code": "knowledge_with_ad_tail",
+        "confidence": 0.8})])
+    decision = classify_noise(body, llm=llm)
+    assert decision.decision == "KEEP"          # 语义判定说了算
+    assert len(llm.calls) == 1                  # 走了疑似路径而非规则直杀
+
+def test_i2_repeated_edits_do_not_duplicate_reviews(tmp_path):
+    from knowledge_ingest.telegram.client_port import (
+        TelegramEvent,
+        TelegramEventKind,
+    )
+    from knowledge_ingest.telegram.watcher import TelegramWatcher
+
+    store = _prep(tmp_path)
+    pipeline, send_text, _ = make_pipeline(tmp_path, store)  # llm=None→REVIEW
+    send_text(1, 1, "方法论干货：想要完整版的可以私聊我领取")
+
+    watcher = TelegramWatcher(store, pipeline=pipeline)
+    for i, text in enumerate(["改一", "改二"], start=2):
+        watcher.handle_event(TelegramEvent(
+            kind=TelegramEventKind.EDIT, chat_id=-1001234567890,
+            message_id=1, message_date=dt(1), sender_id=99, text=text,
+            edited_at=dt(60 + i)))
+    opens = [r for r in store.list_open_reviews()
+             if r["reason"] == "noise_uncertain"]
+    assert len(opens) == 1                      # 去重：不随编辑翻倍
+
+def test_i4_review_items_parked_not_materialized(tmp_path):
+    store = _prep(tmp_path)
+    _pipeline, send_text, _ = make_pipeline(tmp_path, store)  # llm=None
+    send_text(1, 1, "干货方法论，想要完整版私聊我领取")
+    item = store.get_source_item("tg_a:1")
+    assert item["processing_status"] == "noise_review"   # 停车场语义
+    assert item["materialized_path"] is None             # 未物化
+    assert any(r["reason"] == "noise_uncertain"
+               for r in store.list_open_reviews())
+
+def test_i4_empty_item_terminal(tmp_path):
+    store = _prep(tmp_path)
+    _pipeline, send_text, _ = make_pipeline(tmp_path, store)
+    send_text(1, 1, "   ")                      # 空白正文
+    item = store.get_source_item("tg_a:1")
+    assert item["processing_status"] == "empty_item"
+    assert item["materialized_path"] is None
+    assert store.list_open_reviews() == []      # 空项不产生人工队列噪音
+
+def test_i3_pdf_edit_reclassifies(tmp_path):
+    from knowledge_ingest.telegram.client_port import (
+        TelegramEvent,
+        TelegramEventKind,
+    )
+    from knowledge_ingest.telegram.watcher import TelegramWatcher
+
+    store = _prep(tmp_path)
+    llm = CountingLLM(script=[
+        json.dumps({"decision": "REVIEW", "primary_topic": "?",
+                    "reason": "unclear", "confidence": 0.4}),
+        json.dumps({"decision": "INCLUDE", "primary_topic": "AI",
+                    "reason": "clear now", "confidence": 0.9}),
+    ])
+    _pipeline, _, send_pdf = make_pipeline(tmp_path, store,
+                                           interest_llm=llm)
+    send_pdf(1, "讲义")                          # 第一次：REVIEW
+    item_id = "tg_a:1"
+    assert store.get_source_item(item_id)["interest_decision"] == "REVIEW"
+
+    pipeline = _pipeline
+    watcher = TelegramWatcher(store, pipeline=pipeline)
+    watcher.handle_event(TelegramEvent(
+        kind=TelegramEventKind.EDIT, chat_id=-1001234567890,
+        message_id=1, message_date=dt(1), sender_id=99,
+        text="Agent 架构讲义", edited_at=dt(60)))  # caption 编辑
+    item = store.get_source_item(item_id)
+    assert item["interest_decision"] == "INCLUDE"          # 重分类生效
+    assert item["processing_status"] == "interest_include"
+    assert len(llm.calls) == 2
+
+def test_i7_status_shows_review_backlog(tmp_path):
+    store = _prep(tmp_path)
+    store.add_source(source_id="tg_a", chat_id=-1001234567890,
+                     start_at=T0)
+    store.create_source_item("item-1", "tg_a", "text", [1])
+    store.create_review("item-1", "noise_uncertain", kind="text")
+    summary = store.status_summary()
+    assert summary["reviews_by_reason"].get("noise_uncertain") == 1
+    assert summary["oldest_open_review_at"] is not None
+
+def test_m8_unknown_size_reason_distinguishes(tmp_path):
+    store = _prep(tmp_path)
+    llm = CountingLLM(script=[json.dumps({
+        "decision": "INCLUDE", "primary_topic": "AI",
+        "reason": "ok", "confidence": 0.9})])
+    pipeline, _, _send_pdf = make_pipeline(tmp_path, store,
+                                           interest_llm=llm)
+    from knowledge_ingest.telegram.client_port import (
+        TelegramDocumentRef,
+        TelegramEvent,
+        TelegramEventKind,
+    )
+    from knowledge_ingest.telegram.watcher import TelegramWatcher
+    watcher = TelegramWatcher(store, pipeline=pipeline)
+    watcher.handle_event(TelegramEvent(
+        kind=TelegramEventKind.NEW, chat_id=-1001234567890,
+        message_id=1, message_date=dt(1), sender_id=99, text="课件",
+        document=TelegramDocumentRef(document_id=1, file_name="x.pdf",
+                                     mime_type="application/pdf",
+                                     size_bytes=None)))   # 大小未知
+    reasons = [r["reason"] for r in store.list_open_reviews()]
+    assert "pdf size unknown" in reasons
+    assert "size over 50 MiB" not in reasons

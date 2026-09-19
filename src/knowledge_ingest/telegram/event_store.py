@@ -550,11 +550,24 @@ class TelegramEventStore:
             (kind,)).fetchall()
 
     def find_stranded_items(self) -> list[sqlite3.Row]:
-        """C1 恢复扫描：finalized 但从未物化成功的 text item。"""
+        """C1 恢复扫描：只找"确实该物化而没物化"的项。
+
+        终态（skipped_noise / noise_review / empty_item /
+        deleted_source）不是搁浅——把它们扫进来会让 recover 每
+        5 分钟重分类一次并无限堆积审计行（评审 C1）。
+        """
         return self._conn.execute(
             "SELECT * FROM source_items WHERE kind = 'text' "
             "AND finalized_at IS NOT NULL AND materialized_path IS NULL "
-            "AND processing_status != 'deleted_source'").fetchall()
+            "AND processing_status NOT IN ('deleted_source', "
+            "'skipped_noise', 'noise_review', 'empty_item')"
+        ).fetchall()
+
+    def has_open_review(self, item_id: str, reason: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM reviews WHERE item_id = ? AND reason = ? "
+            "AND resolved_at IS NULL LIMIT 1",
+            (item_id, reason)).fetchone() is not None
 
     # ---------- TG5：decision 落库与审计 ----------
 
@@ -693,6 +706,14 @@ class TelegramEventStore:
                 "SELECT item_id, knowledge_ingest_job_id FROM source_items "
                 "WHERE handoff_completed = 1 ORDER BY created_at DESC "
                 "LIMIT 5")]
+        summary["reviews_by_reason"] = {
+            row["reason"]: row["n"] for row in self._conn.execute(
+                "SELECT reason, COUNT(*) AS n FROM reviews "
+                "WHERE resolved_at IS NULL GROUP BY reason")}
+        oldest = self._conn.execute(
+            "SELECT MIN(created_at) FROM reviews "
+            "WHERE resolved_at IS NULL").fetchone()[0]
+        summary["oldest_open_review_at"] = oldest
         summary["download_once_pending"] = [
             row["item_id"] for row in self._conn.execute(
                 "SELECT item_id FROM reviews WHERE decision = "
@@ -735,28 +756,48 @@ class AIBudgetGuard:
         return dict(row)
 
     def acquire(self, source_id: str, kind: str, request_id: str):
-        row = self._row(source_id, kind)
-        permits = json.loads(row["permits_json"] or "{}")
-        if request_id in permits:
-            return ("permit", request_id)      # 重放幂等
-        if row["calls"] >= self.max_calls:
-            return ("denied", "budget_exhausted")
-        if (row["consecutive_empty"] >= self.breaker_empty
-                or row["consecutive_rate_limit"] >= self.breaker_rate_limit):
-            return ("denied", "breaker_open")
-        permits[request_id] = "pending"
-        with self.store._conn:
-            self.store._conn.execute(
+        conn = self.store._conn
+        conn.execute("BEGIN IMMEDIATE")        # I5：读-改-写单事务
+        try:
+            row = self._row(source_id, kind)
+            permits = json.loads(row["permits_json"] or "{}")
+            if request_id in permits:
+                conn.execute("COMMIT")
+                return ("permit", request_id)  # 重放幂等
+            if row["calls"] >= self.max_calls:
+                conn.execute("COMMIT")
+                return ("denied", "budget_exhausted")
+            if (row["consecutive_empty"] >= self.breaker_empty
+                    or row["consecutive_rate_limit"]
+                    >= self.breaker_rate_limit):
+                conn.execute("COMMIT")
+                return ("denied", "breaker_open")
+            permits[request_id] = "pending"
+            conn.execute(
                 """UPDATE source_ai_budget SET calls = calls + 1,
                      attempts = attempts + 1, permits_json = ?
                    WHERE source_id = ? AND classifier_kind = ?""",
                 (json.dumps(permits), source_id, kind))
-        return ("permit", request_id)
+            conn.execute("COMMIT")
+            return ("permit", request_id)
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def outcome(self, source_id: str, kind: str, request_id: str,
                 result: str) -> None:
         if result not in ("success", "empty", "rate_limit"):
             raise ValueError(f"invalid budget outcome: {result}")
+        conn = self.store._conn
+        conn.execute("BEGIN IMMEDIATE")        # I5：同上
+        try:
+            self._outcome_tx(conn, source_id, kind, request_id, result)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def _outcome_tx(self, conn, source_id, kind, request_id, result):
         row = self._row(source_id, kind)
         permits = json.loads(row["permits_json"] or "{}")
         if request_id not in permits:
@@ -779,10 +820,9 @@ class AIBudgetGuard:
         else:
             rate += 1
             empty = 0
-        with self.store._conn:
-            self.store._conn.execute(
-                """UPDATE source_ai_budget SET
-                     consecutive_empty = ?, consecutive_rate_limit = ?,
-                     permits_json = ?
-                   WHERE source_id = ? AND classifier_kind = ?""",
-                (empty, rate, json.dumps(permits), source_id, kind))
+        conn.execute(
+            """UPDATE source_ai_budget SET
+                 consecutive_empty = ?, consecutive_rate_limit = ?,
+                 permits_json = ?
+               WHERE source_id = ? AND classifier_kind = ?""",
+            (empty, rate, json.dumps(permits), source_id, kind))

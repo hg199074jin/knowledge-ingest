@@ -32,7 +32,10 @@ _GROUP_SPAM_RE = re.compile(
 _CONTACT_SALE_RE = re.compile(
     r"(加微信|加vx|vx号|微信号|私信我|联系我).{0,20}"
     r"([a-zA-Z0-9_-]{6,}|领取|优惠|返利|下单|折扣|秒杀)")
-_COUPON_RE = re.compile(r"优惠券|返利|佣金|推广费|招代理|招下级")
+# I6：裸词（优惠券/返利/佣金/推广费）只做疑似信号，不进零调用
+# SKIP——OTA 佣金结构、带货返利模式本是 §11.2 INCLUDE 域
+_COUPON_RE = re.compile(
+    r"(优惠券|返利|佣金).{0,12}(领取|下单|立减|私信|加微信)|招代理|招下级")
 
 NOISE_SKIP_RULES = (
     ("adult_service", _ADULT_RE),
@@ -43,7 +46,22 @@ NOISE_SKIP_RULES = (
 
 # ---- 疑似层（弱信号 → 交给 LLM 边界判断） ----
 _SUSPECT_RE = re.compile(
-    r"私聊|私信|完整版|加v|领取|免费拿|扫码|客服|下单|拼单|优惠")
+    r"私聊|私信|完整版|加v|领取|免费拿|扫码|客服|下单|拼单|优惠|"
+    r"优惠券|返利|佣金|推广费")
+
+# §10.3：长正文里的广告元素更可能是"方法论+广告尾巴"——规则直杀
+# 只对短内容（近乎无知识正文）生效；长内容降级为疑似路径
+KNOWLEDGE_BODY_FLOOR_CHARS = 400
+
+
+def _rule_hit(content: str):
+    """规则命中（短内容限定）；返回 (reason_code, pattern) 或 None。"""
+    if len(content) >= KNOWLEDGE_BODY_FLOOR_CHARS:
+        return None
+    for reason_code, pattern in NOISE_SKIP_RULES:
+        if pattern.search(content):
+            return reason_code, pattern
+    return None
 
 # ---- 冻结 §11.3：投资认知正例（防"见股票词即排除"的语义误杀） ----
 INVESTMENT_POSITIVE_EXAMPLES = (
@@ -139,9 +157,9 @@ def classify_noise(text: str | None, *, llm=None, budget=None,
     content = (text or "").strip()
     if not content:
         return NoiseDecision("REVIEW", "empty_text", 0.0)
-    for reason_code, pattern in NOISE_SKIP_RULES:
-        if pattern.search(content):
-            return NoiseDecision("SKIP", reason_code, 1.0)
+    hit = _rule_hit(content)
+    if hit is not None:
+        return NoiseDecision("SKIP", hit[0], 1.0)
     if not _SUSPECT_RE.search(content):
         return NoiseDecision("KEEP", "whitelist_default", 1.0)
     if llm is None:
@@ -156,7 +174,7 @@ def classify_noise(text: str | None, *, llm=None, budget=None,
     try:
         raw = llm(prompt)
     except Exception:  # noqa: BLE001 —— 注入通道任意失败→REVIEW
-        _settle(budget, source_id, "noise_classifier", info, "empty")
+        _settle(budget, source_id, "noise_classifier", info, "rate_limit")
         return NoiseDecision("REVIEW", "llm_failure", 0.0)
     decision = parse_noise_json(raw)
     _settle(budget, source_id, "noise_classifier", info,
@@ -182,9 +200,9 @@ def classify_interest(pdf_meta: dict, *, llm=None, budget=None,
     filename = (pdf_meta.get("filename") or "").strip()
     source_name = (pdf_meta.get("source_display_name") or "").strip()
     visible = f"{caption}\n{filename}"
-    for reason_code, pattern in NOISE_SKIP_RULES:
-        if pattern.search(visible):
-            return InterestDecision("EXCLUDE", "ad", reason_code, 1.0)
+    hit = _rule_hit(visible)
+    if hit is not None:
+        return InterestDecision("EXCLUDE", "ad", hit[0], 1.0)
     if not (caption or filename or source_name):
         return InterestDecision("REVIEW", "", "insufficient_metadata", 0.0)
     if llm is None:
@@ -210,7 +228,8 @@ def classify_interest(pdf_meta: dict, *, llm=None, budget=None,
     try:
         raw = llm(prompt)
     except Exception:  # noqa: BLE001 —— 注入通道任意失败→REVIEW
-        _settle(budget, source_id, "pdf_interest_classifier", info, "empty")
+        _settle(budget, source_id, "pdf_interest_classifier", info,
+                "rate_limit")
         return InterestDecision("REVIEW", "", "llm_failure", 0.0)
     decision = parse_interest_json(raw)
     _settle(budget, source_id, "pdf_interest_classifier", info,
