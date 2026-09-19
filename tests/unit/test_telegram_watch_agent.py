@@ -33,9 +33,11 @@ def test_labels_and_paths(tmp_path, monkeypatch):
     assert watch_agent.plist_install_path() == (
         tmp_path / "Library" / "LaunchAgents"
         / f"com.{tmp_path.name}.ki-telegram-watch.plist")
+    # launchd 打不开外置盘上的日志文件（生产实测 EX_CONFIG/78）→ 固定内建盘
     config = make_config(tmp_path)
     assert watch_agent.launchd_log_path(config) == (
-        config.pipeline_root / "logs" / "launchd" / "telegram-watch.log")
+        Path.home() / "Library" / "Logs" / "knowledge-ingest"
+        / "telegram-watch.log")
 
 
 def test_collect_env_picks_channel_vars_and_defaults_handoff(monkeypatch):

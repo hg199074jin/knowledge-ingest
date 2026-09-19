@@ -45,8 +45,10 @@ def plist_install_path(user: str | None = None) -> Path:
 
 
 def launchd_log_path(config: AppConfig) -> Path:
-    return (config.pipeline_root / "logs" / "launchd"
-            / "telegram-watch.log")
+    """launchd 的 stdout/stderr 必须落内建盘：实测指向外置盘（ORICO）时
+    spawn 直接 EX_CONFIG/78（launchd 无法打开该卷上的日志文件）。
+    config 参数保留以维持调用方形状，日志固定走 ~/Library/Logs。"""
+    return Path.home() / "Library" / "Logs" / "knowledge-ingest"         / "telegram-watch.log"
 
 
 def run_launchctl(argv: list[str]) -> tuple[int, str, str]:
