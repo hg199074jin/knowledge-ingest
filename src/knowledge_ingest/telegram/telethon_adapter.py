@@ -261,7 +261,9 @@ class TelethonAdapter:
         client = await self._connected(self._client_or_new())
 
         async def call():
-            return await client.get_messages(chat_id, ids=message_id)
+            # R11：ids 传列表——telethon 对单个 int 返回单个 Message 对象
+            #（不可下标），传列表才返回 TotalList
+            return await client.get_messages(chat_id, ids=[message_id])
 
         messages = await self._guard(call())
         if not messages or messages[0] is None:
@@ -272,7 +274,7 @@ class TelethonAdapter:
                                 dest_dir: Path) -> Path:
         client = await self._connected(self._client_or_new())
         messages = await self._guard(
-            client.get_messages(chat_id, ids=message_id))
+            client.get_messages(chat_id, ids=[message_id]))
         if not messages or messages[0] is None:
             raise TelegramRPCError(
                 f"message not found: {chat_id}#{message_id}")

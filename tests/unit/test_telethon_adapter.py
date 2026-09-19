@@ -324,3 +324,50 @@ def test_r8_live_handlers_are_awaitable(tmp_path):
     handlers = asyncio.run(drive())
     assert all(inspect.iscoroutinefunction(handler)
                for handler in handlers)
+
+
+def test_r11_download_document_handles_single_message_return(tmp_path):
+    """R11（生产实测）：telethon `get_messages(ids=int)` 返回**单个** Message
+    而不是列表——适配器按 `messages[0]` 取值，所有真实 PDF 下载全部以
+    `'Message' object is not subscriptable` 失败。fake 必须复现真实行为。"""
+    import types
+
+    from knowledge_ingest.telegram.telethon_adapter import TelethonAdapter
+
+    class DuckClient:
+        """按 telethon 真实契约：ids=int → 单对象；ids=list → 列表。"""
+
+        def __init__(self):
+            self.sent = None
+
+        def is_connected(self):
+            return True
+
+        async def connect(self):
+            return None
+
+        async def get_messages(self, chat_id, ids=None, limit=None,
+                               min_id=None, reverse=None):
+            if ids is not None:
+                self.sent = ids
+                if isinstance(ids, list):
+                    return [types.SimpleNamespace(id=ids[0])]
+                return types.SimpleNamespace(id=ids)
+            return []
+
+        async def download_media(self, message, file=None):
+            path = Path(file) / "doc.pdf"
+            path.write_bytes(b"%PDF-1.4 real")
+            return str(path)
+
+    adapter = make_adapter(tmp_path)
+    client = DuckClient()
+    adapter._client = client
+    dest = tmp_path / "dest"
+    dest.mkdir(parents=True, exist_ok=True)   # 生产侧由 download_pdf_async 创建
+    out = asyncio.run(adapter.download_document(-1001234567890, 42, dest))
+    assert out.is_file() and out.read_bytes().startswith(b"%PDF")
+    assert isinstance(client.sent, list) and client.sent == [42]
+
+    event = asyncio.run(adapter.get_message(-1001234567890, 42))
+    assert event is not None and event.message_id == 42
