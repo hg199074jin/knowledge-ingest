@@ -160,8 +160,8 @@ class TelethonAdapter:
         TG7：session 文件与常驻 watcher 互斥（SQLite 锁），短暂争用时
         退避重试而不是直接失败；持久锁由上层报错（migration/运维处理）。
         """
+        import asyncio
         import sqlite3
-        import time as _time
 
         if not client.is_connected():
             for attempt in range(3):
@@ -172,7 +172,8 @@ class TelethonAdapter:
                     if "database is locked" not in str(exc) \
                             or attempt == 2:
                         raise
-                    _time.sleep(SESSION_LOCK_RETRY_SECONDS)
+                    # async 环境用 asyncio.sleep（阻塞 sleep 会冻结事件循环）
+                    await asyncio.sleep(SESSION_LOCK_RETRY_SECONDS)
         return client
 
     async def _guard(self, coro):
