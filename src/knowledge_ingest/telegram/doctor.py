@@ -141,10 +141,7 @@ def run_checks(config: AppConfig, *,
                          + (f"; { '; '.join(dl_bad[:3])}" if dl_bad else "")))
 
     # source_item → job_id 存在
-    from knowledge_ingest.manifest_store import ManifestStore
-
     jobs_root = config.pipeline_root / "jobs"
-    ms = ManifestStore(jobs_root=jobs_root)
     orphan = [r["item_id"] for r in store._conn.execute(
         "SELECT item_id, knowledge_ingest_job_id j FROM source_items "
         "WHERE handoff_completed = 1")
