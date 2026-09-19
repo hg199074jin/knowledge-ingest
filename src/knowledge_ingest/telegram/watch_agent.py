@@ -85,28 +85,39 @@ def program_arguments(ki_exe: str) -> list[str]:
     return [ki_exe, "telegram", "watch"]
 
 
+def repo_root() -> Path:
+    # watch_agent.py 位于 src/knowledge_ingest/telegram/ → 仓库根是 parents[3]
+    return Path(__file__).resolve().parents[3]
+
+
 def _ki_exe() -> str:
-    """console script 与当前解释器同目录（venv 安装布局）。"""
+    """定位 console script：先看解释器同目录，再回退仓库 venv 布局。
+
+    不能对 sys.executable 做 resolve()——venv 的 python3 是指向 uv
+    管理解释器的符号链接，resolve 后同目录就不再是 venv 的 bin。
+    """
     import sys
 
-    candidate = Path(sys.executable).resolve().parent / "knowledge-ingest"
-    if not candidate.is_file():
-        raise RuntimeError(
-            f"knowledge-ingest launcher not found next to {sys.executable}; "
-            "install from the project venv")
-    return str(candidate)
+    candidates = [
+        Path(sys.executable).absolute().parent / "knowledge-ingest",
+        repo_root() / ".venv" / "bin" / "knowledge-ingest",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    raise RuntimeError(
+        "knowledge-ingest launcher not found "
+        f"(tried: {', '.join(str(c) for c in candidates)})")
 
 
 def generate_plist_bytes(config: AppConfig, ki_exe: str,
                          env: dict[str, str]) -> bytes:
-    # watch_agent.py 位于 src/knowledge_ingest/telegram/ → 仓库根是 parents[3]
-    repo_root = Path(__file__).resolve().parents[3]
     cfg = {
         "Label": label_for(),
         "ProgramArguments": program_arguments(ki_exe),
         "RunAtLoad": True,
         "KeepAlive": True,
-        "WorkingDirectory": str(repo_root),
+        "WorkingDirectory": str(repo_root()),
         "EnvironmentVariables": env,
         "StandardOutPath": str(launchd_log_path(config)),
         "StandardErrorPath": str(launchd_log_path(config)),
