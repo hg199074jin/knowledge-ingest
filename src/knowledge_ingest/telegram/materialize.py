@@ -39,7 +39,7 @@ def materialize_text_item(store, item_id: str, base_dir: str | Path, *,
     texts = [row["text"] for row in store.get_item_messages(item_id)
              if row["text"] and not row["deleted_at"]]
     body = "\n\n".join(texts)
-    directory = Path(base_dir) / "materialized" / item_id
+    directory = Path(base_dir) / "telegram" / "materialized" / item_id
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "message.md"
     tmp = directory / ".message.md.tmp"

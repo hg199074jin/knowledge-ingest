@@ -1585,9 +1585,13 @@ def _cmd_telegram_watch(config: AppConfig, args) -> int:
         print("error: telegram state not initialized "
               "(run: telegram sources add first)", file=sys.stderr)
         return 2
-    watcher = TelegramWatcher(store, client=adapter)
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+
+    pipeline = SourceItemPipeline(store, data_root=config.pipeline_root)
+    watcher = TelegramWatcher(store, client=adapter, pipeline=pipeline)
     print("telegram watcher running (Ctrl-C to stop); "
-          "live updates + periodic reconcile")
+          "live updates + periodic reconcile + item pipeline "
+          "(rules-only classify; LLM channel lands in TG6)")
     try:
         asyncio.run(watcher.run())
     except KeyboardInterrupt:
