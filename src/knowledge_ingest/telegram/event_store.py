@@ -406,12 +406,12 @@ class TelegramEventStore:
                 "last_message_id = ? WHERE item_id = ?",
                 (json.dumps(ids), max(ids), item_id))
 
-    def finalize_item(self, item_id: str) -> None:
+    def finalize_item(self, item_id: str, *, status: str = "finalized") -> None:
         with self._conn:
             cursor = self._conn.execute(
                 "UPDATE source_items SET finalized_at = COALESCE("
-                "finalized_at, ?), processing_status = 'finalized' "
-                "WHERE item_id = ?", (_now_iso(), item_id))
+                "finalized_at, ?), processing_status = ? "
+                "WHERE item_id = ?", (_now_iso(), status, item_id))
         if cursor.rowcount == 0:
             raise ValueError(f"item not found: {item_id}")
 
@@ -502,6 +502,35 @@ class TelegramEventStore:
         return self._conn.execute(
             "SELECT * FROM downloads ORDER BY item_id, "
             "document_message_id").fetchall()
+
+    def get_download(self, item_id: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM downloads WHERE item_id = ?",
+            (item_id,)).fetchone()
+
+    def reset_item_policy(self, item_id: str) -> None:
+        """§6.4 B：重建时清理待重算的 policy 决定。"""
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE source_items SET noise_decision = NULL, "
+                "interest_decision = NULL WHERE item_id = ?", (item_id,))
+        if cursor.rowcount == 0:
+            raise ValueError(f"item not found: {item_id}")
+
+    def list_source_items(self, kind: str | None = None) -> list[sqlite3.Row]:
+        if kind is None:
+            return self._conn.execute(
+                "SELECT * FROM source_items ORDER BY item_id").fetchall()
+        return self._conn.execute(
+            "SELECT * FROM source_items WHERE kind = ? ORDER BY item_id",
+            (kind,)).fetchall()
+
+    def find_stranded_items(self) -> list[sqlite3.Row]:
+        """C1 恢复扫描：finalized 但从未物化成功的 text item。"""
+        return self._conn.execute(
+            "SELECT * FROM source_items WHERE kind = 'text' "
+            "AND finalized_at IS NOT NULL AND materialized_path IS NULL "
+            "AND processing_status != 'deleted_source'").fetchall()
 
     # ---------- reviews（§16 REVIEW 机制） ----------
 

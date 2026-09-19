@@ -9,6 +9,7 @@ materialization / policy 语义由 TG4 在库内事实之上实现，本模块
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from datetime import UTC, datetime
 
@@ -56,8 +57,7 @@ class TelegramWatcher:
                                                 event.message_id)
             except ValueError:
                 return "ignored"  # 从未入库的消息：无需标记
-            if self.pipeline is not None:
-                self.pipeline.on_raw(event, "deleted", source_id)
+            self._pipeline_safe(event, "deleted", source_id)
             return "deleted"
         document = event.document
         try:
@@ -83,9 +83,21 @@ class TelegramWatcher:
         self.store.advance_seen(source_id, event.message_id)
         status = ("updated" if event.kind is TelegramEventKind.EDIT
                   else "stored")
-        if self.pipeline is not None:
-            self.pipeline.on_raw(event, status, source_id)
+        self._pipeline_safe(event, status, source_id)
         return status
+
+    def _pipeline_safe(self, event, status: str, source_id: str) -> None:
+        """C1：Item 层是派生态——任何异常（ORICO 掉线等）都不得
+        杀死 watcher；原始事实已 commit，失败项由 recover_stranded
+        在 ORICO 恢复后补齐（§6.8"Item 保持可恢复状态"）。"""
+        if self.pipeline is None:
+            return
+        try:
+            self.pipeline.on_raw(event, status, source_id)
+        except Exception as exc:            # noqa: BLE001 —— 容器化边界
+            print(f"pipeline error ({status} "
+                  f"{source_id}#{event.message_id}): {exc}",
+                  file=sys.stderr, flush=True)
 
     async def reconcile(self, source_id: str) -> int:
         """§5.7 B 路径：只补 start_at 之后、cursor 之前的缺口。"""
@@ -113,6 +125,12 @@ class TelegramWatcher:
         for source in self.store.list_sources():
             if source["enabled"]:
                 total += await self.reconcile(source["source_id"])
+        if self.pipeline is not None:
+            try:
+                self.pipeline.recover_stranded()
+            except Exception as exc:        # noqa: BLE001 —— 恢复不致命
+                print(f"pipeline recovery error: {exc}",
+                      file=sys.stderr, flush=True)
         return total
 
     async def run(self, *, max_ticks: int | None = None,

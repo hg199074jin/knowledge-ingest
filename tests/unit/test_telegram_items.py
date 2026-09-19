@@ -4,6 +4,7 @@
 §20/§22；全部驱动走 TelegramWatcher + pipeline（生产同路径）。
 """
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from knowledge_ingest.telegram.client_port import (
     TelegramEventKind,
 )
 from knowledge_ingest.telegram.event_store import TelegramEventStore
+from knowledge_ingest.telegram.items import SourceItemPipeline
 from knowledge_ingest.telegram.materialize import (
     OricoUnavailableError,
     download_pdf,
@@ -419,3 +421,260 @@ def test_pipeline_default_orico_check_resolves(tmp_path, monkeypatch):
     watcher.handle_event(make_event(message_id=1, second=1, text="x"))
     watcher.handle_event(make_event(message_id=2, second=302, text="y"))
     assert store.get_source_item("tg_a:1")["materialized_path"] is not None
+
+
+# ---------- 评审加固（TG4 review round：C1/C2/C3/I1/I2/I4/I5/I6） ----------
+
+def test_c1_orico_flap_does_not_kill_watcher_and_item_recovers(tmp_path):
+    """ORICO 掉线：handle_event 不抛、Item 保持可恢复、恢复后补物化。"""
+    store = ready_store(tmp_path)
+    _pipeline_off, watcher = make_pipeline(tmp_path, store,
+                                         orico_ok=False)
+    assert watcher.handle_event(make_event(message_id=1, second=1,
+                                           text="v1")) == "stored"
+    assert watcher.handle_event(make_event(message_id=2, second=302,
+                                           text="v2")) == "stored"  # 未崩
+    item = store.get_source_item("tg_a:1")
+    assert item["finalized_at"] is not None
+    assert item["materialized_path"] is None      # stranded，事实仍在
+
+    pipeline_on = SourceItemPipeline(store, data_root=tmp_path,
+                                     orico_check=lambda: True)
+    assert pipeline_on.recover_stranded() == 1
+    assert store.get_source_item("tg_a:1")["materialized_path"]
+
+
+def test_c1_edit_on_stranded_finalized_rebuilds(tmp_path):
+    """C1：finalized-未物化 item 的编辑走重建（不再被 open 键控吞掉）。"""
+    from knowledge_ingest.telegram.client_port import TelegramEventKind
+    store = ready_store(tmp_path)
+    _pipeline_off, watcher = make_pipeline(tmp_path, store,
+                                         orico_ok=False)
+    watcher.handle_event(make_event(message_id=1, second=1, text="v1"))
+    watcher.handle_event(make_event(message_id=2, second=302))  # 关窗失败
+
+    pipeline_on = SourceItemPipeline(store, data_root=tmp_path,
+                                     orico_check=lambda: True)
+    watcher_on = TelegramWatcher(store, pipeline=pipeline_on)
+    edited = TelegramEvent(kind=TelegramEventKind.EDIT,
+                           chat_id=-1001234567890, message_id=1,
+                           message_date=dt(1), sender_id=99, text="新版",
+                           edited_at=dt(400))
+    assert watcher_on.handle_event(edited) == "updated"
+    content = Path(store.get_source_item("tg_a:1")["materialized_path"]
+                   ).read_text(encoding="utf-8")
+    assert "新版" in content
+
+
+def test_c2_replayed_new_does_not_duplicate(tmp_path):
+    """重放 NEW（新窗口开着）不得把旧消息并入新窗口。"""
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=1, second=1, text="hello"))
+    watcher.handle_event(make_event(message_id=2, second=302, text="next"))
+    assert text_item_count(store) == 2
+    # 重放 msg1（live 重投 / 崩溃后 reconcile 重放）
+    assert watcher.handle_event(make_event(message_id=1, second=1,
+                                           text="hello")) == "stored"
+    assert text_item_count(store) == 2
+    new_item = store.get_source_item("tg_a:2")
+    assert new_item["message_ids_json"] == "[2]"          # 未被污染
+    old = store.get_source_item("tg_a:1")
+    assert old["message_ids_json"] == "[1]"               # 仍是原样
+    # 关闭新窗口后比对内容
+    watcher.handle_event(make_event(message_id=3, second=700, text="tail"))
+    assert Path(old["materialized_path"]).read_text(
+        encoding="utf-8").count("hello") == 1             # 只在旧 Item 出现
+    new_body = Path(store.get_source_item("tg_a:2")["materialized_path"]
+                    ).read_text(encoding="utf-8")
+    assert "hello" not in new_body                        # 内容不重复
+
+
+def test_c2_negative_delta_never_joins_newer_window(tmp_path):
+    """早于锚点的乱序消息不得并入更新的窗口。"""
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=10, second=400, text="锚"))
+    watcher.handle_event(make_event(message_id=11, second=100,
+                                    text="乱序旧消息"))
+    assert text_item_count(store) == 2
+    assert store.find_open_text_item("tg_a")["item_id"] == "tg_a:11"
+
+
+def test_c3_orico_outage_does_not_consume_authorization(tmp_path):
+    """C3：ORICO 掉线时 DOWNLOAD_ONCE 授权不被没收。"""
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="大.pdf",
+                              mime_type="application/pdf",
+                              size_bytes=80 * 1024 * 1024)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=9, text=None, document=doc))
+    review_id = store.create_review("tg_a:9", "oversize", kind="pdf",
+                                    size_bytes=80 * 1024 * 1024)
+    store.resolve_review(review_id, "DOWNLOAD_ONCE")
+
+    with pytest.raises(OricoUnavailableError):
+        download_pdf(store, "tg_a:9", FakeDownloadClient(b"big"), tmp_path,
+                     decision="INCLUDE", orico_check=lambda: False)
+    assert store.get_review(review_id)["decision_consumed_at"] is None
+
+    path = download_pdf(store, "tg_a:9", FakeDownloadClient(b"big"),
+                        tmp_path, decision="INCLUDE",
+                        orico_check=lambda: True)
+    assert path is not None                              # 授权仍在，恢复后可下
+
+
+def test_i1_completed_small_pdf_replay_no_redownload(tmp_path):
+    """I1：≤50MiB 完成后重扫不再重复下载。"""
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="a.pdf",
+                              mime_type="application/pdf", size_bytes=1024)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=7, text=None, document=doc))
+
+    class CountingClient(FakeDownloadClient):
+        def __init__(self):
+            super().__init__(b"%PDF small")
+            self.calls = 0
+
+        async def download_document(self, chat_id, message_id, dest_dir):
+            self.calls += 1
+            return await super().download_document(chat_id, message_id,
+                                                   dest_dir)
+
+    client = CountingClient()
+    first = download_pdf(store, "tg_a:7", client, tmp_path,
+                         decision="INCLUDE", orico_check=lambda: True)
+    assert first is not None
+    second = download_pdf(store, "tg_a:7", client, tmp_path,
+                          decision="INCLUDE", orico_check=lambda: True)
+    assert second is None
+    assert client.calls == 1
+    assert store.get_download("tg_a:7")["attempts"] == 1
+
+
+def test_i2_attempts_cap_creates_review(tmp_path):
+    """I2：毒丸 PDF 熔断——5 次失败后转人工 REVIEW，不再重试。"""
+    from knowledge_ingest.telegram.materialize import MAX_DOWNLOAD_ATTEMPTS
+
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="毒.pdf",
+                              mime_type="application/pdf",
+                              size_bytes=80 * 1024 * 1024)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=9, text=None, document=doc))
+    review_id = store.create_review("tg_a:9", "oversize", kind="pdf")
+    store.resolve_review(review_id, "DOWNLOAD_ONCE")
+
+    class AlwaysFail(FakeDownloadClient):
+        async def download_document(self, chat_id, message_id, dest_dir):
+            raise RuntimeError("permanent failure")
+
+    for _ in range(MAX_DOWNLOAD_ATTEMPTS):
+        with pytest.raises(RuntimeError):
+            download_pdf(store, "tg_a:9", AlwaysFail(), tmp_path,
+                         decision="INCLUDE", orico_check=lambda: True)
+    assert download_pdf(store, "tg_a:9", AlwaysFail(), tmp_path,
+                        decision="INCLUDE",
+                        orico_check=lambda: True) is None  # 熔断
+    reasons = [r["reason"] for r in store.list_open_reviews()]
+    assert "download_attempts_exceeded" in reasons
+
+
+def test_i2_async_core_runs_inside_event_loop(tmp_path):
+    """I2：异步核心可在 watcher 事件循环内调用。"""
+    from knowledge_ingest.telegram.materialize import download_pdf_async
+
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="a.pdf",
+                              mime_type="application/pdf", size_bytes=1024)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=7, text=None, document=doc))
+
+    async def main():
+        return await download_pdf_async(store, "tg_a:7",
+                                        FakeDownloadClient(b"%PDF"),
+                                        tmp_path, decision="INCLUDE",
+                                        orico_check=lambda: True)
+
+    assert asyncio.run(main()) is not None
+
+
+def test_i4_rebuild_resets_policy_columns(tmp_path):
+    """§6.4 B：重建时清理待重算的 policy 决定。"""
+    from knowledge_ingest.telegram.client_port import TelegramEventKind
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=1, second=1, text="v1"))
+    item_id = store.find_open_text_item("tg_a")["item_id"]
+    store.finalize_item(item_id)
+    materialize_text_item(store, item_id, tmp_path)
+    with store._conn:
+        store._conn.execute(
+            "UPDATE source_items SET noise_decision='KEEP', "
+            "interest_decision='INCLUDE' WHERE item_id = ?", (item_id,))
+
+    edited = TelegramEvent(kind=TelegramEventKind.EDIT,
+                           chat_id=-1001234567890, message_id=1,
+                           message_date=dt(1), sender_id=99, text="v2",
+                           edited_at=dt(60))
+    assert _pipeline.ingest_edit(edited, "tg_a") == "rebuilt"
+    item = store.get_source_item(item_id)
+    assert item["noise_decision"] is None
+    assert item["interest_decision"] is None
+
+
+def test_i5_partial_delete_keeps_surviving_text(tmp_path):
+    """I5：多消息窗口删一条，幸存正文不丢失。"""
+    from knowledge_ingest.telegram.client_port import TelegramEventKind
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    for i, text in enumerate(["一", "二", "三"], start=1):
+        watcher.handle_event(make_event(message_id=i, second=i, text=text))
+    item_id = store.find_open_text_item("tg_a")["item_id"]
+    store.finalize_item(item_id)
+    materialize_text_item(store, item_id, tmp_path)
+
+    deleted = TelegramEvent(kind=TelegramEventKind.DELETE,
+                            chat_id=-1001234567890, message_id=2)
+    watcher.handle_event(deleted)
+    item = store.get_source_item(item_id)
+    assert item["processing_status"] == "materialized"   # 未被整体阻断
+    content = Path(item["materialized_path"]).read_text(encoding="utf-8")
+    assert "一" in content and "三" in content and "二" not in content
+
+
+def test_i5_all_deleted_blocks_item(tmp_path):
+    from knowledge_ingest.telegram.client_port import TelegramEventKind
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=1, second=1, text="唯一"))
+    item_id = store.find_open_text_item("tg_a")["item_id"]
+    watcher.handle_event(TelegramEvent(kind=TelegramEventKind.DELETE,
+                                       chat_id=-1001234567890, message_id=1))
+    assert store.get_source_item(item_id)["processing_status"] == \
+        "deleted_source"
+
+
+def test_i6_pending_record_builder(tmp_path):
+    """§13.3：Pending Record 从既有事实确定性派生。"""
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(
+        message_id=30, text="2755 份英语动画 https://pan.quark.cn/s/big"))
+    record = _pipeline.pending_record("tg_a:30")
+    assert record["provider_guess"] == "quark"
+    assert record["status"] == "PENDING_RESOURCE"
+    assert record["resource_collection_candidate"] is True
+    assert record["url"] == "https://pan.quark.cn/s/big"
+    assert _pipeline.pending_record("tg_a:missing") is None
+
+
+def test_i6_collection_regex_no_false_positive():
+    from knowledge_ingest.telegram.items import (
+        is_resource_collection_candidate,
+    )
+
+    assert is_resource_collection_candidate("v2集团更新") is False
+    assert is_resource_collection_candidate("2755 份 / 176G 英语动画") is True
+    assert is_resource_collection_candidate("普通一条链接") is False

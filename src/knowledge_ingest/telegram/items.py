@@ -8,6 +8,7 @@ open 窗口内的 EDIT 天然被吸收。
 """
 
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -18,7 +19,7 @@ WINDOW_SECONDS = 300
 _QUARK_HINT = "quark.cn"
 _BAIDU_HINT = "pan.baidu.com"
 _COLLECTION_RE = re.compile(
-    r"\d+\s*(?:份|个文件|个文档|集)|\d+(?:\.\d+)?\s*[GT]B",
+    r"\d+\s*(?:份|个文件|个文档)|(?<![\w.])\d+(?:\.\d+)?\s*[GT]B?\b",
     re.IGNORECASE)
 
 
@@ -86,16 +87,20 @@ class SourceItemPipeline:
         if kind == "text":
             return self._merge_or_open_text(event, source_id)
         item_id = f"{source_id}:{event.message_id}"
+        status = "PENDING_RESOURCE" if kind == "cloud_link" else "open"
         self.store.create_source_item(item_id, source_id, kind,
-                                      [event.message_id])
-        self.store.finalize_item(item_id)
-        if kind == "cloud_link":
-            # PENDING_RESOURCE 必须写在 finalize 之后（finalize 会改状态）
-            self.store.set_item_processing_status(item_id,
-                                                  "PENDING_RESOURCE")
+                                      [event.message_id],
+                                      processing_status=status)
+        self.store.finalize_item(item_id, status=status)
         return item_id
 
     def _merge_or_open_text(self, event, source_id: str) -> str:
+        # C2：重放/乱序事件不得重复入项（live 重投、崩溃后 reconcile
+        # 重放是正常工况）；已是某 Item 成员则直接归属，绝不二次并入。
+        owner = self.store.find_item_by_message(source_id,
+                                                event.message_id)
+        if owner is not None:
+            return owner["item_id"]
         self._close_expired_windows(event, source_id)
         existing = self.store.find_open_text_item(source_id)
         if existing is not None:
@@ -134,7 +139,9 @@ class SourceItemPipeline:
         if first is None:
             return False
         anchor = _aware(first["message_date"])
-        return (event_date - anchor).total_seconds() <= self.window_seconds
+        # C2：负 delta（早于锚点的乱序消息）绝不并入更新的窗口
+        return 0 <= (event_date - anchor).total_seconds() <= \
+            self.window_seconds
 
     # ---- EDIT：§6.4 四态 ----
 
@@ -142,15 +149,21 @@ class SourceItemPipeline:
         item = self.store.find_item_by_message(source_id, event.message_id)
         if item is None:
             return self.ingest_new(event, source_id)  # 未见过的编辑=事实补录
+        item_id = item["item_id"]
         if item["handoff_completed"]:
-            self.store.create_review(item["item_id"],
+            self.store.create_review(item_id,
                                      "SOURCE_EDITED_AFTER_HANDOFF",
                                      kind=item["kind"])
             return "handoff_review"          # §6.4 C：Corpus 不动
-        if item["materialized_path"]:
-            self._materialize(item["item_id"])
-            return "rebuilt"                 # §6.4 B：同 item_id 重建
-        return "absorbed"                    # §6.4 A：open 窗口派生吸收
+        if item["processing_status"] == "open":
+            return "absorbed"                # §6.4 A：open 窗口派生吸收
+        # §6.4 B：同 item_id 重建——清待重算的 policy；
+        # 只有 text 重写物化（pdf/cloud_link 的物化由各自链路负责）；
+        # 兼覆盖 C1 的 stranded（finalized 未物化）场景。
+        self.store.reset_item_policy(item_id)
+        if item["kind"] == "text":
+            self._materialize(item_id)
+        return "rebuilt"
 
     # ---- DELETE：§6.4 D ----
 
@@ -158,13 +171,64 @@ class SourceItemPipeline:
         item = self.store.find_item_by_message(source_id, event.message_id)
         if item is None:
             return None
+        item_id = item["item_id"]
         if item["handoff_completed"]:
             return "deleted_provenance"      # 仅追加事实，不跨层回滚
-        self.store.set_item_processing_status(item["item_id"],
-                                              "deleted_source")
-        return "blocked"                     # 阻止尚未开始的自动 handoff
+        if item["kind"] == "text":
+            survivors = [row for row in self.store.get_item_messages(item_id)
+                         if not row["deleted_at"] and row["text"]]
+            if survivors:
+                if item["processing_status"] != "open":
+                    self._materialize(item_id)  # 重建剔除已删正文
+                return "survived"            # 幸存正文不因单条被删而丢失
+        self.store.set_item_processing_status(item_id, "deleted_source")
+        return "blocked"                     # 空窗口/单消息类：阻断 handoff
 
     # ---- 内部 ----
+
+    def recover_stranded(self) -> int:
+        """C1：finalized 但物化失败（ORICO 掉线/崩溃窗口）的 item，
+        在 ORICO 恢复后补物化；仍失败的留待下轮 reconcile。"""
+        recovered = 0
+        for item in self.store.find_stranded_items():
+            try:
+                self._materialize(item["item_id"])
+                recovered += 1
+            except Exception as exc:        # noqa: BLE001 —— 恢复不中断
+                print(f"recover stranded {item['item_id']}: {exc}",
+                      file=sys.stderr, flush=True)
+                continue
+        return recovered
+
+    def pending_record(self, item_id: str) -> dict | None:
+        """§13.3 Pending Record：CLOUD_LINK 的 Stub 视图（从既有事实
+        确定性派生，不引入第二事实源；未来 Cloud Resource Resolver
+        从此续接）。"""
+        import json as _json
+
+        item = self.store.get_source_item(item_id)
+        if item is None or item["kind"] != "cloud_link":
+            return None
+        message = self.store.get_message(item["source_id"],
+                                         item["last_message_id"])
+        links = (_json.loads(message["cloud_links_json"])
+                 if message and message["cloud_links_json"] else [])
+        caption = message["text"] if message else None
+        url = None
+        if links:
+            matched = re.search(r"https?://\S+", links[0])
+            url = matched.group(0) if matched else links[0]
+        return {
+            "item_id": item_id,
+            "source_id": item["source_id"],
+            "message_id": item["last_message_id"],
+            "caption": caption,
+            "url": url,
+            "provider_guess": provider_guess(links),
+            "resource_collection_candidate":
+                is_resource_collection_candidate(caption),
+            "status": "PENDING_RESOURCE",
+        }
 
     def _materialize(self, item_id: str):
         from .materialize import materialize_text_item, orico_ready
