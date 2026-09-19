@@ -41,7 +41,11 @@ def plist_install_path(user: str | None = None) -> Path:
 
 
 def launchd_log_path(config: AppConfig) -> Path:
-    return config.pipeline_root / "logs" / "launchd" / "ki-resume-launchd.log"
+    # TCC（2026-09-19 实测）：launchd 子进程默认无可移动卷（ORICO）访问权，
+    # stdout/stderr 指向卷上文件会导致 job 无法 spawn（EX_CONFIG/78）。
+    # config 参数保留以维持调用方形状，日志固定走内建盘 ~/Library/Logs。
+    return (_home() / "Library" / "Logs" / "knowledge-ingest"
+            / "ki-resume-launchd.log")
 
 
 def run_launchctl(argv: list[str]) -> tuple[int, str, str]:

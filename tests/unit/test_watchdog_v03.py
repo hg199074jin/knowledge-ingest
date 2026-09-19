@@ -80,7 +80,8 @@ def test_install_generates_dynamic_script_and_plist(tmp_path, fake_home):
     assert cfg["ProgramArguments"] == ["/bin/zsh", str(script)]
     assert cfg["StartInterval"] == 900
     assert cfg["RunAtLoad"] is True
-    assert str(config.pipeline_root) in cfg["StandardOutPath"]
+    # TCC 修复后：launchd 日志固定内建盘（不再随 pipeline_root 走）
+    assert cfg["StandardOutPath"] == str(watchdog.launchd_log_path(config))
     assert calls, "launchctl load must be invoked via adapter"
     assert any("load" in argv for argv in calls)
 
@@ -108,9 +109,9 @@ def test_status_reports_installed_and_missing(tmp_path, fake_home, capsys):
 def test_uninstall_removes_files_keeps_logs(tmp_path, fake_home):
     config = make_config(tmp_path)
     watchdog.install(config)
-    log_dir = config.pipeline_root / "logs" / "launchd"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    (log_dir / "ki-resume-launchd.log").write_text("log", encoding="utf-8")
+    log_dir = watchdog.launchd_log_path(config).parent   # fake home 下
+    assert log_dir.exists()                              # install 建好目录
+    (log_dir / "ki-resume-launchd.log").write_text("log")  # 模拟 launchd 落日志
     rc = watchdog.uninstall(config)
     assert rc == 0
     assert not watchdog.plist_install_path().exists()
