@@ -332,8 +332,6 @@ def test_r11_download_document_handles_single_message_return(tmp_path):
     `'Message' object is not subscriptable` 失败。fake 必须复现真实行为。"""
     import types
 
-    from knowledge_ingest.telegram.telethon_adapter import TelethonAdapter
-
     class DuckClient:
         """按 telethon 真实契约：ids=int → 单对象；ids=list → 列表。"""
 
