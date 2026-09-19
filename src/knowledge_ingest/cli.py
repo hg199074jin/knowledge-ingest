@@ -1903,7 +1903,7 @@ def _cmd_telegram_budget(config: AppConfig, args) -> int:
 def _render_telegram_budget(store) -> int:
     max_calls, breaker_empty, breaker_rate_limit = _tg_budget_limits()
     rows = store.list_ai_budgets()
-    print(f"budget limits: max_calls={max_calls} "
+    print(f"budget limits (this process env): max_calls={max_calls} "
           f"breaker_empty={breaker_empty} "
           f"breaker_rate_limit={breaker_rate_limit}")
     if not rows:
