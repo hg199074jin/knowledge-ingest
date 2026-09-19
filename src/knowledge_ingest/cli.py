@@ -1589,15 +1589,23 @@ def _cmd_telegram_watch(config: AppConfig, args) -> int:
         print("error: telegram state not initialized "
               "(run: telegram sources add first)", file=sys.stderr)
         return 2
+    from knowledge_ingest.telegram.handoff import TelegramHandoffRunner
     from knowledge_ingest.telegram.items import SourceItemPipeline
 
     pipeline = SourceItemPipeline(store, data_root=config.pipeline_root)
     watcher = TelegramWatcher(store, client=adapter, pipeline=pipeline)
+    handoff_scan = None
+    if os.environ.get("KI_TELEGRAM_HANDOFF") == "1":
+        # §8.2 交付编排：默认关闭——开启后 materialized/合格 item
+        # 会自动创建 k2c job（真实 LLM 成本），由运维显式启用
+        runner = TelegramHandoffRunner(store, config)
+        handoff_scan = runner.scan
+        print("telegram handoff scan: ENABLED (KI_TELEGRAM_HANDOFF=1)")
     print("telegram watcher running (Ctrl-C to stop); "
           "live updates + periodic reconcile + item pipeline "
           "(rules-only classify; LLM channel lands in TG6)")
     try:
-        asyncio.run(watcher.run())
+        asyncio.run(watcher.run(handoff_scan=handoff_scan))
     except KeyboardInterrupt:
         print("watcher stopped")
     return 0
