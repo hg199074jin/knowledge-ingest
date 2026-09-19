@@ -661,16 +661,6 @@ class TelegramEventStore:
                ORDER BY item_id LIMIT 1""",
             (sha256, exclude_item_id)).fetchone()
 
-    def find_download_by_sha(self, sha256: str,
-                             exclude_item_id: str) -> sqlite3.Row | None:
-        """TG7 去重：其他 item 已完成下载的相同内容（SHA-256 寻址）。"""
-        return self._conn.execute(
-            """SELECT * FROM downloads
-               WHERE sha256 = ? AND status = 'complete'
-                 AND item_id != ? AND local_path IS NOT NULL
-               ORDER BY item_id LIMIT 1""",
-            (sha256, exclude_item_id)).fetchone()
-
     def reset_item_policy(self, item_id: str) -> None:
         """§6.4 B：重建时清理待重算的 policy 决定。"""
         with self._conn:
