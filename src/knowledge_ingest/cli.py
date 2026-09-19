@@ -29,7 +29,10 @@ from knowledge_ingest.targets import (
 from knowledge_ingest.targets import (
     target_choices,
 )
-from knowledge_ingest.telegram.event_store import TelegramEventStore
+from knowledge_ingest.telegram.event_store import (
+    AIBudgetGuard,
+    TelegramEventStore,
+)
 from knowledge_ingest.telegram.registry import register_source
 
 BAIDU_APP_PREFIXES = ("apps/bdpan", "/apps/bdpan")
@@ -393,6 +396,10 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="interactive Telegram login (H1: user present)")
     tg_sub.add_parser("watch", parents=[common],
                       help="run the live watcher (long-running)")
+    tg_download = tg_sub.add_parser(
+        "download", parents=[common],
+        help="download one PDF source item (explicit human trigger)")
+    tg_download.add_argument("item_id")
     tg_sources_sub.add_parser("discover", parents=[common],
                               help="list visible dialogs")
     tg_add = tg_sources_sub.add_parser("add", parents=[common],
@@ -1372,6 +1379,8 @@ def _cmd_telegram(config: AppConfig, args) -> int:
         return _cmd_telegram_watch(config, args)
     if args.telegram_command == "status":
         return _cmd_telegram_status(config, args)
+    if args.telegram_command == "download":
+        return _cmd_telegram_download(config, args)
     if args.telegram_command == "sources":
         sub = args.telegram_sources_command
         if sub == "list":
@@ -1496,6 +1505,8 @@ def _cmd_telegram_review_list(config: AppConfig, args) -> int:
 
 
 def _cmd_telegram_review_resolve(config: AppConfig, args) -> int:
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+
     store = _open_telegram_store(config, create=False)
     if store is None:
         print("error: telegram state not initialized", file=sys.stderr)
@@ -1506,6 +1517,15 @@ def _cmd_telegram_review_resolve(config: AppConfig, args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(f"review {args.review_id}: {outcome} (decision={args.decision})")
+    # R2：决定必须真的作用于 Item（KEEP→物化、SKIP→终态），否则人工
+    # 队列就成了单向黑洞；失败（ORICO 掉线）时留下未消费，下轮重试
+    pipeline = SourceItemPipeline(store, data_root=config.pipeline_root)
+    for entry in pipeline.consume_review_decisions():
+        print(f"applied: item={entry['item_id']} reason={entry['reason']} "
+              f"decision={entry['decision']} → {entry['outcome']}")
+    if args.decision == "DOWNLOAD_ONCE":
+        print("download authorization recorded; consumed by the downloader "
+              "(telegram download <item_id>, or the next reconcile)")
     return 0
 
 
@@ -1578,6 +1598,56 @@ def _cmd_telegram_auth(config: AppConfig, args, *, repo_root=None,
     return 0
 
 
+def _tg_classifier_channel(store):
+    """§7.6：分类模型通道——必须可注入，不写死任何 provider/SDK。
+
+    运维通过环境变量指定一个命令行（prompt 走 stdin、结构化 JSON 走
+    stdout），用于复用本机已有 worker/router：
+        KI_TELEGRAM_LLM_CMD        例: "claude -p" / 自建 worker CLI
+        KI_TELEGRAM_LLM_TIMEOUT    秒，默认 120
+        KI_TELEGRAM_LLM_MAX_CALLS  每 source 每 classifier 次数，默认 100
+    未配置 → (None, None)：规则路径照常，疑似内容进 REVIEW 等人。
+    """
+    import shlex
+    import subprocess
+
+    command = (os.environ.get("KI_TELEGRAM_LLM_CMD") or "").strip()
+    if not command:
+        return None, None
+    argv = shlex.split(command)
+    if not argv:
+        return None, None
+    try:
+        timeout = float(os.environ.get("KI_TELEGRAM_LLM_TIMEOUT", "120"))
+        max_calls = int(os.environ.get("KI_TELEGRAM_LLM_MAX_CALLS", "100"))
+    except ValueError as exc:
+        raise ValueError(f"invalid KI_TELEGRAM_LLM_* value: {exc}") from exc
+
+    def channel(prompt: str) -> str:
+        proc = subprocess.run(argv, input=prompt, capture_output=True,
+                              text=True, timeout=timeout, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"classifier channel exit {proc.returncode}: "
+                f"{(proc.stderr or '').strip()[:200]}")
+        return proc.stdout
+
+    return channel, AIBudgetGuard(store, max_calls=max_calls)
+
+
+def _tg_watch_banner(*, handoff_enabled: bool, channel_enabled: bool) -> str:
+    """启动横幅：如实报告 handoff 开关与分类通道状态（评审 R4）。"""
+    handoff = ("ENABLED (KI_TELEGRAM_HANDOFF=1)" if handoff_enabled
+               else "disabled")
+    channel = ("env(KI_TELEGRAM_LLM_CMD)" if channel_enabled else "none")
+    return "\n".join([
+        f"telegram handoff scan: {handoff}",
+        f"classifier channel: {channel}",
+        ("telegram watcher running (Ctrl-C to stop); live updates + "
+         "periodic reconcile + item pipeline"),
+    ])
+
+
 def _cmd_telegram_watch(config: AppConfig, args) -> int:
     from knowledge_ingest.telegram.watcher import TelegramWatcher
 
@@ -1592,7 +1662,14 @@ def _cmd_telegram_watch(config: AppConfig, args) -> int:
     from knowledge_ingest.telegram.handoff import TelegramHandoffRunner
     from knowledge_ingest.telegram.items import SourceItemPipeline
 
-    pipeline = SourceItemPipeline(store, data_root=config.pipeline_root)
+    try:
+        channel, budget = _tg_classifier_channel(store)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    pipeline = SourceItemPipeline(store, data_root=config.pipeline_root,
+                                  noise_llm=channel, interest_llm=channel,
+                                  budget=budget)
     watcher = TelegramWatcher(store, client=adapter, pipeline=pipeline)
     handoff_scan = None
     if os.environ.get("KI_TELEGRAM_HANDOFF") == "1":
@@ -1600,15 +1677,58 @@ def _cmd_telegram_watch(config: AppConfig, args) -> int:
         # 会自动创建 k2c job（真实 LLM 成本），由运维显式启用
         runner = TelegramHandoffRunner(store, config)
         handoff_scan = runner.scan
-        print("telegram handoff scan: ENABLED (KI_TELEGRAM_HANDOFF=1)")
-    print("telegram watcher running (Ctrl-C to stop); "
-          "live updates + periodic reconcile + item pipeline "
-          "(rules-only classify; LLM channel lands in TG6)")
+    print(_tg_watch_banner(handoff_enabled=handoff_scan is not None,
+                           channel_enabled=channel is not None))
     try:
         asyncio.run(watcher.run(handoff_scan=handoff_scan))
     except KeyboardInterrupt:
         print("watcher stopped")
     return 0
+
+
+def _cmd_telegram_download(config: AppConfig, args, *, client=None) -> int:
+    """§6.7：人工显式触发一个 PDF Item 的下载（DOWNLOAD_ONCE 后/重试）。
+
+    自动路径是 watcher 的周期 reconcile（≤50 MiB 的 INCLUDE PDF）；
+    本命令用于人工授权后的 >50 MiB、或 5 次失败熔断后的显式重试。
+    """
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+
+    if client is None:
+        client = _tg_build_adapter(config)
+        if client is None:
+            return 2
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("error: telegram state not initialized", file=sys.stderr)
+        return 2
+    item = store.get_source_item(args.item_id)
+    if item is None:
+        print(f"error: item not found: {args.item_id}", file=sys.stderr)
+        return 2
+    existing = store.get_download(args.item_id)
+    if existing is not None and existing["status"] == "complete":
+        print(f"already downloaded: {existing['local_path']}")
+        return 0
+    pipeline = SourceItemPipeline(store, data_root=config.pipeline_root)
+    try:
+        downloaded = asyncio.run(pipeline.download_pending_pdfs(
+            client, item_id=args.item_id))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if downloaded:
+        row = store.get_download(args.item_id)
+        print(f"downloaded: {row['local_path']}  sha256={row['sha256']}")
+        return 0
+    # 不在这里调 download_gate 打印原因：它会消费授权（诊断不得改状态）
+    row = store.get_download(args.item_id)
+    print(f"no download performed (status={item['processing_status']}, "
+          f"interest={item['interest_decision']}, "
+          f"download={row['status'] if row else 'none'}/"
+          f"{row['attempts'] if row else 0} attempts); "
+          "see: knowledge-ingest telegram review list")
+    return 1
 
 
 def _cmd_telegram_sources_discover(config: AppConfig, args) -> int:

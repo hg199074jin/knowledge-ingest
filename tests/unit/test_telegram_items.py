@@ -679,3 +679,374 @@ def test_i6_collection_regex_no_false_positive():
     assert is_resource_collection_candidate("v2集团更新") is False
     assert is_resource_collection_candidate("2755 份 / 176G 英语动画") is True
     assert is_resource_collection_candidate("普通一条链接") is False
+
+
+# ---------- 评审 R1：删除不得复活终态/待审 Item ----------
+
+AD_TEXT = "加微信 abcdef123 领取"
+
+
+def _seed_ad_window(watcher, count=3):
+    """同寄件人、同窗口的短广告 → 一个 SKIP 的 text Item（tg_a:1）。"""
+    for i in range(1, count + 1):
+        watcher.handle_event(make_event(message_id=i, second=i,
+                                        text=AD_TEXT))
+    # 另一寄件人的消息关闭窗口 → 触发分类（不并入）
+    watcher.handle_event(TelegramEvent(
+        kind=TelegramEventKind.NEW, chat_id=-1001234567890,
+        message_id=90, message_date=dt(30), sender_id=42,
+        text="另一条无关消息，用于关闭前面的窗口"))
+
+
+def _gate(item, store):
+    from knowledge_ingest.telegram.handoff import TelegramHandoffRunner
+
+    return TelegramHandoffRunner(store, None).gate(item)
+
+
+def test_r1_partial_delete_keeps_noise_skip(tmp_path):
+    """R1：SKIP 的 Item 删掉一条后不得复活成可交付（原缺陷：→ materialized）。"""
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    _seed_ad_window(watcher)
+    item_id = "tg_a:1"
+    assert store.get_source_item(item_id)["processing_status"] == \
+        "skipped_noise"
+
+    watcher.handle_event(TelegramEvent(
+        kind=TelegramEventKind.DELETE, chat_id=-1001234567890,
+        message_id=2))
+    item = store.get_source_item(item_id)
+    assert item["processing_status"] == "skipped_noise"   # 决定不被删除改写
+    assert item["materialized_path"] is None
+    assert _gate(item, store) == "blocked:skipped_noise"          # 不放行 handoff
+
+
+def test_r1_partial_delete_keeps_pending_review(tmp_path):
+    """R1：人工待审（noise_review）同样不被部分删除复活。"""
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    for i in (1, 2, 3):
+        watcher.handle_event(make_event(message_id=i, second=i,
+                                        text=f"正文段落{i}"))
+    item_id = "tg_a:1"
+    store.finalize_item(item_id)
+    store.set_item_noise(item_id, "REVIEW")
+    store.set_item_processing_status(item_id, "noise_review")
+
+    watcher.handle_event(TelegramEvent(
+        kind=TelegramEventKind.DELETE, chat_id=-1001234567890,
+        message_id=2))
+    item = store.get_source_item(item_id)
+    assert item["processing_status"] == "noise_review"
+    assert item["materialized_path"] is None
+    assert _gate(item, store) == "blocked:noise_review"
+
+
+def test_r1_all_deleted_keeps_terminal_decision(tmp_path):
+    """R1：终态 Item 的消息全删也不得改写已作出的判定。"""
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    _seed_ad_window(watcher)
+    item_id = "tg_a:1"
+    for message_id in (1, 2, 3):
+        watcher.handle_event(TelegramEvent(
+            kind=TelegramEventKind.DELETE, chat_id=-1001234567890,
+            message_id=message_id))
+    assert store.get_source_item(item_id)["processing_status"] == \
+        "skipped_noise"
+
+
+def test_r5_claimed_authorization_retries_without_download_row(tmp_path):
+    """R5：认领授权后崩溃（还没有 downloads 行）→ 同授权必须可重试。"""
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="大.pdf",
+                              mime_type="application/pdf",
+                              size_bytes=80 * 1024 * 1024)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=9, text=None, document=doc))
+    item_id = "tg_a:9"
+    review_id = store.create_review(item_id, "size over 50 MiB",
+                                    kind="pdf",
+                                    size_bytes=80 * 1024 * 1024)
+    store.resolve_review(review_id, "DOWNLOAD_ONCE")
+
+    assert store.download_gate(item_id) == "authorized"   # 认领（未写下载行）
+    assert store.get_download(item_id) is None
+    assert store.download_gate(item_id) == "retry"        # 原缺陷：denied
+
+
+# ---------- 评审 R2：人工 REVIEW 决定必须被消费 ----------
+
+
+def _parked_text_item(store, watcher, *, body, reason="noise_uncertain"):
+    watcher.handle_event(make_event(message_id=1, second=1, text=body))
+    item_id = "tg_a:1"
+    store.finalize_item(item_id)
+    store.set_item_noise(item_id, "REVIEW")
+    store.set_item_processing_status(item_id, "noise_review")
+    review_id = store.create_review(item_id, reason, kind="text")
+    return item_id, review_id
+
+
+def test_r2_resolve_keep_materializes_parked_item(tmp_path):
+    store = ready_store(tmp_path)
+    pipeline, watcher = make_pipeline(tmp_path, store)
+    body = "这是一段足够长的知识正文，包含方法论的完整叙述。" * 3
+    item_id, review_id = _parked_text_item(store, watcher, body=body)
+
+    assert store.resolve_review(review_id, "KEEP") == "resolved"
+    applied = pipeline.consume_review_decisions()
+    item = store.get_source_item(item_id)
+    assert item["processing_status"] == "materialized"
+    assert item["noise_decision"] == "KEEP"
+    content = Path(item["materialized_path"]).read_text(encoding="utf-8")
+    assert body[:12] in content
+    assert store.get_review(review_id)["decision_consumed_at"] is not None
+    audits = store.list_classifier_audit(item_id)
+    assert any(row["decision"] == "KEEP"
+               and "human" in row["classifier_version"] for row in audits)
+    assert applied and applied[0]["item_id"] == item_id
+    assert pipeline.consume_review_decisions() == []      # 幂等
+
+
+def test_r2_resolve_skip_marks_skipped(tmp_path):
+    store = ready_store(tmp_path)
+    pipeline, watcher = make_pipeline(tmp_path, store)
+    item_id, review_id = _parked_text_item(store, watcher,
+                                           body="疑似广告的正文内容。")
+    store.resolve_review(review_id, "SKIP")
+    pipeline.consume_review_decisions()
+    item = store.get_source_item(item_id)
+    assert item["processing_status"] == "skipped_noise"
+    assert item["noise_decision"] == "SKIP"
+    assert item["materialized_path"] is None
+
+
+def test_r2_interest_keep_includes_pdf(tmp_path):
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="投资框架.pdf",
+                              mime_type="application/pdf",
+                              size_bytes=1024 * 1024)
+    pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=7, text="值得一看", document=doc))
+    item_id = "tg_a:7"
+    store.set_item_processing_status(item_id, "interest_review")
+    review_id = store.create_review(item_id, "interest_uncertain",
+                                    kind="pdf")
+    store.resolve_review(review_id, "KEEP")
+    pipeline.consume_review_decisions()
+    item = store.get_source_item(item_id)
+    assert item["interest_decision"] == "INCLUDE"
+    assert item["processing_status"] == "interest_include"
+
+
+def test_r2_interest_skip_excludes_pdf(tmp_path):
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="恋爱技巧.pdf",
+                              mime_type="application/pdf", size_bytes=1024)
+    pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=7, text=None, document=doc))
+    item_id = "tg_a:7"
+    store.set_item_processing_status(item_id, "interest_review")
+    review_id = store.create_review(item_id, "interest_uncertain",
+                                    kind="pdf")
+    store.resolve_review(review_id, "SKIP")
+    pipeline.consume_review_decisions()
+    assert store.get_source_item(item_id)["processing_status"] == \
+        "skipped_interest"
+
+
+def test_r2_download_once_left_to_download_gate(tmp_path):
+    """R2：DOWNLOAD_ONCE 只由下载闸门消费，applier 不得替它消费。"""
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="大.pdf",
+                              mime_type="application/pdf",
+                              size_bytes=80 * 1024 * 1024)
+    pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=9, text=None, document=doc))
+    item_id = "tg_a:9"
+    review_id = store.create_review(item_id, "size over 50 MiB",
+                                    kind="pdf",
+                                    size_bytes=80 * 1024 * 1024)
+    store.resolve_review(review_id, "DOWNLOAD_ONCE")
+
+    assert pipeline.consume_review_decisions() == []
+    assert store.get_review(review_id)["decision_consumed_at"] is None
+    assert store.download_gate(item_id) == "authorized"   # 授权仍有效
+
+
+def test_r2_apply_failure_keeps_review_unconsumed(tmp_path):
+    """R2：物化失败（ORICO 掉线）不得假装消费成功——留待下轮。"""
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    item_id, review_id = _parked_text_item(store, watcher,
+                                           body="正文内容足够长的一段描述。")
+    store.resolve_review(review_id, "KEEP")
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+
+    failing = SourceItemPipeline(store, data_root=tmp_path,
+                                 orico_check=lambda: False)
+    assert failing.consume_review_decisions() == []
+    assert store.get_review(review_id)["decision_consumed_at"] is None
+    assert store.get_source_item(item_id)["processing_status"] == \
+        "noise_review"
+
+
+def test_r2_reconcile_all_consumes_decisions(tmp_path):
+    """R2：watcher 的周期 reconcile 是消费入口（不依赖 handoff 开关）。"""
+    store = ready_store(tmp_path)
+    _pipeline, watcher = make_pipeline(tmp_path, store)
+    item_id, review_id = _parked_text_item(store, watcher,
+                                           body="正文内容足够长的一段描述。")
+    store.resolve_review(review_id, "KEEP")
+    asyncio.run(watcher.reconcile_all())
+    assert store.get_source_item(item_id)["processing_status"] == \
+        "materialized"
+
+
+# ---------- 评审 R3：PDF 下载器接入运行时 ----------
+
+class FakePdfClient:
+    """最小 PDF 下载通道（生产由 TelethonAdapter 提供同签名）。"""
+
+    def __init__(self, payload=b"%PDF-1.4 fake"):
+        self.payload = payload
+        self.calls = 0
+
+    async def download_document(self, chat_id, message_id, dest_dir):
+        self.calls += 1
+        path = Path(dest_dir) / "document.pdf"
+        path.write_bytes(self.payload)
+        return path
+
+    async def fetch_messages_after(self, chat_id, after_message_id):
+        return []
+
+
+def _pdf_pipeline(tmp_path, store, *, orico_ok=True):
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+
+    return SourceItemPipeline(
+        store, data_root=tmp_path, orico_check=(lambda: orico_ok),
+        interest_llm=lambda _prompt: (
+            '{"decision": "INCLUDE", "primary_topic": "AI", '
+            '"reason": "ok", "confidence": 1.0}'))
+
+
+def test_r3_reconcile_downloads_small_pdf(tmp_path):
+    store = ready_store(tmp_path)
+    pipeline = _pdf_pipeline(tmp_path, store)
+    client = FakePdfClient(b"%PDF small")
+    watcher = TelegramWatcher(store, client=client, pipeline=pipeline)
+    doc = TelegramDocumentRef(document_id=5, file_name="课.pdf",
+                              mime_type="application/pdf",
+                              size_bytes=1024 * 1024)
+    watcher.handle_event(make_event(message_id=7, text=None, document=doc))
+    item_id = "tg_a:7"
+    assert store.get_source_item(item_id)["processing_status"] == \
+        "interest_include"
+
+    asyncio.run(watcher.reconcile_all())
+    row = store.get_download(item_id)
+    assert row is not None and row["status"] == "complete"
+    assert client.calls == 1
+    assert Path(row["local_path"]).is_file()
+    assert row["sha256"] and len(row["sha256"]) == 64
+    assert _gate(store.get_source_item(item_id), store) is None   # 可 handoff
+
+    asyncio.run(watcher.reconcile_all())                   # 幂等：不重下
+    assert client.calls == 1
+
+
+def test_r3_oversize_pdf_requires_download_once(tmp_path):
+    store = ready_store(tmp_path)
+    pipeline = _pdf_pipeline(tmp_path, store)
+    client = FakePdfClient(b"big")
+    watcher = TelegramWatcher(store, client=client, pipeline=pipeline)
+    doc = TelegramDocumentRef(document_id=5, file_name="大课.pdf",
+                              mime_type="application/pdf",
+                              size_bytes=80 * 1024 * 1024)
+    watcher.handle_event(make_event(message_id=9, text=None, document=doc))
+    item_id = "tg_a:9"
+
+    asyncio.run(watcher.reconcile_all())
+    assert client.calls == 0                                # 无授权不下载
+    assert store.get_download(item_id) is None
+
+    review_id = store.create_review(item_id, "size over 50 MiB",
+                                    kind="pdf",
+                                    size_bytes=80 * 1024 * 1024)
+    store.resolve_review(review_id, "DOWNLOAD_ONCE")
+    asyncio.run(watcher.reconcile_all())
+    assert client.calls == 1
+    assert store.get_download(item_id)["status"] == "complete"
+    assert _gate(store.get_source_item(item_id),
+                 store) == "blocked:oversize"
+
+
+def test_r3_orico_unavailable_pauses_without_claiming(tmp_path):
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="大.pdf",
+                              mime_type="application/pdf",
+                              size_bytes=80 * 1024 * 1024)
+    client = FakePdfClient(b"big")
+    watcher = TelegramWatcher(
+        store, client=client, pipeline=_pdf_pipeline(tmp_path, store,
+                                                     orico_ok=False))
+    watcher.handle_event(make_event(message_id=9, text=None, document=doc))
+    item_id = "tg_a:9"
+    review_id = store.create_review(item_id, "size over 50 MiB",
+                                    kind="pdf",
+                                    size_bytes=80 * 1024 * 1024)
+    store.resolve_review(review_id, "DOWNLOAD_ONCE")
+
+    asyncio.run(watcher.reconcile_all())                    # 不抛异常
+    assert client.calls == 0
+    assert store.get_download(item_id) is None
+    assert store.get_review(review_id)["decision_consumed_at"] is None
+
+    watcher.pipeline = _pdf_pipeline(tmp_path, store, orico_ok=True)
+    asyncio.run(watcher.reconcile_all())                    # 恢复后授权仍在
+    assert client.calls == 1
+    assert store.get_review(review_id)["decision_consumed_at"] is not None
+
+
+def test_r2_interest_keep_oversize_flags_size_review(tmp_path):
+    """R2：人工 KEEP 的大 PDF 必须补出尺寸授权单，否则卡在无人知晓处。"""
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="大课.pdf",
+                              mime_type="application/pdf",
+                              size_bytes=80 * 1024 * 1024)
+    pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=9, text=None, document=doc))
+    item_id = "tg_a:9"
+    store.set_item_processing_status(item_id, "interest_review")
+    review_id = store.create_review(item_id, "interest_uncertain",
+                                    kind="pdf")
+    store.resolve_review(review_id, "KEEP")
+    pipeline.consume_review_decisions()
+
+    item = store.get_source_item(item_id)
+    assert item["processing_status"] == "interest_include"
+    reasons = [row["reason"] for row in store.list_open_reviews()
+               if row["item_id"] == item_id]
+    assert "size over 50 MiB" in reasons
+    assert store.download_gate(item_id) == "denied"   # 仍需人工授权
+
+
+def test_r2_interest_keep_unknown_size_flags_review(tmp_path):
+    store = ready_store(tmp_path)
+    doc = TelegramDocumentRef(document_id=5, file_name="无尺寸.pdf",
+                              mime_type="application/pdf", size_bytes=None)
+    pipeline, watcher = make_pipeline(tmp_path, store)
+    watcher.handle_event(make_event(message_id=9, text=None, document=doc))
+    item_id = "tg_a:9"
+    store.set_item_processing_status(item_id, "interest_review")
+    review_id = store.create_review(item_id, "interest_uncertain",
+                                    kind="pdf")
+    store.resolve_review(review_id, "KEEP")
+    pipeline.consume_review_decisions()
+    reasons = [row["reason"] for row in store.list_open_reviews()
+               if row["item_id"] == item_id]
+    assert "pdf size unknown" in reasons

@@ -19,6 +19,7 @@
     "sender_id": "<sender-id-or-null>",
     "message_url": null,
     "first_message_at": "2026-09-18T12:25:00+08:00",
-    "last_message_at": "2026-09-18T12:29:00+08:00"
+    "last_message_at": "2026-09-18T12:29:00+08:00",
+    "source_deleted": false
   }
 }

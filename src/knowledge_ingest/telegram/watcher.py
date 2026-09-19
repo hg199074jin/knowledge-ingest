@@ -128,6 +128,13 @@ class TelegramWatcher:
                 total += await self.reconcile(source["source_id"])
         if self.pipeline is not None:
             try:
+                if self.client is not None:
+                    # R3/§6.5：≤50 MiB 的 INCLUDE PDF 自动下载；
+                    # >50 MiB 或大小未知须人工 DOWNLOAD_ONCE
+                    await self.pipeline.download_pending_pdfs(self.client)
+                # R2/§16.3：把人工 KEEP/SKIP 决定落到 Item 上（不依赖
+                # handoff 开关——决定消费是 Item 层语义）
+                self.pipeline.consume_review_decisions()
                 self.pipeline.recover_stranded()
             except Exception as exc:        # noqa: BLE001 —— 恢复不致命
                 print(f"pipeline recovery error: {exc}",

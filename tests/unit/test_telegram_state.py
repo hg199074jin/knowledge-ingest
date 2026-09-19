@@ -460,3 +460,152 @@ def test_cli_status_renders_last_seen(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "last_seen" in out
     assert "tg_a" in out
+
+
+# ---------- 评审 R4：分类通道接线（§7.6）与启动横幅 ----------
+
+
+def test_r4_classifier_channel_absent_without_env(tmp_path, monkeypatch):
+    from knowledge_ingest.cli import _tg_classifier_channel
+
+    store = TelegramEventStore(tmp_path / "state.db")
+    monkeypatch.delenv("KI_TELEGRAM_LLM_CMD", raising=False)
+    assert _tg_classifier_channel(store) == (None, None)
+
+
+def test_r4_classifier_channel_runs_configured_command(tmp_path, monkeypatch):
+    import json
+    import sys
+
+    from knowledge_ingest.cli import _tg_classifier_channel
+
+    store = TelegramEventStore(tmp_path / "state.db")
+    script = tmp_path / "channel.py"
+    script.write_text(
+        "import sys, json\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'decision': 'KEEP', 'reason_code': 'ok',\n"
+        "                  'confidence': 1.0}))\n", encoding="utf-8")
+    monkeypatch.setenv("KI_TELEGRAM_LLM_CMD",
+                       f"{sys.executable} {script}")
+    channel, budget = _tg_classifier_channel(store)
+    assert channel is not None and budget is not None
+    assert json.loads(channel("提示"))["decision"] == "KEEP"
+
+
+def test_r4_channel_failure_becomes_review(tmp_path, monkeypatch):
+    """通道进程失败 → llm_failure → REVIEW（绝不静默 SKIP 知识）。"""
+    import sys
+
+    from knowledge_ingest.cli import _tg_classifier_channel
+    from knowledge_ingest.telegram.classify import classify_noise
+
+    store = TelegramEventStore(tmp_path / "state.db")
+    script = tmp_path / "boom.py"
+    script.write_text("import sys\nsys.exit(3)\n", encoding="utf-8")
+    monkeypatch.setenv("KI_TELEGRAM_LLM_CMD", f"{sys.executable} {script}")
+    channel, budget = _tg_classifier_channel(store)
+    decision = classify_noise("私聊领取完整版资料", llm=channel, budget=budget,
+                              source_id="tg_a")
+    assert decision.decision == "REVIEW"
+    assert decision.reason_code == "llm_failure"
+
+
+def test_r4_watch_banner_reports_channel_state():
+    from knowledge_ingest.cli import _tg_watch_banner
+
+    off = _tg_watch_banner(handoff_enabled=False, channel_enabled=False)
+    assert "classifier channel: none" in off
+    assert "handoff scan: disabled" in off
+    on = _tg_watch_banner(handoff_enabled=True, channel_enabled=True)
+    assert "classifier channel: env(KI_TELEGRAM_LLM_CMD)" in on
+    assert "handoff scan: ENABLED" in on
+
+
+# ---------- 评审 R3：telegram download 人工入口 ----------
+
+
+class _FakeDocClient:
+    def __init__(self, payload=b"%PDF-1.4 fake"):
+        self.payload = payload
+        self.calls = 0
+
+    async def download_document(self, chat_id, message_id, dest_dir):
+        self.calls += 1
+        path = Path(dest_dir) / "document.pdf"
+        path.write_bytes(self.payload)
+        return path
+
+
+def _pdf_item_store(config, *, size_bytes=1024):
+    store = TelegramEventStore(config.pipeline_root / "telegram" / "state.db")
+    store.add_source(source_id="tg_a", chat_id=-1, start_at=T0,
+                     display_name="A")
+    store.upsert_message("tg_a", 7, message_date="2026-09-18T10:00:00+08:00",
+                         has_document=True, document_name="a.pdf",
+                         document_size_bytes=size_bytes)
+    store.create_source_item("tg_a:7", "tg_a", "pdf", [7],
+                             processing_status="interest_include")
+    store.set_item_interest("tg_a:7", "INCLUDE")
+    return store
+
+
+def test_r3_cli_download_command(tmp_path, capsys):
+    from knowledge_ingest.cli import _cmd_telegram_download
+
+    config = make_config(tmp_path)
+    store = _pdf_item_store(config)
+    client = _FakeDocClient()
+    rc = _cmd_telegram_download(config, Namespace(item_id="tg_a:7"),
+                                client=client)
+    out = capsys.readouterr().out
+    assert rc == 0 and "downloaded:" in out and client.calls == 1
+    assert store.get_download("tg_a:7")["status"] == "complete"
+
+    rc = _cmd_telegram_download(config, Namespace(item_id="tg_a:7"),
+                                client=client)
+    assert rc == 0 and "already downloaded" in capsys.readouterr().out
+    assert client.calls == 1          # 幂等：不重复下载
+
+
+def test_r3_cli_download_without_authorization_denied(tmp_path, capsys):
+    from knowledge_ingest.cli import _cmd_telegram_download
+
+    config = make_config(tmp_path)
+    store = _pdf_item_store(config, size_bytes=80 * 1024 * 1024)
+    client = _FakeDocClient(b"big")
+    rc = _cmd_telegram_download(config, Namespace(item_id="tg_a:9"),
+                                client=client)
+    assert rc == 2                                        # item 不存在
+    rc = _cmd_telegram_download(config, Namespace(item_id="tg_a:7"),
+                                client=client)
+    out = capsys.readouterr().out
+    assert rc == 1 and "no download performed" in out
+    assert client.calls == 0                              # 无授权不下载
+    assert store.get_download("tg_a:7") is None
+
+
+def test_r2_cli_resolve_applies_decision(tmp_path, capsys):
+    """R2：resolve 当场生效（不再只写数据库）。"""
+    from knowledge_ingest.cli import _cmd_telegram_review_resolve
+
+    config = make_config(tmp_path)
+    store = TelegramEventStore(config.pipeline_root / "telegram" / "state.db")
+    store.add_source(source_id="tg_a", chat_id=-1, start_at=T0,
+                     display_name="A")
+    store.upsert_message("tg_a", 7, message_date="2026-09-18T10:00:00+08:00",
+                         text="正文内容足够长的一段知识描述。")
+    store.create_source_item("tg_a:7", "tg_a", "text", [7],
+                             processing_status="noise_review")
+    store.finalize_item("tg_a:7", status="noise_review")
+    store.set_item_noise("tg_a:7", "REVIEW")
+    review_id = store.create_review("tg_a:7", "noise_uncertain", kind="text")
+
+    rc = _cmd_telegram_review_resolve(
+        config, Namespace(review_id=review_id, decision="KEEP"))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "applied:" in out
+    item = store.get_source_item("tg_a:7")
+    assert item["processing_status"] == "materialized"
+    assert Path(item["materialized_path"]).is_file()

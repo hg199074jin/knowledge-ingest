@@ -7,10 +7,13 @@
 open 窗口内的 EDIT 天然被吸收。
 """
 
+import json
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
+
+from knowledge_ingest.manifest_store import ManifestStore, atomic_write_text
 
 from .client_port import TelegramEventKind
 from .event_store import TelegramEventStore
@@ -21,6 +24,18 @@ _BAIDU_HINT = "pan.baidu.com"
 _COLLECTION_RE = re.compile(
     r"\d+\s*(?:份|个文件|个文档)|(?<![\w.])\d+(?:\.\d+)?\s*[GT]B?\b",
     re.IGNORECASE)
+
+# 评审 R1：已作出判定/停车待人审的状态——删除只落 tg_messages 事实，
+# 绝不改写这些状态（原缺陷：部分删除会经 _materialize 复活成可交付）。
+TERMINAL_ITEM_STATUSES = (
+    "skipped_noise", "skipped_interest", "skipped_too_short", "empty_item",
+    "noise_review", "interest_review", "deleted_source")
+# 评审 R1：正文派生仍在进行中/已完成 → 删除后需要按幸存正文重建
+_TEXT_REBUILDABLE_STATUSES = ("finalized", "materialized")
+# 评审 R2：人工决定的审计来源标记（与模型分类器区分）
+HUMAN_REVIEW_CLASSIFIER = "human-review"
+# 尺寸参数缺省哨兵：None 是合法值（= 大小未知），不能当"未传"用
+_UNSET = object()
 
 
 def classify_kind(event) -> str:
@@ -179,19 +194,180 @@ class SourceItemPipeline:
         if item is None:
             return None
         item_id = item["item_id"]
+        status = item["processing_status"]
         if item["handoff_completed"]:
+            self._mark_downstream_deleted(item_id)
             return "deleted_provenance"      # 仅追加事实，不跨层回滚
+        if status in TERMINAL_ITEM_STATUSES:
+            # 评审 R1：SKIP / 待人审 / 已移除的决定不因单条删除被复活
+            #（原缺陷：幸存正文会把 skipped_noise/noise_review 翻成
+            # materialized，从而通过 handoff 门并生成真实 k2c Job）
+            return "decision_kept"
         if item["kind"] == "text":
-            survivors = [row for row in self.store.get_item_messages(item_id)
-                         if not row["deleted_at"] and row["text"]]
+            survivors = self._live_texts(item_id)
             if survivors:
-                if item["processing_status"] != "open":
+                if status in _TEXT_REBUILDABLE_STATUSES:
                     self._materialize(item_id)  # 重建剔除已删正文
                 return "survived"            # 幸存正文不因单条被删而丢失
         self.store.set_item_processing_status(item_id, "deleted_source")
         return "blocked"                     # 空窗口/单消息类：阻断 handoff
 
-    # ---- 内部 ----
+    # ---- R2：人工 REVIEW 决定的消费（§16.3） ----
+
+    def consume_review_decisions(self) -> list[dict]:
+        """把已解决的人工决定落到 Item 上（幂等；失败不消费，下轮重试）。
+
+        §16.3 的 KEEP / SKIP 必须真的改变 Item 的命运；DOWNLOAD_ONCE
+        例外——它由 download_gate 在真正下载时消费（唯一消费方）。
+        """
+        applied = []
+        for review in self.store.list_reviews_pending_apply():
+            try:
+                outcome = self._apply_review_decision(review)
+            except Exception as exc:        # noqa: BLE001 —— 单项隔离
+                print(f"review {review['review_id']} apply failed: {exc}",
+                      file=sys.stderr, flush=True)
+                continue
+            if outcome == "deferred":
+                continue
+            self.store.mark_review_consumed(review["review_id"])
+            applied.append({"review_id": review["review_id"],
+                            "item_id": review["item_id"],
+                            "reason": review["reason"],
+                            "decision": review["decision"],
+                            "outcome": outcome})
+        return applied
+
+    def _apply_review_decision(self, review) -> str:
+        item = self.store.get_source_item(review["item_id"])
+        if item is None:
+            return "item_missing"
+        item_id = item["item_id"]
+        reason, decision = review["reason"], review["decision"]
+        if item["handoff_completed"]:
+            return "post_handoff_informational"   # §20.1：不跨层回滚
+        if decision == "DOWNLOAD_ONCE":
+            if reason != "download_attempts_exceeded":
+                return "deferred"                 # 交给 download_gate 认领
+            self.store.reset_download_attempts(item_id)
+            return "download_retry_armed"
+        if reason == "noise_uncertain":
+            if decision == "KEEP":
+                self.store.set_item_noise(item_id, "KEEP")
+                if not "\n\n".join(self._live_texts(item_id)).strip():
+                    self.store.set_item_processing_status(item_id,
+                                                          "empty_item")
+                    self._audit_human(item_id, "noise", "KEEP", "human_keep")
+                    return "kept_empty"
+                self._materialize(item_id)
+                self._audit_human(item_id, "noise", "KEEP", "human_keep")
+                return "materialized"
+            if decision == "SKIP":
+                self.store.set_item_noise(item_id, "SKIP")
+                self.store.set_item_processing_status(item_id,
+                                                      "skipped_noise")
+                self._audit_human(item_id, "noise", "SKIP", "human_skip")
+                return "skipped_noise"
+            return "unsupported_decision"
+        if reason in ("interest_uncertain", "pdf size unknown",
+                      "size over 50 MiB", "download_attempts_exceeded"):
+            if decision == "KEEP":
+                self.store.set_item_interest(item_id, "INCLUDE")
+                self.store.set_item_processing_status(item_id,
+                                                      "interest_include")
+                self._audit_human(item_id, "interest", "INCLUDE",
+                                  "human_keep")
+                # 人工 INCLUDE 同样要过 §12 尺寸规则（>50 MiB/未知 →
+                # 补一张 DOWNLOAD_ONCE 授权单，否则 Item 会卡在无人知晓处）
+                self._flag_size_review_if_needed(item)
+                return "interest_include"
+            if decision == "SKIP":
+                self.store.set_item_interest(item_id, "EXCLUDE")
+                self.store.set_item_processing_status(item_id,
+                                                      "skipped_interest")
+                self._audit_human(item_id, "interest", "EXCLUDE",
+                                  "human_skip")
+                return "skipped_interest"
+            return "unsupported_decision"
+        return "informational"      # SOURCE_EDITED_AFTER_HANDOFF 等：仅记录
+
+    def _audit_human(self, item_id: str, kind: str, decision: str,
+                     reason_code: str) -> None:
+        """§21.1：人工决定同样进审计（来源标记为 human-review）。"""
+        from .classify import CLASSIFIER_VERSION, POLICY_VERSION
+
+        self.store.create_classifier_audit(
+            item_id, kind, decision, reason_code=reason_code,
+            confidence=1.0, policy_version=POLICY_VERSION,
+            classifier_version=f"{HUMAN_REVIEW_CLASSIFIER}:"
+                               f"{CLASSIFIER_VERSION}")
+
+    # ---- R3：PDF 下载接入运行时（§6.5/§6.7/§6.8） ----
+
+    async def download_pending_pdfs(self, client, *,
+                                    item_id: str | None = None) -> int:
+        """把 interest_include 的 PDF Item 推进到已下载。
+
+        ≤50 MiB 自动下载；>50 MiB 或大小未知须人工 DOWNLOAD_ONCE；
+        ORICO 不可用时不消费授权、Item 保持可恢复（§6.8）。
+        单项失败不影响其他 Item（评审 R3：此前下载器没有任何调用方，
+        整条 PDF 腿到不了 handoff）。
+        """
+        from .materialize import download_pdf_async
+
+        if client is None:
+            return 0
+        downloaded = 0
+        for item in self.store.list_source_items(kind="pdf"):
+            if item_id is not None and item["item_id"] != item_id:
+                continue
+            if item["processing_status"] != "interest_include":
+                continue
+            try:
+                path = await download_pdf_async(
+                    self.store, item["item_id"], client, self.data_root,
+                    decision=item["interest_decision"] or "",
+                    orico_check=self._orico())
+            except Exception as exc:        # noqa: BLE001 —— 单项隔离
+                print(f"pdf download {item['item_id']}: {exc}",
+                      file=sys.stderr, flush=True)
+                continue
+            if path is not None:
+                downloaded += 1
+        return downloaded
+
+    def _mark_downstream_deleted(self, item_id: str) -> None:
+        """评审 R6/§20.2：已 handoff 的 Item 收到删除后，下游 provenance
+        必须能知道（只改 provenance 事实，不改 Corpus / Job 内容，§20.1）。
+        """
+        item = self.store.get_source_item(item_id)
+        job_id = item["knowledge_ingest_job_id"] if item else None
+        if not job_id:
+            return
+        jobs_root = Path(self.data_root) / "jobs"
+        try:
+            handoff_file = jobs_root / job_id / "handoff" / "source.json"
+            if handoff_file.is_file():
+                handoff = json.loads(handoff_file.read_text(encoding="utf-8"))
+                provenance = handoff.get("provenance")
+                if isinstance(provenance, dict):
+                    provenance["source_deleted"] = True
+                    atomic_write_text(handoff_file, json.dumps(
+                        handoff, ensure_ascii=False, indent=2))
+            manifest_store = ManifestStore(jobs_root=jobs_root)
+            if not manifest_store.manifest_path(job_id).is_file():
+                return
+            registered = manifest_store.load(job_id)
+            source = registered.source if isinstance(registered.source,
+                                                     dict) else None
+            provenance = source.get("provenance") if source else None
+            if isinstance(provenance, dict) \
+                    and provenance.get("source_deleted") is not True:
+                with manifest_store.edit(job_id) as manifest:
+                    manifest.source["provenance"]["source_deleted"] = True
+        except Exception as exc:            # noqa: BLE001 —— 审计补记不致命
+            print(f"downstream provenance update failed ({job_id}): {exc}",
+                  file=sys.stderr, flush=True)
 
     def recover_stranded(self) -> int:
         """C1：finalized 但物化失败（ORICO 掉线/崩溃窗口）的 item，
@@ -244,8 +420,7 @@ class SourceItemPipeline:
 
         self.store.finalize_item(item_id)
         item = self.store.get_source_item(item_id)
-        texts = [row["text"] for row in self.store.get_item_messages(
-            item_id) if row["text"] and not row["deleted_at"]]
+        texts = self._live_texts(item_id)
         decision = classify_noise("\n\n".join(texts),
                                   llm=self.noise_llm, budget=self.budget,
                                   source_id=item["source_id"])
@@ -278,7 +453,6 @@ class SourceItemPipeline:
         """§11.4/§12：Interest（下载前）→ INCLUDE 且 ≤50MiB 才待下载；
         越界或 REVIEW 转人工。"""
         from .classify import CLASSIFIER_VERSION, POLICY_VERSION, classify_interest
-        from .materialize import MAX_AUTO_DOWNLOAD_BYTES
 
         item = self.store.get_source_item(item_id)
         source = self.store.get_source(item["source_id"])
@@ -316,18 +490,36 @@ class SourceItemPipeline:
         else:                                   # INCLUDE
             self.store.set_item_processing_status(item_id,
                                                   "interest_include")
-            reason = ("pdf size unknown" if size is None
-                      else "size over 50 MiB")
-            if (size is None or size > MAX_AUTO_DOWNLOAD_BYTES) \
-                    and not self.store.has_open_review(item_id, reason):
-                self.store.create_review(item_id, reason,
-                                         kind="pdf", size_bytes=size)
+            self._flag_size_review_if_needed(item, size=size)
+
+    def _flag_size_review_if_needed(self, item, *, size=_UNSET):
+        """§12：>50 MiB（或大小未知）的 INCLUDE PDF 必须人工授权才下载。"""
+        from .materialize import MAX_AUTO_DOWNLOAD_BYTES
+
+        item_id = item["item_id"]
+        if size is _UNSET:
+            message = self.store.get_message(item["source_id"],
+                                             item["last_message_id"])
+            size = message["document_size_bytes"] if message else None
+        if size is not None and size <= MAX_AUTO_DOWNLOAD_BYTES:
+            return
+        reason = "pdf size unknown" if size is None else "size over 50 MiB"
+        if not self.store.has_open_review(item_id, reason):
+            self.store.create_review(item_id, reason, kind="pdf",
+                                     size_bytes=size)
+
+    def _live_texts(self, item_id: str) -> list[str]:
+        """Item 的幸存正文（已删消息不进 Corpus，§20.2）。"""
+        return [row["text"] for row in self.store.get_item_messages(item_id)
+                if row["text"] and not row["deleted_at"]]
+
+    def _orico(self):
+        from .materialize import orico_ready
+
+        return self._orico_check or orico_ready
 
     def _materialize(self, item_id: str):
-        from .materialize import materialize_text_item, orico_ready
+        from .materialize import materialize_text_item
 
-        check = self._orico_check
-        if check is None:
-            check = orico_ready
         materialize_text_item(self.store, item_id, self.data_root,
-                              orico_check=check)
+                              orico_check=self._orico())

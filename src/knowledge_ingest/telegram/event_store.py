@@ -468,9 +468,13 @@ class TelegramEventStore:
     def download_gate(self, item_id: str) -> str:
         """§6.7 DOWNLOAD_ONCE 闸门（短事务守卫，幂等）。
 
-        返回：'authorized'（本次 claim 成功）/ 'retry'（同授权内的
-        重试，已有失败/挂起下载行）/ 'completed'（已完成，禁止再下）
-        / 'denied'（无授权）。
+        返回：'authorized'（本次 claim 成功）/ 'retry'（授权已认领、
+        尚未完成 → 同一次授权内的重试/续传）/ 'completed'（已完成，
+        禁止再下）/ 'denied'（无授权）。
+
+        评审 R5：认领后崩溃（下载行还没写下）也属于"同授权内重试"，
+        绝不能因为缺行就把人工授权判成 denied（那会让 Item 永久卡死，
+        且没有任何 CLI 能重新授权）。
         """
         review = self._conn.execute(
             """SELECT * FROM reviews WHERE item_id = ?
@@ -492,9 +496,7 @@ class TelegramEventStore:
                     (_now_iso(), review["review_id"]))
             if cursor.rowcount == 1:
                 return "authorized"
-        if row is not None and row["attempts"] >= 1:
-            return "retry"
-        return "denied"
+        return "retry"
 
     def upsert_download(self, item_id: str, document_message_id: int, *,
                         telegram_document_id: str | None = None,
@@ -628,6 +630,33 @@ class TelegramEventStore:
         return self._conn.execute(
             "SELECT * FROM reviews WHERE review_id = ?",
             (review_id,)).fetchone()
+
+    def list_reviews_pending_apply(self) -> list[sqlite3.Row]:
+        """评审 R2：已解决、决定尚未消费的 review（供 Item 层消费）。
+
+        DOWNLOAD_ONCE 也在此列出，但只有 download_gate 有权把它标记
+        为已消费——下载器真正认领授权时才写 decision_consumed_at。
+        """
+        return self._conn.execute(
+            "SELECT * FROM reviews WHERE resolved_at IS NOT NULL "
+            "AND decision_consumed_at IS NULL AND decision IS NOT NULL "
+            "ORDER BY review_id").fetchall()
+
+    def mark_review_consumed(self, review_id: int) -> bool:
+        """标记人工决定已落到 Item 上（守卫式，重复调用幂等）。"""
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE reviews SET decision_consumed_at = ? "
+                "WHERE review_id = ? AND decision_consumed_at IS NULL",
+                (_now_iso(), review_id))
+        return cursor.rowcount == 1
+
+    def reset_download_attempts(self, item_id: str) -> None:
+        """评审 R2/§6.7：人工对 download_attempts_exceeded 授权后重开下载。"""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE downloads SET attempts = 0, status = 'pending', "
+                "last_error = NULL WHERE item_id = ?", (item_id,))
 
     def list_open_reviews(self) -> list[sqlite3.Row]:
         return self._conn.execute(

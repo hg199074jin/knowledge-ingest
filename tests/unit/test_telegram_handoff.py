@@ -346,3 +346,39 @@ def test_oversize_pdf_blocked_from_handoff(tmp_path):
         "blocked:oversize"
     assert runner.prepare_handoff("tg_a:1") is None
     assert store.get_source_item("tg_a:1")["knowledge_ingest_job_id"] is None
+
+
+# ---------- 评审 R6：handoff 后的删除必须让下游 provenance 看得见 ----------
+
+
+def test_r6_post_handoff_delete_refreshes_downstream_provenance(tmp_path):
+    """§20.2：已 handoff 的 Item 收到删除 → job 的 provenance 记 source_deleted。"""
+    from knowledge_ingest.telegram.client_port import (
+        TelegramEvent,
+        TelegramEventKind,
+    )
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+    from knowledge_ingest.telegram.watcher import TelegramWatcher
+
+    store, _ = seeded_item(tmp_path)
+    config, runner = make_runner(tmp_path, store)
+    result = runner.prepare_handoff("tg_a:1")
+    job_id = result["job_id"]
+    handoff_file = (config.pipeline_root / "jobs" / job_id / "handoff" /
+                    "source.json")
+    assert json.loads(handoff_file.read_text(
+        encoding="utf-8"))["provenance"]["source_deleted"] is False
+
+    pipeline = SourceItemPipeline(store, data_root=config.pipeline_root,
+                                  orico_check=lambda: True)
+    watcher = TelegramWatcher(store, client=None, pipeline=pipeline)
+    watcher.handle_event(TelegramEvent(
+        kind=TelegramEventKind.DELETE, chat_id=-1001234567890,
+        message_id=7))
+
+    assert json.loads(handoff_file.read_text(
+        encoding="utf-8"))["provenance"]["source_deleted"] is True
+    manifest = registered_manifest(config, job_id)
+    assert manifest.source["provenance"]["source_deleted"] is True
+    # 跨层不回滚：Corpus 侧文件与 job 状态不动
+    assert manifest.status == "DOWNLOADED"

@@ -249,3 +249,13 @@ def test_cli_parser_accepts_telegram_provider():
         ["job", "create", "--provider", "telegram", "--source", "tg://x",
          "--target", "k2c"])
     assert args.provider == "telegram"
+
+
+def test_handoff_v2_example_carries_source_deleted():
+    """评审 R7：v2 规范样例必须包含运行时恒定输出的 source_deleted。"""
+    root = Path(__file__).resolve().parents[2]
+    example = json.loads(
+        (root / "schemas" / "source-handoff.example.json")
+        .read_text(encoding="utf-8"))
+    assert example["schema_version"] == 2
+    assert example["provenance"]["source_deleted"] is False
