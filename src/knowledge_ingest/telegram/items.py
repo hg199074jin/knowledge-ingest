@@ -38,9 +38,21 @@ HUMAN_REVIEW_CLASSIFIER = "human-review"
 _UNSET = object()
 
 
+VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi")
+
+
 def classify_kind(event) -> str:
+    """TG7 分类学：附件按 mime/扩展名细分（pdf/video/file），不再一律 pdf。"""
     if event.document is not None:
-        return "pdf"
+        mime = (getattr(event.document, "mime_type", None) or "").lower()
+        name = (getattr(event.document, "file_name", None) or "").lower()
+        if mime.startswith("video/") or name.endswith(VIDEO_EXTS):
+            return "video"
+        if mime == "application/pdf" or name.endswith(".pdf"):
+            return "pdf"
+        if mime or name:
+            return "file"       # 其余文档/压缩包：进库即 unsupported（终态）
+        return "pdf"            # 无类型信息：保守按 pdf（走人工审）
     if event.cloud_links:
         return "cloud_link"
     return "text"
@@ -108,12 +120,16 @@ class SourceItemPipeline:
             return self._merge_or_open_text(event, source_id)
         item_id = f"{source_id}:{event.message_id}"
         status = "PENDING_RESOURCE" if kind == "cloud_link" else "open"
+        if kind == "file":
+            # TG7 分类学：非 PDF 非视频的附件（压缩包等）无处理管线，
+            # 留事实、终态跳过（V2.1-3 附件分类学）
+            status = "skipped_unsupported"
         self.store.create_source_item(item_id, source_id, kind,
                                       [event.message_id],
                                       processing_status=status)
         self.store.finalize_item(item_id, status=status)
-        if kind == "pdf":
-            self._classify_pdf(item_id)      # §11.4：下载前判定
+        if kind in ("pdf", "video"):
+            self._classify_pdf(item_id)      # §11.4：下载前判定（元数据）
         return item_id
 
     def _merge_or_open_text(self, event, source_id: str) -> str:
@@ -368,6 +384,25 @@ class SourceItemPipeline:
         except Exception as exc:            # noqa: BLE001 —— 审计补记不致命
             print(f"downstream provenance update failed ({job_id}): {exc}",
                   file=sys.stderr, flush=True)
+
+    def close_stale_windows(self, *, now: datetime | None = None) -> int:
+        """TG7：安静源的 open 文本窗口按锚点+300s 关闭。
+
+        窗口本应被下一条消息关闭；安静源没有"下一条"，open item 永悬。
+        reconcile 时按墙钟补关（first-message-anchored，不引入滚动窗口）。
+        """
+        now = now or datetime.now().astimezone()
+        closed = 0
+        for item in self.store.list_open_text_items():
+            first = self.store.get_message(item["source_id"],
+                                           item["first_message_id"])
+            if first is None or not first["message_date"]:
+                continue
+            anchor = datetime.fromisoformat(str(first["message_date"]))
+            if (now - anchor).total_seconds() > self.window_seconds:
+                self._finalize_text(item["item_id"])
+                closed += 1
+        return closed
 
     def recover_stranded(self) -> int:
         """C1：finalized 但物化失败（ORICO 掉线/崩溃窗口）的 item，

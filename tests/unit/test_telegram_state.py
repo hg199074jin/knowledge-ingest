@@ -18,6 +18,7 @@ from knowledge_ingest.cli import (
 )
 from knowledge_ingest.config import AppConfig
 from knowledge_ingest.telegram.event_store import (
+    SCHEMA_VERSION,
     MessageBeforeStartError,
     ReviewConflictError,
     TelegramEventStore,
@@ -74,9 +75,9 @@ def test_db_init_idempotent(tmp_path: Path):
     assert TelegramEventStore(db).count_messages("tg_x") == 0
 
 
-def test_user_version_is_1(tmp_path: Path):
+def test_user_version_matches_supported(tmp_path: Path):
     store = make_store(tmp_path)
-    assert store.user_version() == 1
+    assert store.user_version() == SCHEMA_VERSION
 
 
 def test_wal_mode_enabled(tmp_path: Path):
@@ -280,7 +281,7 @@ def test_maintenance_lock_blocks_second_holder(tmp_path: Path):
 def test_status_summary_readonly_and_empty_ok(tmp_path: Path):
     store = make_store(tmp_path)
     empty = store.status_summary()
-    assert empty["schema_version"] == 1
+    assert empty["schema_version"] == SCHEMA_VERSION
     assert empty["sources_enabled"] == 0
     assert empty["open_reviews"] == 0
 

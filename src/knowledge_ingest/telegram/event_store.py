@@ -15,12 +15,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5000
 
 REVIEW_DECISIONS = ("KEEP", "SKIP", "DOWNLOAD_ONCE")
 
 ITEM_KINDS = ("text", "pdf", "cloud_link")
+
+
+def maintenance_lock(db_path: Path):
+    """迁移专用 maintenance lock（§8.4；经 contextmanager 便于测试打点）。"""
+    from knowledge_ingest.telegram.locks import maintenance_lock as _lock
+
+    return _lock(db_path)
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -81,7 +88,7 @@ CREATE TABLE IF NOT EXISTS tg_messages (
 CREATE TABLE IF NOT EXISTS source_items (
     item_id                 TEXT PRIMARY KEY,
     source_id               TEXT NOT NULL REFERENCES tg_sources(source_id),
-    kind                    TEXT NOT NULL CHECK (kind IN ('text', 'pdf', 'cloud_link')),
+    kind                    TEXT NOT NULL CHECK (kind IN ('text', 'pdf', 'cloud_link', 'video', 'file')),
     first_message_id        INTEGER,
     last_message_id         INTEGER,
     message_ids_json        TEXT NOT NULL DEFAULT '[]',
@@ -131,6 +138,20 @@ CREATE TABLE IF NOT EXISTS classifier_audit (
     created_at         TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS notifications (
+    event_id            TEXT PRIMARY KEY,
+    channel             TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    body                TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    delivered_at        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS digest_state (
+    key                 TEXT PRIMARY KEY,
+    value               TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS reviews (
     review_id            INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id              TEXT NOT NULL REFERENCES source_items(item_id),
@@ -167,12 +188,108 @@ class TelegramEventStore:
             raise UnsupportedSchemaVersionError(
                 f"state.db user_version={version} > supported "
                 f"{SCHEMA_VERSION}; refusing to open (fail-fast)")
-        # 全部 DDL 幂等（IF NOT EXISTS）：v1 期内追加的表对既有库
-        # 自动补建，不引入迁移框架（§4.5；TG7 才做 1→2）
+        if version < 2:
+            # TG7 迁移 1→2：多步写，持 maintenance lock（§8.4）。
+            # 全新库（version 0、无表）直接由 _SCHEMA 建 v2 形状，无需迁移。
+            has_v1 = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'source_items'").fetchone()
+            if has_v1:
+                with maintenance_lock(self.db_path):
+                    self._migrate_v1_to_v2()
+        # 全部 DDL 幂等（IF NOT EXISTS）：新表对既有库自动补建
         self._conn.executescript(_SCHEMA)
-        if version < SCHEMA_VERSION:
+        if self.user_version() < SCHEMA_VERSION:
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _migrate_v1_to_v2(self) -> None:
+        """1→2：附件分类学（CHECK 扩展 + 误标回填）与通知/游标新表。"""
+        cur = self._conn
+        # 重建 source_items：CHECK 扩展（SQLite 不能改 CHECK，须换表）。
+        # downloads/reviews 引用本表——重建期间按 SQLite 官方流程临时
+        # 关闭 foreign_keys，换表+改名后恢复（引用名同步更新，数据一致）。
+        cur.execute("PRAGMA foreign_keys=OFF")
+        cur.executescript("""
+        CREATE TABLE IF NOT EXISTS source_items_v2 (
+            item_id                 TEXT PRIMARY KEY,
+            source_id               TEXT NOT NULL REFERENCES tg_sources(source_id),
+            kind                    TEXT NOT NULL CHECK (kind IN
+                ('text', 'pdf', 'cloud_link', 'video', 'file')),
+            first_message_id        INTEGER,
+            last_message_id         INTEGER,
+            message_ids_json        TEXT NOT NULL DEFAULT '[]',
+            created_at              TEXT NOT NULL,
+            finalized_at            TEXT,
+            noise_decision          TEXT,
+            interest_decision       TEXT,
+            processing_status       TEXT NOT NULL DEFAULT 'open',
+            materialized_path       TEXT,
+            knowledge_ingest_job_id TEXT,
+            handoff_completed       INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO source_items_v2
+            SELECT item_id, source_id, kind, first_message_id,
+                   last_message_id, message_ids_json, created_at,
+                   finalized_at, noise_decision, interest_decision,
+                   processing_status, materialized_path,
+                   knowledge_ingest_job_id, handoff_completed
+            FROM source_items;
+        DROP TABLE source_items;
+        ALTER TABLE source_items_v2 RENAME TO source_items;
+        """)
+        cur.execute("PRAGMA foreign_keys=ON")
+        # 回填：mime 或扩展名为视频的 pdf → video（基于 tg_messages 事实）
+        cur.execute("""
+            UPDATE source_items SET kind = 'video'
+            WHERE kind = 'pdf' AND EXISTS (
+                SELECT 1 FROM tg_messages m
+                WHERE m.source_id = source_items.source_id
+                  AND m.message_id = source_items.last_message_id
+                  AND (COALESCE(m.document_mime, '') LIKE 'video/%'
+                       OR LOWER(COALESCE(m.document_name, '')) LIKE '%.mp4'
+                       OR LOWER(COALESCE(m.document_name, '')) LIKE '%.mov'
+                       OR LOWER(COALESCE(m.document_name, '')) LIKE '%.mkv'
+                       OR LOWER(COALESCE(m.document_name, '')) LIKE '%.avi'))
+        """)
+
+    def record_notification(self, event_id: str, channel: str, title: str,
+                            body: str) -> bool:
+        """记录一次通知意图（event_id 幂等：重复返回 False）。"""
+        with self._conn:
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO notifications (event_id, channel, "
+                "title, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                (event_id, channel, title, body, _now_iso()))
+        return cursor.rowcount == 1
+
+    def mark_notification_delivered(self, event_id: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE notifications SET delivered_at = ? WHERE "
+                "event_id = ?", (_now_iso(), event_id))
+
+    def has_notification(self, event_id: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM notifications WHERE event_id = ?",
+            (event_id,)).fetchone() is not None
+
+    def get_digest_state(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM digest_state WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_digest_state(self, key: str, value: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO digest_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value))
+
+    def list_open_text_items(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            """SELECT * FROM source_items
+               WHERE kind = 'text' AND processing_status = 'open'
+               ORDER BY created_at""").fetchall()
 
     def user_version(self) -> int:
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])

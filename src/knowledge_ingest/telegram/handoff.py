@@ -81,7 +81,7 @@ class TelegramHandoffRunner:
                     item["item_id"], "skipped_too_short")
                 return "blocked:too_short"
             return None
-        if kind == "pdf":
+        if kind in ("pdf", "video"):
             download = self.store.get_download(item["item_id"])
             if (download is None
                     or download["status"] != DOWNLOAD_COMPLETE
