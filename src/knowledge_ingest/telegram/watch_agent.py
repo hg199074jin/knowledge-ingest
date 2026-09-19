@@ -81,13 +81,29 @@ def collect_env(environ: dict[str, str] | None = None) -> dict[str, str]:
     return collected
 
 
-def generate_plist_bytes(config: AppConfig, python_exe: str,
+def program_arguments(ki_exe: str) -> list[str]:
+    return [ki_exe, "telegram", "watch"]
+
+
+def _ki_exe() -> str:
+    """console script 与当前解释器同目录（venv 安装布局）。"""
+    import sys
+
+    candidate = Path(sys.executable).resolve().parent / "knowledge-ingest"
+    if not candidate.is_file():
+        raise RuntimeError(
+            f"knowledge-ingest launcher not found next to {sys.executable}; "
+            "install from the project venv")
+    return str(candidate)
+
+
+def generate_plist_bytes(config: AppConfig, ki_exe: str,
                          env: dict[str, str]) -> bytes:
-    repo_root = Path(__file__).resolve().parents[2]
+    # watch_agent.py 位于 src/knowledge_ingest/telegram/ → 仓库根是 parents[3]
+    repo_root = Path(__file__).resolve().parents[3]
     cfg = {
         "Label": label_for(),
-        "ProgramArguments": [python_exe, "-m", "knowledge_ingest",
-                             "telegram", "watch"],
+        "ProgramArguments": program_arguments(ki_exe),
         "RunAtLoad": True,
         "KeepAlive": True,
         "WorkingDirectory": str(repo_root),
@@ -104,14 +120,12 @@ def _sha(data: bytes) -> str:
     return f"sha256:{hashlib.sha256(data).hexdigest()[:16]}"
 
 
-def install(config: AppConfig, *, python_exe: str | None = None,
-            environ: dict[str, str] | None = None) -> int:
-    import sys
-
+def install(config: AppConfig, *, environ: dict[str, str] | None = None,
+            ki_exe: str | None = None) -> int:
     plist_dst = plist_install_path()
     launchd_log_path(config).parent.mkdir(parents=True, exist_ok=True)
     plist_data = generate_plist_bytes(
-        config, python_exe or sys.executable, collect_env(environ))
+        config, ki_exe or _ki_exe(), collect_env(environ))
 
     old_plist = plist_dst.read_bytes() if plist_dst.exists() else None
     if old_plist == plist_data and is_loaded():

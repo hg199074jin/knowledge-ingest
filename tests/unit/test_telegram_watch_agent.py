@@ -66,12 +66,13 @@ def test_generate_plist_bytes(tmp_path):
     config = make_config(tmp_path)
     env = watch_agent.collect_env({"PATH": "/bin", "HOME": "/Users/x"})
     data = watch_agent.generate_plist_bytes(
-        config, "/repo/.venv/bin/python", env)
+        config, "/repo/.venv/bin/knowledge-ingest", env)
     cfg = plistlib.loads(data)
     assert cfg["Label"] == watch_agent.label_for()
     assert cfg["ProgramArguments"] == [
-        "/repo/.venv/bin/python", "-m", "knowledge_ingest",
-        "telegram", "watch"]
+        "/repo/.venv/bin/knowledge-ingest", "telegram", "watch"]
+    assert watch_agent.program_arguments(
+        "/repo/.venv/bin/knowledge-ingest") == cfg["ProgramArguments"]
     assert cfg["RunAtLoad"] is True
     assert cfg["KeepAlive"] is True                     # 崩溃/被杀即复活
     assert cfg["WorkingDirectory"] == str(
@@ -105,7 +106,7 @@ def test_install_writes_and_loads(tmp_path, fake_launchd, capsys, monkeypatch):
     config = make_config(tmp_path)
     monkeypatch.setenv("KI_TELEGRAM_LLM_CMD", "codex exec -")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    assert watch_agent.install(config, python_exe="/repo/.venv/bin/python") == 0
+    assert watch_agent.install(config, ki_exe="/repo/.venv/bin/knowledge-ingest") == 0
     plist = watch_agent.plist_install_path()
     assert plist.is_file()
     cfg = plistlib.loads(plist.read_bytes())
@@ -118,16 +119,16 @@ def test_install_writes_and_loads(tmp_path, fake_launchd, capsys, monkeypatch):
 def test_install_idempotent(tmp_path, fake_launchd, capsys, monkeypatch):
     config = make_config(tmp_path)
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    assert watch_agent.install(config, python_exe="/repo/.venv/bin/python") == 0
+    assert watch_agent.install(config, ki_exe="/repo/.venv/bin/knowledge-ingest") == 0
     loads_before = len(fake_launchd)
-    assert watch_agent.install(config, python_exe="/repo/.venv/bin/python") == 0
+    assert watch_agent.install(config, ki_exe="/repo/.venv/bin/knowledge-ingest") == 0
     assert "already up to date" in capsys.readouterr().out
     assert len(fake_launchd) == loads_before            # 不重复 load
 
 
 def test_uninstall(tmp_path, fake_launchd, capsys):
     config = make_config(tmp_path)
-    watch_agent.install(config, python_exe="/repo/.venv/bin/python")
+    watch_agent.install(config, ki_exe="/repo/.venv/bin/knowledge-ingest")
     capsys.readouterr()
     assert watch_agent.uninstall(config) == 0
     assert not watch_agent.plist_install_path().exists()
