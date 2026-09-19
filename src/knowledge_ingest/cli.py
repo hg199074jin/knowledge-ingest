@@ -408,6 +408,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "classify-dryrun", parents=[common],
         help="run the classifier channel over parked samples (read-only)")
     tg_dryrun.add_argument("--limit", type=int, default=None)
+    tg_watch_agent = tg_sub.add_parser(
+        "watch-agent", parents=[common],
+        help="persist the watcher as a LaunchAgent (reboot-survival)")
+    wa_sub = tg_watch_agent.add_subparsers(dest="telegram_watch_agent_command",
+                                           required=True)
+    for name, hlp in (
+            ("install", "generate + load the watch agent (idempotent)"),
+            ("status", "report agent installation state"),
+            ("uninstall", "unload and remove the agent (log kept)")):
+        wa_sub.add_parser(name, parents=[common], help=hlp)
     tg_budget = tg_sub.add_parser(
         "budget", parents=[common],
         help="source AI budget ledger (show / reset)")
@@ -1409,6 +1419,8 @@ def _cmd_telegram(config: AppConfig, args) -> int:
         return _cmd_telegram_classify_dryrun(config, args)
     if args.telegram_command == "budget":
         return _cmd_telegram_budget(config, args)
+    if args.telegram_command == "watch-agent":
+        return _cmd_telegram_watch_agent(config, args)
     if args.telegram_command == "sources":
         sub = args.telegram_sources_command
         if sub == "list":
@@ -2125,3 +2137,24 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def _cmd_telegram_watch_agent(config: AppConfig, args) -> int:
+    """V2.1-1 P0：把 telegram watcher 安装为 LaunchAgent。
+
+    重启即死的 nohup 裸进程是采集的单点；install 会把当前 shell 里的
+    通道/开关环境变量（KI_TELEGRAM_LLM_* / KI_TELEGRAM_HANDOFF / PATH）
+    持久化进 plist——因此**必须用带通道环境变量的 shell 执行 install**。
+    卸载：telegram watch-agent uninstall（然后才能安全做人工维护）。
+    """
+    from knowledge_ingest.telegram import watch_agent
+
+    if args.telegram_watch_agent_command == "install":
+        return watch_agent.install(config)
+    if args.telegram_watch_agent_command == "status":
+        return watch_agent.status(config)
+    if args.telegram_watch_agent_command == "uninstall":
+        return watch_agent.uninstall(config)
+    print(f"unknown watch-agent command: "
+          f"{args.telegram_watch_agent_command}", file=sys.stderr)
+    return 2
