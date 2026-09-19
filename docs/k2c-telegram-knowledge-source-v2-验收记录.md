@@ -1,7 +1,8 @@
 # K2C Telegram Knowledge Source V2 验收记录（Real Acceptance）
 
-- 日期：2026-09-20
-- HEAD：`ca2dd89`（TG7 完成后）+ 本记录提交；分支 `main` = `origin/main`
+- 日期：2026-09-20（评审修订：2026-09-20 晚）
+- HEAD：`3fedb19`（含评审修复）；分支 `main` = `origin/main`
+- 回归：**552 passed**、ruff 干净
 - 回归：**545 passed**（含 telegram unit/contract/integration 与既有全量）、ruff 干净
 - 真实来源（14 启用 / 1 停采）：tg_v2ex、tg_trivia、tg_zaihua、tg_it_charge、
   tg_chuhai、tg_quality_info、tg_quality_res、tg_side_hustle、tg_vip_docs、
@@ -63,6 +64,20 @@ V2.1-4 增补路径：视频→本地 Fun-ASR 转写→docchunk（23s/153s 实�
 - **H3-B**：真实 Edit/Delete 与百度链接样本未出现——T/U/V 以生产审计 +
   单测语义验收，L 行如实标 ⏳，未伪造通过
 - **DOWNLOAD_ONCE 真实大文件**：未出现；闸门/重试/一致性以单测 + doctor 验证
+
+## 双评审闭环与如实偏差（2026-09-20 晚）
+
+本记录经两道独立评审（review-agent 直审 + requesting-code-review subagent），
+全部 Critical/Important 已修复并推送：
+- **C1**：`close_stale_windows` 原为死代码（未接入 reconcile_all）→ 已接线并逐条隔离
+- **C2**：retention 可能删除被 KEEP 侧共享的去重文件 → 候选 SQL 排除共享路径
+- **I3**：迁移不原子（crash 可留半迁移态/丢表）→ 重建包进 `BEGIN IMMEDIATE…COMMIT` + 先清残留 v2 表
+- **I4**：doctor 会在 state.db 缺失时创建库 → 缺失时直接 FAIL 不开库
+- **I5**：classify-dryrun 对 parked video 误走 noise 通道 → 已并入 interest 通道
+- **I6**：通知"失败即永久消费" → 未投递事件可重试；digest 游标仅在成功投递后推进；digest event_id 按窗口稳定
+- **I7 偏差如实标记**：① `doctor --fix`（§10.3）未实现——实施记录为本项偏差，待后续单独实施；② §10.2 "cursor 未倒退"已实现（last_seen 滞后检查）；③ §9.7 digest 内容已扩充（分类分布/进入 KI 计数），完整 12 项清单中"verify/staged 状态行"随 target complete 证据归档覆盖
+- **Minors**：skipped_unsupported 入终态清单（DELETE 不改写）；retention 路径安全断言；video 的 gate/edit 回归测试；review kind 标签用真实 item kind
+- digest-agent 同样需要解释器 TCC 授权（与 watch-agent 相同，授权已生效）
 
 ## 结论
 
