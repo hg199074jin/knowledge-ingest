@@ -159,9 +159,13 @@ class TelegramWatcher:
                     await self.reconcile_all()
                     last_reconcile = now
                     if handoff_scan is not None:
-                        result = handoff_scan()
-                        if inspect.iscoroutine(result):
-                            await result
+                        try:
+                            result = handoff_scan()
+                            if inspect.iscoroutine(result):
+                                await result
+                        except Exception as exc:  # noqa: BLE001 —— C1 防线
+                            print(f"handoff scan error: {exc}",
+                                  file=sys.stderr, flush=True)
             except TelegramFloodWaitError as exc:
                 await asyncio.sleep(
                     min(exc.seconds, flood_wait_cap_seconds))

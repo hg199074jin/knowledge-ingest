@@ -9,6 +9,7 @@ K2C 全部复用 knowledge-ingest 既有机器（§8.5 不得旁路）。
 from __future__ import annotations
 
 import json
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from knowledge_ingest.manifest_store import ManifestStore
 from knowledge_ingest.models import JobRequest
 
 from .event_store import TelegramEventStore
+from .materialize import MAX_AUTO_DOWNLOAD_BYTES
 
 MIN_HANDOFF_TEXT_CHARS = 20          # §6 观察：短垃圾（"园区"）不进 Corpus
 DOWNLOAD_COMPLETE = "complete"
@@ -30,7 +32,7 @@ def important_capability_signal(k2c_manifest: dict) -> str | None:
         return None
     for key in ("importance", "high_value", "priority"):
         value = k2c_manifest.get(key)
-        if isinstance(value, str) and value:
+        if isinstance(value, str) and value.lower() in ("high", "important"):
             return value
     return None
 
@@ -88,6 +90,11 @@ class TelegramHandoffRunner:
                 return "blocked:download_incomplete"
             if item["interest_decision"] != "INCLUDE":
                 return "blocked:not_included"   # §8.3：不得偷跑
+            expected = download["expected_size_bytes"]
+            if expected is None or expected > MAX_AUTO_DOWNLOAD_BYTES:
+                # §8.3：>50MiB（含 DOWNLOAD_ONCE 授权下载完成的）不自动
+                # 建 job——人工需要时走 CLI 显式创建
+                return "blocked:oversize"
             return None
         return f"blocked:unknown_kind:{kind}"
 
@@ -113,8 +120,8 @@ class TelegramHandoffRunner:
                 "name": source["display_name"] if source else item_id,
                 "size_bytes": local.stat().st_size if local
                 and local.is_file() else None,
-                "mtime": (_aware(source["updated_at"]).isoformat()
-                          if source and source["updated_at"] else None),
+                "mtime": (messages[-1]["message_date"]
+                          if messages else None),
             },
             "local_path": str(local) if local else "",
             "download_completed": True,
@@ -145,17 +152,19 @@ class TelegramHandoffRunner:
             return None
         jobs_root = self.config.pipeline_root / "jobs"
         marked_job = item["knowledge_ingest_job_id"]
-        if marked_job and item["handoff_completed"]:
+        manifest_file = jobs_root / marked_job / "job.yaml" \
+            if marked_job else None
+        if manifest_file is not None and manifest_file.is_file():
+            # 评审 C1/C2：凡 job.yaml 存在且状态 ≠ CREATED，说明注册
+            # 已发生过（甚至已被下游推进/人工阻断）——一律幂等早退。
+            # 重注册会对推进中的 manifest 抛 InvalidTransition（杀死
+            # watcher），并会把 BLOCKED job 每 5 分钟静默复活。
+            manifest = ManifestStore(jobs_root=jobs_root).load(marked_job)
+            if manifest.status != "CREATED":
+                return {"item_id": item_id, "job_id": marked_job,
+                        "status": item["processing_status"]}
             # 完整交付过的：幂等返回；仅当 handoff 文件缺失或尚未
             # 注册成功（崩溃点）时才继续走补注册
-            handoff_file = jobs_root / marked_job / "handoff" / "source.json"
-            manifest_file = jobs_root / marked_job / "job.yaml"
-            if (handoff_file.is_file() and manifest_file.is_file()):
-                manifest = ManifestStore(jobs_root=jobs_root).load(
-                    marked_job)
-                if manifest.status in ("DISCOVERING", "DOWNLOADED"):
-                    return {"item_id": item_id, "job_id": marked_job,
-                            "status": item["processing_status"]}
         reason = self.gate(item)
         if reason is not None:
             return None
@@ -193,7 +202,12 @@ class TelegramHandoffRunner:
         for item in self.store.list_source_items():
             if item["kind"] not in ("text", "pdf"):
                 continue
-            result = self.prepare_handoff(item["item_id"])
+            try:
+                result = self.prepare_handoff(item["item_id"])
+            except Exception as exc:            # noqa: BLE001 —— 单项隔离
+                print(f"handoff error {item['item_id']}: {exc}",
+                      file=sys.stderr, flush=True)
+                continue
             if result is not None:
                 results.append(result)
         return results

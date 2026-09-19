@@ -64,6 +64,7 @@ def seeded_item(tmp_path: Path, *, body="这是一段足够长的知识正文，
                              processing_status=status)
     if kind == "pdf":
         store.upsert_download("tg_a:1", 7, status="complete", attempts=1,
+                              expected_size_bytes=1024,
                               local_path=str(materialized / "document.pdf"))
     if deleted:
         store.upsert_message("tg_a", 7, message_date=(
@@ -260,3 +261,88 @@ def test_watcher_run_invokes_handoff_scan(tmp_path):
     assert len(scans) == 1
     assert [r["item_id"] for r in scans[0]] == ["tg_a:1"]
     assert scans[0][0]["job_id"]
+
+
+# ---------- 评审 I2：推进中/BLOCKED/毒丸/尺寸边界回归 ----------
+
+def test_prepare_on_advanced_manifest_is_noop(tmp_path):
+    """C1 回归：job 被下游推进后，prepare 绝不重注册（曾抛
+    InvalidTransition 杀死 watcher）。"""
+
+    store, _ = seeded_item(tmp_path)
+    config, runner = make_runner(tmp_path, store)
+    first = runner.prepare_handoff("tg_a:1")            # 注册至 DOWNLOADED
+    store_km = ManifestStore(jobs_root=config.pipeline_root / "jobs")
+    for status in ("ROUTING", "TARGET_RUNNING", "COMPLETED"):
+        with store_km.edit(first["job_id"]) as manifest:
+            manifest.status = status                    # 模拟下游推进
+        result = runner.prepare_handoff("tg_a:1")
+        assert result is not None
+        assert result["job_id"] == first["job_id"]
+        assert store_km.load(first["job_id"]).status == status  # 未回拨
+
+
+def test_prepare_on_blocked_manifest_never_resurrects(tmp_path):
+    """C2 回归：BLOCKED job 不得被 scan 静默复活。"""
+    store, _ = seeded_item(tmp_path)
+    config, runner = make_runner(tmp_path, store)
+    first = runner.prepare_handoff("tg_a:1")
+    store_km = ManifestStore(jobs_root=config.pipeline_root / "jobs")
+    with store_km.edit(first["job_id"]) as manifest:
+        manifest.status = "BLOCKED"
+    result = runner.prepare_handoff("tg_a:1")
+    assert result is not None                           # 幂等返回
+    assert store_km.load(first["job_id"]).status == "BLOCKED"  # 仍阻断
+
+
+def test_scan_poison_item_does_not_starve_rest(tmp_path, monkeypatch):
+    """C3 回归：单个毒丸 item 不得饿死排序在后的合格 item。"""
+    store = ready_store_twice(tmp_path)
+    _config, runner = make_runner(tmp_path, store)
+
+    def poison(item):
+        if item["item_id"] == "tg_a:1":
+            raise RuntimeError("poison")
+
+    monkeypatch.setattr(runner, "gate", poison)
+    results = runner.scan()
+    assert [r["item_id"] for r in results] == ["tg_b:2"]
+
+
+def ready_store_twice(tmp_path):
+    store = make_store(tmp_path)
+    for source_id in ("tg_a", "tg_b"):
+        store.add_source(source_id=source_id,
+                         chat_id=-1001234567890 if source_id == "tg_a"
+                         else -2002,
+                         display_name=source_id,
+                         start_at="2026-09-18T09:00:00+08:00")
+    for item_id, source in (("tg_a:1", "tg_a"), ("tg_b:2", "tg_b")):
+        materialized = tmp_path / "telegram" / "materialized" / item_id
+        materialized.mkdir(parents=True, exist_ok=True)
+        (materialized / "message.md").write_text(
+            "这是一段足够长的知识正文，" * 4, encoding="utf-8")
+        store.create_source_item(item_id, source, "text", [7],
+                                 processing_status="open")
+        store.upsert_message(source, 7, message_date=(
+            "2026-09-18T09:01:00+08:00"), sender_id="99", text="正文")
+        store.finalize_item(item_id)
+        store.set_item_materialized(item_id, str(materialized
+                                                 / "message.md"))
+    return store
+
+
+def test_oversize_pdf_blocked_from_handoff(tmp_path):
+    """§8.3：>50MiB 即使 DOWNLOAD_ONCE 授权下载完成，也不自动建 job。"""
+    store, _ = seeded_item(tmp_path, kind="pdf",
+                           status="interest_include", interest="INCLUDE")
+    store.upsert_download("tg_a:1", 7, status="complete", attempts=1,
+                          expected_size_bytes=80 * 1024 * 1024,
+                          local_path=str(
+                              tmp_path / "telegram" / "attachments"
+                              / "tg_a:1" / "document.pdf"))
+    _config, runner = make_runner(tmp_path, store)
+    assert runner.gate(store.get_source_item("tg_a:1")) == \
+        "blocked:oversize"
+    assert runner.prepare_handoff("tg_a:1") is None
+    assert store.get_source_item("tg_a:1")["knowledge_ingest_job_id"] is None
