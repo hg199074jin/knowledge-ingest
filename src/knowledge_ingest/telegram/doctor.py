@@ -204,10 +204,9 @@ def run_checks(config: AppConfig, *,
 
 def run(config: AppConfig, *, store: TelegramEventStore | None = None) -> int:
     db_path = config.pipeline_root / "telegram" / "state.db"
-    if store is None:
-        if not db_path.is_file():
-            # §4.6：只读体检不得创建 state.db（评审 I4）
-            return _report_empty(str(db_path))
+    if store is None and not db_path.is_file():
+        # §4.6：只读体检不得创建 state.db（评审 I4）
+        return _report_empty(str(db_path))
     checks = run_checks(config, store=store)
     for name, status, detail in checks:
         print(f"[{status:4}] {name}: {detail}")
