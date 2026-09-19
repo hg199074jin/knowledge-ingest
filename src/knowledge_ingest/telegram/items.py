@@ -61,11 +61,16 @@ class SourceItemPipeline:
     def __init__(self, store: TelegramEventStore, *,
                  data_root: str | Path,
                  window_seconds: int = WINDOW_SECONDS,
-                 orico_check=None):
+                 orico_check=None,
+                 noise_llm=None, interest_llm=None, budget=None):
         self.store = store
         self.data_root = Path(data_root)
         self.window_seconds = window_seconds
         self._orico_check = orico_check
+        # TG5：可注入分类通道与预算（不写死任何 provider/SDK，§7.6）
+        self.noise_llm = noise_llm
+        self.interest_llm = interest_llm
+        self.budget = budget
 
     # ---- watcher 回调入口 ----
 
@@ -92,6 +97,8 @@ class SourceItemPipeline:
                                       [event.message_id],
                                       processing_status=status)
         self.store.finalize_item(item_id, status=status)
+        if kind == "pdf":
+            self._classify_pdf(item_id)      # §11.4：下载前判定
         return item_id
 
     def _merge_or_open_text(self, event, source_id: str) -> str:
@@ -114,8 +121,7 @@ class SourceItemPipeline:
                 self.store.append_item_message(existing["item_id"],
                                                event.message_id)
                 return existing["item_id"]
-            self.store.finalize_item(existing["item_id"])
-            self._materialize(existing["item_id"])
+            self._finalize_text(existing["item_id"])
         item_id = f"{source_id}:{event.message_id}"
         self.store.create_source_item(item_id, source_id, "text",
                                       [event.message_id])
@@ -129,8 +135,7 @@ class SourceItemPipeline:
             return
         if not self._within_window(source_id, open_item,
                                    event.message_date):
-            self.store.finalize_item(open_item["item_id"])
-            self._materialize(open_item["item_id"])
+            self._finalize_text(open_item["item_id"])
 
     def _within_window(self, source_id: str, item, event_date) -> bool:
         if event_date is None:
@@ -162,7 +167,7 @@ class SourceItemPipeline:
         # 兼覆盖 C1 的 stranded（finalized 未物化）场景。
         self.store.reset_item_policy(item_id)
         if item["kind"] == "text":
-            self._materialize(item_id)
+            self._finalize_text(item_id)   # 重建即重分类（policy 已清）
         return "rebuilt"
 
     # ---- DELETE：§6.4 D ----
@@ -192,7 +197,7 @@ class SourceItemPipeline:
         recovered = 0
         for item in self.store.find_stranded_items():
             try:
-                self._materialize(item["item_id"])
+                self._finalize_text(item["item_id"])
                 recovered += 1
             except Exception as exc:        # noqa: BLE001 —— 恢复不中断
                 print(f"recover stranded {item['item_id']}: {exc}",
@@ -229,6 +234,77 @@ class SourceItemPipeline:
                 is_resource_collection_candidate(caption),
             "status": "PENDING_RESOURCE",
         }
+
+    def _finalize_text(self, item_id: str) -> None:
+        """§24.1 顺序：finalize → Noise → KEEP/REVIEW 才 materialize；
+        SKIP 只留审计（30 天保留，§18.2），不产生下游产物。"""
+        from .classify import CLASSIFIER_VERSION, POLICY_VERSION, classify_noise
+
+        self.store.finalize_item(item_id)
+        item = self.store.get_source_item(item_id)
+        texts = [row["text"] for row in self.store.get_item_messages(
+            item_id) if row["text"] and not row["deleted_at"]]
+        decision = classify_noise("\n\n".join(texts),
+                                  llm=self.noise_llm, budget=self.budget,
+                                  source_id=item["source_id"])
+        self.store.set_item_noise(item_id, decision.decision)
+        self.store.create_classifier_audit(
+            item_id, "noise", decision.decision,
+            reason_code=decision.reason_code,
+            confidence=decision.confidence,
+            policy_version=POLICY_VERSION,
+            classifier_version=CLASSIFIER_VERSION)
+        if decision.decision == "SKIP":
+            self.store.set_item_processing_status(item_id, "skipped_noise")
+            return
+        self._materialize(item_id)
+        if decision.decision == "REVIEW":
+            self.store.create_review(item_id, "noise_uncertain",
+                                     kind="text")
+
+    def _classify_pdf(self, item_id: str) -> None:
+        """§11.4/§12：Interest（下载前）→ INCLUDE 且 ≤50MiB 才待下载；
+        越界或 REVIEW 转人工。"""
+        from .classify import CLASSIFIER_VERSION, POLICY_VERSION, classify_interest
+        from .materialize import MAX_AUTO_DOWNLOAD_BYTES
+
+        item = self.store.get_source_item(item_id)
+        source = self.store.get_source(item["source_id"])
+        message = self.store.get_message(item["source_id"],
+                                         item["last_message_id"])
+        meta = {
+            "caption": message["text"] if message else None,
+            "filename": message["document_name"] if message else None,
+            "size_bytes": (message["document_size_bytes"]
+                           if message else None),
+            "source_display_name": source["display_name"] if source
+            else None,
+        }
+        decision = classify_interest(meta, llm=self.interest_llm,
+                                     budget=self.budget,
+                                     source_id=item["source_id"])
+        self.store.set_item_interest(item_id, decision.decision)
+        self.store.create_classifier_audit(
+            item_id, "interest", decision.decision,
+            reason_code=decision.reason,
+            confidence=decision.confidence,
+            policy_version=POLICY_VERSION,
+            classifier_version=CLASSIFIER_VERSION)
+        size = meta["size_bytes"]
+        if decision.decision == "EXCLUDE":
+            self.store.set_item_processing_status(item_id,
+                                                  "skipped_interest")
+        elif decision.decision == "REVIEW":
+            self.store.set_item_processing_status(item_id,
+                                                  "interest_review")
+            self.store.create_review(item_id, "interest_uncertain",
+                                     kind="pdf", size_bytes=size)
+        else:                                   # INCLUDE
+            self.store.set_item_processing_status(item_id,
+                                                  "interest_include")
+            if size is None or size > MAX_AUTO_DOWNLOAD_BYTES:
+                self.store.create_review(item_id, "size over 50 MiB",
+                                         kind="pdf", size_bytes=size)
 
     def _materialize(self, item_id: str):
         from .materialize import materialize_text_item, orico_ready

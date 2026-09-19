@@ -609,10 +609,10 @@ def test_i4_rebuild_resets_policy_columns(tmp_path):
     item_id = store.find_open_text_item("tg_a")["item_id"]
     store.finalize_item(item_id)
     materialize_text_item(store, item_id, tmp_path)
-    with store._conn:
+    with store._conn:  # 注入过期的 policy 决定
         store._conn.execute(
-            "UPDATE source_items SET noise_decision='KEEP', "
-            "interest_decision='INCLUDE' WHERE item_id = ?", (item_id,))
+            "UPDATE source_items SET noise_decision='SKIP', "
+            "interest_decision='EXCLUDE' WHERE item_id = ?", (item_id,))
 
     edited = TelegramEvent(kind=TelegramEventKind.EDIT,
                            chat_id=-1001234567890, message_id=1,
@@ -620,7 +620,8 @@ def test_i4_rebuild_resets_policy_columns(tmp_path):
                            edited_at=dt(60))
     assert _pipeline.ingest_edit(edited, "tg_a") == "rebuilt"
     item = store.get_source_item(item_id)
-    assert item["noise_decision"] is None
+    # §6.4 B：重建即重分类——过期决定被重算（SKIP→KEEP），不残留
+    assert item["noise_decision"] == "KEEP"
     assert item["interest_decision"] is None
 
 

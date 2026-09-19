@@ -108,6 +108,29 @@ CREATE TABLE IF NOT EXISTS downloads (
     PRIMARY KEY (item_id, document_message_id)
 );
 
+CREATE TABLE IF NOT EXISTS source_ai_budget (
+    source_id              TEXT NOT NULL,
+    classifier_kind        TEXT NOT NULL,
+    calls                  INTEGER NOT NULL DEFAULT 0,
+    attempts               INTEGER NOT NULL DEFAULT 0,
+    consecutive_empty      INTEGER NOT NULL DEFAULT 0,
+    consecutive_rate_limit INTEGER NOT NULL DEFAULT 0,
+    permits_json           TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (source_id, classifier_kind)
+);
+
+CREATE TABLE IF NOT EXISTS classifier_audit (
+    audit_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id            TEXT NOT NULL,
+    kind               TEXT NOT NULL,
+    decision           TEXT NOT NULL,
+    reason_code        TEXT,
+    confidence         REAL,
+    policy_version     TEXT NOT NULL,
+    classifier_version TEXT NOT NULL,
+    created_at         TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS reviews (
     review_id            INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id              TEXT NOT NULL REFERENCES source_items(item_id),
@@ -144,10 +167,11 @@ class TelegramEventStore:
             raise UnsupportedSchemaVersionError(
                 f"state.db user_version={version} > supported "
                 f"{SCHEMA_VERSION}; refusing to open (fail-fast)")
-        if version == SCHEMA_VERSION:
-            return
+        # 全部 DDL 幂等（IF NOT EXISTS）：v1 期内追加的表对既有库
+        # 自动补建，不引入迁移框架（§4.5；TG7 才做 1→2）
         self._conn.executescript(_SCHEMA)
-        self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        if version < SCHEMA_VERSION:
+            self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._conn.commit()
 
     def user_version(self) -> int:
@@ -532,6 +556,49 @@ class TelegramEventStore:
             "AND finalized_at IS NOT NULL AND materialized_path IS NULL "
             "AND processing_status != 'deleted_source'").fetchall()
 
+    # ---------- TG5：decision 落库与审计 ----------
+
+    def set_item_noise(self, item_id: str, decision: str) -> None:
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE source_items SET noise_decision = ? "
+                "WHERE item_id = ?", (decision, item_id))
+        if cursor.rowcount == 0:
+            raise ValueError(f"item not found: {item_id}")
+
+    def set_item_interest(self, item_id: str, decision: str) -> None:
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE source_items SET interest_decision = ? "
+                "WHERE item_id = ?", (decision, item_id))
+        if cursor.rowcount == 0:
+            raise ValueError(f"item not found: {item_id}")
+
+    def get_ai_budget(self, source_id: str, classifier_kind: str):
+        return self._conn.execute(
+            "SELECT * FROM source_ai_budget WHERE source_id = ? "
+            "AND classifier_kind = ?", (source_id,
+                                        classifier_kind)).fetchone()
+
+    def create_classifier_audit(self, item_id: str, kind: str,
+                                decision: str, *, reason_code=None,
+                                confidence=None, policy_version: str,
+                                classifier_version: str) -> int:
+        with self._conn:
+            cursor = self._conn.execute(
+                """INSERT INTO classifier_audit
+                   (item_id, kind, decision, reason_code, confidence,
+                    policy_version, classifier_version, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (item_id, kind, decision, reason_code, confidence,
+                 policy_version, classifier_version, _now_iso()))
+        return int(cursor.lastrowid)
+
+    def list_classifier_audit(self, item_id: str) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM classifier_audit WHERE item_id = ? "
+            "ORDER BY audit_id", (item_id,)).fetchall()
+
     # ---------- reviews（§16 REVIEW 机制） ----------
 
     def create_review(self, item_id: str, reason: str, *, kind=None,
@@ -631,3 +698,91 @@ class TelegramEventStore:
                 "SELECT item_id FROM reviews WHERE decision = "
                 "'DOWNLOAD_ONCE' AND decision_consumed_at IS NULL")]
         return summary
+
+
+# ---------- TG5：Source AI Budget + 分类审计（§21.1 / §7.5） ----------
+
+
+class AIBudgetGuard:
+    """Source 级模型预算（独立于 Target Budget；SQLite 分账）。
+
+    复用 budget.py 的 acquire/outcome/quota/breaker 思想：
+    - acquire(request_id) 幂等（重放不重复计数）；
+    - outcome 幂等（同 permit 同结果 no-op，冲突拒绝）；
+    - success 双清零；empty/rate_limit 递增对应熔断计数；
+    - 拒绝理由：budget_exhausted / breaker_open。
+    状态持久在 state.db（source × classifier_kind 维度）。
+    """
+
+    def __init__(self, store: TelegramEventStore, *,
+                 max_calls: int = 100,
+                 breaker_empty: int = 3,
+                 breaker_rate_limit: int = 2):
+        self.store = store
+        self.max_calls = max_calls
+        self.breaker_empty = breaker_empty
+        self.breaker_rate_limit = breaker_rate_limit
+
+    def _row(self, source_id: str, kind: str) -> dict:
+        row = self.store.get_ai_budget(source_id, kind)
+        if row is None:
+            with self.store._conn:
+                self.store._conn.execute(
+                    "INSERT OR IGNORE INTO source_ai_budget "
+                    "(source_id, classifier_kind) VALUES (?, ?)",
+                    (source_id, kind))
+            row = self.store.get_ai_budget(source_id, kind)
+        return dict(row)
+
+    def acquire(self, source_id: str, kind: str, request_id: str):
+        row = self._row(source_id, kind)
+        permits = json.loads(row["permits_json"] or "{}")
+        if request_id in permits:
+            return ("permit", request_id)      # 重放幂等
+        if row["calls"] >= self.max_calls:
+            return ("denied", "budget_exhausted")
+        if (row["consecutive_empty"] >= self.breaker_empty
+                or row["consecutive_rate_limit"] >= self.breaker_rate_limit):
+            return ("denied", "breaker_open")
+        permits[request_id] = "pending"
+        with self.store._conn:
+            self.store._conn.execute(
+                """UPDATE source_ai_budget SET calls = calls + 1,
+                     attempts = attempts + 1, permits_json = ?
+                   WHERE source_id = ? AND classifier_kind = ?""",
+                (json.dumps(permits), source_id, kind))
+        return ("permit", request_id)
+
+    def outcome(self, source_id: str, kind: str, request_id: str,
+                result: str) -> None:
+        if result not in ("success", "empty", "rate_limit"):
+            raise ValueError(f"invalid budget outcome: {result}")
+        row = self._row(source_id, kind)
+        permits = json.loads(row["permits_json"] or "{}")
+        if request_id not in permits:
+            raise ValueError(f"unknown budget request: {request_id}")
+        if permits[request_id] not in ("pending", result):
+            raise ValueError(
+                f"budget outcome conflict for {request_id}: "
+                f"{permits[request_id]} != {result}")
+        if permits[request_id] == result:
+            return                              # 幂等 no-op
+        permits[request_id] = result
+        empty = row["consecutive_empty"]
+        rate = row["consecutive_rate_limit"]
+        if result == "success":
+            empty = 0
+            rate = 0
+        elif result == "empty":
+            empty += 1
+            rate = 0
+        else:
+            rate += 1
+            empty = 0
+        with self.store._conn:
+            self.store._conn.execute(
+                """UPDATE source_ai_budget SET
+                     consecutive_empty = ?, consecutive_rate_limit = ?,
+                     permits_json = ?
+                   WHERE source_id = ? AND classifier_kind = ?""",
+                (empty, rate, json.dumps(permits), source_id, kind))
