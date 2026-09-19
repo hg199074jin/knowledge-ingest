@@ -661,6 +661,13 @@ class TelegramEventStore:
                ORDER BY item_id LIMIT 1""",
             (sha256, exclude_item_id)).fetchone()
 
+    def mark_download_purged(self, item_id: str) -> None:
+        """Retention 清理后留证：载荷已删，行保留（§10.4）。"""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE downloads SET status = 'purged', local_path = NULL "
+                "WHERE item_id = ?", (item_id,))
+
     def reset_item_policy(self, item_id: str) -> None:
         """§6.4 B：重建时清理待重算的 policy 决定。"""
         with self._conn:

@@ -426,6 +426,15 @@ def _build_parser() -> argparse.ArgumentParser:
             ("status", "report digest agent state"),
             ("uninstall", "unload and remove the digest agent")):
         wa_sub2.add_parser(name, parents=[common], help=hlp)
+    tg_sub.add_parser(
+        "doctor", parents=[common],
+        help="read-only health checks for the Telegram pipeline (TG8)")
+    tg_retention = tg_sub.add_parser(
+        "retention", parents=[common],
+        help="purge SKIP payloads older than N days (dry-run by default)")
+    tg_retention.add_argument("--days", type=int, default=30)
+    tg_retention.add_argument("--execute", action="store_true",
+                              help="actually delete (default: dry-run)")
     tg_watch_agent = tg_sub.add_parser(
         "watch-agent", parents=[common],
         help="persist the watcher as a LaunchAgent (reboot-survival)")
@@ -1445,6 +1454,10 @@ def _cmd_telegram(config: AppConfig, args) -> int:
         return _cmd_telegram_digest(config, args)
     if args.telegram_command == "digest-agent":
         return _cmd_telegram_digest_agent(config, args)
+    if args.telegram_command == "doctor":
+        return _cmd_telegram_doctor(config, args)
+    if args.telegram_command == "retention":
+        return _cmd_telegram_retention(config, args)
     if args.telegram_command == "sources":
         sub = args.telegram_sources_command
         if sub == "list":
@@ -2267,3 +2280,21 @@ def _cmd_telegram_digest_agent(config: AppConfig, args) -> int:
     if args.telegram_digest_agent_command == "uninstall":
         return digest_agent.uninstall(config)
     return 2
+
+
+def _cmd_telegram_doctor(config: AppConfig, args) -> int:
+    """TG8 §10.2：只读体检（不修改任何状态；--fix 独立命令另行实现）。"""
+    from knowledge_ingest.telegram import doctor
+
+    store = _open_telegram_store(config, create=False)
+    return doctor.run(config, store=store)
+
+
+def _cmd_telegram_retention(config: AppConfig, args) -> int:
+    """TG8 §10.4：SKIP 载荷保留约 N 天后清理（dry-run 默认）。"""
+    from knowledge_ingest.telegram.retention import run as retention_run
+
+    if args.execute:
+        print("retention: --execute（将在 maintenance lock 下删除文件；"
+              "provenance/审计行保留）")
+    return retention_run(config, days=args.days, execute=args.execute)
