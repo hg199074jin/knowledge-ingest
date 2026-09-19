@@ -9,6 +9,7 @@ materialization / policy 语义由 TG4 在库内事实之上实现，本模块
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 import time
 from datetime import UTC, datetime
@@ -102,7 +103,7 @@ class TelegramWatcher:
     async def reconcile(self, source_id: str) -> int:
         """§5.7 B 路径：只补 start_at 之后、cursor 之前的缺口。"""
         if self.client is None:
-            raise ValueError("watcher requires a client to reconcile")
+            return 0          # 无客户端（纯本地/handoff 模式）：无事可补
         source = self.store.get_source(source_id)
         if source is None or not source["enabled"]:
             return 0
@@ -137,7 +138,8 @@ class TelegramWatcher:
                   idle_seconds: float = 60.0,
                   reconcile_interval_seconds: float = 300.0,
                   error_backoff_seconds: float = 10.0,
-                  flood_wait_cap_seconds: float = 300.0) -> None:
+                  flood_wait_cap_seconds: float = 300.0,
+                  handoff_scan=None) -> None:
         """live 主循环（§5.7 A+B）：排空 updates，并按墙钟周期
         强制 reconcile 兜底——高频群 updates 不断流时也必须定期
         跑安全网，不能等空闲。max_ticks 仅用于测试/一次性运行。
@@ -156,6 +158,10 @@ class TelegramWatcher:
                 if now - last_reconcile >= reconcile_interval_seconds:
                     await self.reconcile_all()
                     last_reconcile = now
+                    if handoff_scan is not None:
+                        result = handoff_scan()
+                        if inspect.iscoroutine(result):
+                            await result
             except TelegramFloodWaitError as exc:
                 await asyncio.sleep(
                     min(exc.seconds, flood_wait_cap_seconds))
@@ -163,6 +169,9 @@ class TelegramWatcher:
                 await asyncio.sleep(error_backoff_seconds)
 
     async def _drain_updates(self, timeout: float) -> None:
+        if self.client is None:
+            await asyncio.sleep(timeout)   # 无客户端：纯周期任务模式
+            return
         try:
             async with asyncio.timeout(timeout):
                 async for event in self.client.watch_updates():
