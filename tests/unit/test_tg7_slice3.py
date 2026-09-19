@@ -58,8 +58,9 @@ def test_tg7_sha_dedup_points_to_existing_file(tmp_path):
 def test_tg7_session_lock_backoff(tmp_path, monkeypatch):
     """session 锁短暂争用 → 退避重试成功（不再让 CLI 直接失败）。"""
 
-    import knowledge_ingest.telegram.telethon_adapter as adapter_mod
     import asyncio as aio
+
+    import knowledge_ingest.telegram.telethon_adapter as adapter_mod
 
     real_sleep = aio.sleep
 
