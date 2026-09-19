@@ -106,10 +106,17 @@ async def download_pdf_async(store, item_id: str, client,
                               expected_size_bytes=expected,
                               last_error=str(exc))
         raise
+    sha = fingerprint_file(path).removeprefix("sha256:")
+    # TG7 去重：相同内容（SHA-256）已由其他 item 下载过 → 删除新副本，
+    # 复用既有文件（内容寻址；同 item 重放由 complete 幂等挡住）
+    existing = store.find_download_by_sha(sha, exclude_item_id=item_id)
+    if existing is not None and Path(existing["local_path"]) != path:
+        path.unlink(missing_ok=True)
+        path = Path(existing["local_path"])
     store.upsert_download(
         item_id, message_id, status="complete", attempts=attempts,
         expected_size_bytes=expected, local_path=str(path),
-        sha256=fingerprint_file(path).removeprefix("sha256:"))
+        sha256=sha)
     return path
 
 

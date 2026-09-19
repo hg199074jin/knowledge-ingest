@@ -23,6 +23,7 @@ from .client_port import (
 )
 
 CLOUD_LINK_HINTS = ("quark.cn", "pan.baidu.com")
+SESSION_LOCK_RETRY_SECONDS = 2.0
 
 
 def _require_telethon():
@@ -154,9 +155,24 @@ class TelethonAdapter:
             else self._build_client()
 
     async def _connected(self, client):
-        """所有请求前确保 MTProto 已连接（Telethon 不自动重连）。"""
+        """所有请求前确保 MTProto 已连接（Telethon 不自动重连）。
+
+        TG7：session 文件与常驻 watcher 互斥（SQLite 锁），短暂争用时
+        退避重试而不是直接失败；持久锁由上层报错（migration/运维处理）。
+        """
+        import sqlite3
+        import time as _time
+
         if not client.is_connected():
-            await self._guard(client.connect())
+            for attempt in range(3):
+                try:
+                    await self._guard(client.connect())
+                    return client
+                except sqlite3.OperationalError as exc:
+                    if "database is locked" not in str(exc) \
+                            or attempt == 2:
+                        raise
+                    _time.sleep(SESSION_LOCK_RETRY_SECONDS)
         return client
 
     async def _guard(self, coro):
