@@ -282,6 +282,41 @@ def test_run_drains_updates_then_reconciles(tmp_path):
     assert store.get_source("tg_a")["last_seen_message_id"] == 33
 
 
+def test_watcher_live_advances_cursor(tmp_path):
+    store = make_ready_store(tmp_path)
+    watcher = TelegramWatcher(store)
+    watcher.handle_event(make_event(message_id=41))
+    source = store.get_source("tg_a")
+    assert source["last_seen_message_id"] == 41
+
+
+def test_watcher_cursor_never_regresses(tmp_path):
+    store = make_ready_store(tmp_path)
+    watcher = TelegramWatcher(store)
+    watcher.handle_event(make_event(message_id=50))
+    watcher.handle_event(make_event(message_id=40))  # 迟到的旧事件
+    assert store.get_source("tg_a")["last_seen_message_id"] == 50
+
+
+def test_run_reconciles_even_when_updates_keep_flowing(tmp_path):
+    """高频群 updates 不断流时，reconcile 仍按墙钟周期兜底触发。"""
+
+    class FlowingClient(FakeTelegramClient):
+        async def watch_updates(self):
+            for i in range(100, 112):
+                yield make_event(message_id=i)
+                await asyncio.sleep(0.03)
+            await asyncio.Event().wait()
+
+    store = make_ready_store(tmp_path)
+    client = FlowingClient()
+    watcher = TelegramWatcher(store, client=client)
+    asyncio.run(watcher.run(max_ticks=1, idle_seconds=0.2,
+                            reconcile_interval_seconds=0.0))
+    assert store.get_source("tg_a")["last_reconciled_at"] is not None
+    assert client.fetched_after  # reconcile 确实发起了增量拉取
+
+
 # ---------- 无 extra CI 契约（§5.2） ----------
 
 def test_no_extra_core_import_contract():

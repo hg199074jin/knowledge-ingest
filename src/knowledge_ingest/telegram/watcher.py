@@ -9,6 +9,7 @@ materialization / policy 语义由 TG4 在库内事实之上实现，本模块
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 
 from .client_port import TelegramClientPort, TelegramEventKind
@@ -65,8 +66,11 @@ class TelegramWatcher:
                            if event.edited_at else None))
         except MessageBeforeStartError:
             return "skipped_old"  # §6.3 硬边界：永不历史回溯
-        return ("updated" if event.kind is TelegramEventKind.EDIT
-                else "stored")
+        if event.kind is TelegramEventKind.EDIT:
+            self.store.advance_seen(source_id, event.message_id)
+            return "updated"
+        self.store.advance_seen(source_id, event.message_id)
+        return "stored"
 
     async def reconcile(self, source_id: str) -> int:
         """§5.7 B 路径：只补 start_at 之后、cursor 之前的缺口。"""
@@ -97,16 +101,20 @@ class TelegramWatcher:
         return total
 
     async def run(self, *, max_ticks: int | None = None,
-                  idle_seconds: float = 300.0) -> None:
-        """live 主循环：排空 updates，空闲后跑一轮周期 reconcile。
-
-        max_ticks 仅用于测试/一次性运行；生产常驻时为 None。
-        """
+                  idle_seconds: float = 60.0,
+                  reconcile_interval_seconds: float = 300.0) -> None:
+        """live 主循环（§5.7 A+B）：排空 updates，并按墙钟周期
+        强制 reconcile 兜底——高频群 updates 不断流时也必须定期
+        跑安全网，不能等空闲。max_ticks 仅用于测试/一次性运行。"""
         tick = 0
+        last_reconcile = 0.0
         while max_ticks is None or tick < max_ticks:
             tick += 1
             await self._drain_updates(timeout=idle_seconds)
-            await self.reconcile_all()
+            now = time.monotonic()
+            if now - last_reconcile >= reconcile_interval_seconds:
+                await self.reconcile_all()
+                last_reconcile = now
 
     async def _drain_updates(self, timeout: float) -> None:
         try:

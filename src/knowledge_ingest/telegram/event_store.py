@@ -229,6 +229,16 @@ class TelegramEventStore:
         if cursor.rowcount == 0:
             raise ValueError(f"source not found: {source_id}")
 
+    def advance_seen(self, source_id: str, message_id: int) -> None:
+        """live 路径推进 last_seen 游标（只前进，不倒退）。"""
+        with self._conn:
+            self._conn.execute(
+                """UPDATE tg_sources SET
+                     last_seen_message_id = MAX(last_seen_message_id, ?),
+                     updated_at = ?
+                   WHERE source_id = ?""",
+                (message_id, _now_iso(), source_id))
+
     def touch_source_cursor(self, source_id: str, *,
                             last_seen_message_id: int | None = None,
                             last_reconciled_at: str | None = None) -> None:
