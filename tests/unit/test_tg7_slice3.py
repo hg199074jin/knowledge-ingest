@@ -84,3 +84,29 @@ def test_tg7_session_lock_backoff(tmp_path, monkeypatch):
     out = asyncio.run(adapter._connected(client))
     assert out is client and calls["connect"] == 2
     assert SESSION_LOCK_RETRY_SECONDS > 0
+
+
+def test_r1fix_video_items_in_download_scan(tmp_path):
+    """TG7 分类学回归：video INCLUDE 条目必须能自动下载。"""
+    store = make_store(tmp_path)
+    store.add_source("tg_b", chat_id=-200, display_name="B", start_at=None)
+    store.upsert_message("tg_b", 3,
+                         message_date="2026-09-20T00:00:00+00:00",
+                         has_document=True, document_name="v.mp4",
+                         document_mime="video/mp4", document_size_bytes=17)
+    store.create_source_item("tg_b:3", "tg_b", "video", [3],
+                             processing_status="interest_include")
+    store.set_item_interest("tg_b:3", "INCLUDE")
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+
+    pipeline = SourceItemPipeline(store, data_root=tmp_path,
+                                  orico_check=lambda: True)
+    dest = tmp_path / "dest"; dest.mkdir(parents=True, exist_ok=True)
+
+    class C:
+        async def download_document(self, chat_id, message_id, dest_dir):
+            f = Path(dest_dir) / "v.mp4"; f.write_bytes(b"v"); return f
+
+    done = asyncio.run(pipeline.download_pending_pdfs(C()))
+    assert done == 1
+    assert store.get_download("tg_b:3")["status"] == "complete"

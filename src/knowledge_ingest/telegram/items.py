@@ -199,7 +199,7 @@ class SourceItemPipeline:
         self.store.reset_item_policy(item_id)
         if item["kind"] == "text":
             self._finalize_text(item_id)   # 重建即重分类（policy 已清）
-        elif item["kind"] == "pdf":
+        elif item["kind"] in ("pdf", "video"):
             self._classify_pdf(item_id)    # I3：caption 变了 → 重判兴趣
         return "rebuilt"
 
@@ -334,10 +334,12 @@ class SourceItemPipeline:
         if client is None:
             return 0
         downloaded = 0
-        for item in self.store.list_source_items(kind="pdf"):
+        for item in self.store.list_source_items():
             if item_id is not None and item["item_id"] != item_id:
                 continue
             if item["processing_status"] != "interest_include":
+                continue
+            if item["kind"] not in ("pdf", "video"):
                 continue
             try:
                 path = await download_pdf_async(

@@ -200,7 +200,7 @@ class TelegramHandoffRunner:
     def scan(self) -> list[dict]:
         results = []
         for item in self.store.list_source_items():
-            if item["kind"] not in ("text", "pdf"):
+            if item["kind"] not in ("text", "pdf", "video"):
                 continue
             try:
                 result = self.prepare_handoff(item["item_id"])
