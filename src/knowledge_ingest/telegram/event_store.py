@@ -20,7 +20,7 @@ BUSY_TIMEOUT_MS = 5000
 
 REVIEW_DECISIONS = ("KEEP", "SKIP", "DOWNLOAD_ONCE")
 
-ITEM_KINDS = ("text", "pdf", "cloud_link")
+ITEM_KINDS = ("text", "pdf", "cloud_link", "video", "file")
 
 
 def maintenance_lock(db_path: Path):
