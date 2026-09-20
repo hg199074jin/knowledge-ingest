@@ -84,3 +84,9 @@ V2.1-4 增补路径：视频→本地 Fun-ASR 转写→docchunk（23s/153s 实�
 Telegram Source V2 的全部 TG0–TG8 范围已完成或如实标记外部待办；
 自动化严格止于 staged；无越权 publish/activate；语料基线已清扫。
 满足方案 §10"正式完成"条件。
+
+## QA 归档（2026-09-20）
+
+- 测试与巡检类报告统一落 `KnowledgePipeline/qa/reports/`（逐频道10条 / 全链路验收 / channels-raw / 生成物全文示例）；
+- H3-A case 目录已归档至 `KnowledgePipeline/qa/cases/h3a-scmp-3084`（原 k2c-cases/；m2 驱动复用时传 `--case-dir` 新路径）；
+- 生产数据根（state.db / materialized / attachments / LongDocCorpus / K2C runs）原地不动。
