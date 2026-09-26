@@ -90,7 +90,8 @@ class SourceItemPipeline:
                  data_root: str | Path,
                  window_seconds: int = WINDOW_SECONDS,
                  orico_check=None,
-                 noise_llm=None, interest_llm=None, budget=None):
+                 noise_llm=None, interest_llm=None, budget=None,
+                 learned_rules=None):
         self.store = store
         self.data_root = Path(data_root)
         self.window_seconds = window_seconds
@@ -99,6 +100,8 @@ class SourceItemPipeline:
         self.noise_llm = noise_llm
         self.interest_llm = interest_llm
         self.budget = budget
+        # V2.2：学习规则索引（蒸馏的已知广告指纹，0 次调用短路）
+        self.learned_rules = learned_rules
 
     # ---- watcher 回调入口 ----
 
@@ -466,7 +469,8 @@ class SourceItemPipeline:
         texts = self._live_texts(item_id)
         decision = classify_noise("\n\n".join(texts),
                                   llm=self.noise_llm, budget=self.budget,
-                                  source_id=item["source_id"])
+                                  source_id=item["source_id"],
+                                  learned=self.learned_rules)
         self.store.set_item_noise(item_id, decision.decision)
         self.store.create_classifier_audit(
             item_id, "noise", decision.decision,
@@ -511,7 +515,8 @@ class SourceItemPipeline:
         }
         decision = classify_interest(meta, llm=self.interest_llm,
                                      budget=self.budget,
-                                     source_id=item["source_id"])
+                                     source_id=item["source_id"],
+                                     learned=self.learned_rules)
         self.store.set_item_interest(item_id, decision.decision)
         self.store.create_classifier_audit(
             item_id, "interest", decision.decision,

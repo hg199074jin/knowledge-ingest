@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BUSY_TIMEOUT_MS = 5000
 
 REVIEW_DECISIONS = ("KEEP", "SKIP", "DOWNLOAD_ONCE")
@@ -163,6 +163,24 @@ CREATE TABLE IF NOT EXISTS reviews (
     decision             TEXT CHECK (decision IN ('KEEP', 'SKIP', 'DOWNLOAD_ONCE')),
     decision_consumed_at TEXT
 );
+
+-- V2.2 学习规则层：高置信 SKIP 判决蒸馏出的指纹/关键词，
+-- 由 rules-distill 显式激活；命中审计走 learned: 前缀可回溯
+CREATE TABLE IF NOT EXISTS learned_rules (
+    rule_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_type     TEXT NOT NULL CHECK (rule_type IN ('fingerprint', 'keyword')),
+    pattern       TEXT NOT NULL,
+    reason_code   TEXT NOT NULL,
+    decision      TEXT NOT NULL CHECK (decision IN ('SKIP')),
+    source        TEXT NOT NULL CHECK (source IN ('llm', 'human')),
+    confidence    REAL NOT NULL DEFAULT 1.0,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    active        INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_learned_rules_type_pattern
+    ON learned_rules(rule_type, pattern);
 """
 
 
@@ -779,6 +797,67 @@ class TelegramEventStore:
                 (item_id, kind, decision, reason_code, confidence,
                  policy_version, classifier_version, _now_iso()))
         return int(cursor.lastrowid)
+
+    # ---------- V2.2 学习规则层 ----------
+
+    def create_learned_rule(self, rule_type: str, pattern: str, *,
+                            reason_code: str, source: str,
+                            confidence: float = 1.0,
+                            evidence: list | None = None) -> int | None:
+        """插入学习规则；(rule_type, pattern) 重复时幂等返回 None。"""
+        try:
+            with self._conn:
+                cursor = self._conn.execute(
+                    """INSERT INTO learned_rules
+                       (rule_type, pattern, reason_code, decision, source,
+                        confidence, evidence_json, active, created_at)
+                       VALUES (?, ?, ?, 'SKIP', ?, ?, ?, 1, ?)""",
+                    (rule_type, pattern, reason_code, source, confidence,
+                     json.dumps(evidence or []), _now_iso()))
+        except sqlite3.IntegrityError:
+            return None
+        return int(cursor.lastrowid)
+
+    def list_learned_rules(self, *, active_only: bool = False) -> list:
+        query = ("SELECT * FROM learned_rules WHERE active = 1"
+                 if active_only else "SELECT * FROM learned_rules")
+        query += " ORDER BY rule_id"
+        return self._conn.execute(query).fetchall()
+
+    def set_learned_rule_active(self, rule_id: int, active: bool) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE learned_rules SET active = ? WHERE rule_id = ?",
+                (1 if active else 0, rule_id))
+
+    def list_latest_skip_audits(self, min_confidence: float) -> list:
+        """每个 Item 最新的 SKIP 审计（编辑重投只取最新一条）。"""
+        return self._conn.execute(
+            """SELECT a.item_id, a.kind, a.reason_code, a.confidence
+               FROM classifier_audit a
+               JOIN (SELECT item_id, MAX(audit_id) AS latest
+                     FROM classifier_audit
+                     WHERE decision = 'SKIP' GROUP BY item_id) t
+                 ON a.item_id = t.item_id AND a.audit_id = t.latest
+               WHERE a.confidence >= ?
+                 AND a.kind IN ('noise', 'interest')
+               ORDER BY a.audit_id""", (min_confidence,)).fetchall()
+
+    def list_items_with_resolved_skip(self) -> list:
+        """人工裁决为 SKIP 的 Item（供蒸馏采信，置信按 1.0）。"""
+        return self._conn.execute(
+            """SELECT item_id, COALESCE(kind, 'noise') AS kind
+               FROM reviews
+               WHERE decision = 'SKIP' AND resolved_at IS NOT NULL
+               GROUP BY item_id""").fetchall()
+
+    def get_message_for_item(self, item_id: str):
+        """Item 末条消息（interest 判定的可见元数据来源）。"""
+        return self._conn.execute(
+            """SELECT m.* FROM source_items i
+               JOIN tg_messages m ON m.source_id = i.source_id
+                    AND m.message_id = i.last_message_id
+               WHERE i.item_id = ?""", (item_id,)).fetchone()
 
     def list_classifier_audit(self, item_id: str) -> list[sqlite3.Row]:
         return self._conn.execute(
