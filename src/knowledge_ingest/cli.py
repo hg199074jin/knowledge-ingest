@@ -413,6 +413,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="distill high-confidence SKIP verdicts into learned rules "
              "(preview by default; --apply to activate)")
     tg_rules_distill.add_argument("--min-confidence", type=float, default=0.9)
+    tg_rules_distill.add_argument(
+        "--source", choices=("all", "llm", "human"), default="all",
+        help="only distill verdicts from this source (default: all)")
     tg_rules_distill.add_argument("--apply", action="store_true",
                                   help="write learned rules (default: preview)")
     tg_sub.add_parser(
@@ -2013,6 +2016,8 @@ def _cmd_telegram_rules_distill(config: AppConfig, args) -> int:
     pipeline = SourceItemPipeline(store, data_root=config.pipeline_root)
     candidates = collect_skip_candidates(
         store, pipeline, min_confidence=args.min_confidence)
+    if getattr(args, "source", "all") != "all":
+        candidates = [c for c in candidates if c["source"] == args.source]
     if not candidates:
         print("no new SKIP fingerprints to distill")
         return 0
