@@ -586,3 +586,27 @@ class InsightStore:
             """SELECT * FROM trend_clusters
                WHERE signal_count >= ? AND status = 'ready'
                ORDER BY signal_count DESC""", (threshold,)).fetchall()
+
+    # ---------- approved cognition（M5/M7：仅 Human Gate ADOPT 后写入） ----------
+
+    def upsert_approved_cognition(self, record_id: str, proposal_id: str,
+                                  cognition: str, *, domain: str | None,
+                                  approved_at: str,
+                                  approved_by: str = "human_gate") -> None:
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO approved_cognition
+                   (record_id, proposal_id, domain, cognition, state,
+                    source_ref, approved_at, approved_by)
+                   VALUES (?, ?, ?, ?, 'CONFIRMED', NULL, ?, ?)
+                   ON CONFLICT(record_id) DO UPDATE SET
+                       cognition = excluded.cognition,
+                       proposal_id = excluded.proposal_id,
+                       approved_at = excluded.approved_at""",
+                (record_id, proposal_id, domain, cognition, approved_at,
+                 approved_by))
+
+    def list_approved_cognition(self) -> list:
+        return self._conn.execute(
+            """SELECT * FROM approved_cognition
+               WHERE state = 'CONFIRMED' ORDER BY approved_at""").fetchall()

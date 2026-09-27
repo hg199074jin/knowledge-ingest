@@ -177,12 +177,18 @@ class PersonalContextRef:
 
     relation_reason 必填：每条关联必须说明"为什么它会影响当前判断"，
     禁止主题级硬关联（设计 §23.3）。
+    kind/text/conflict_with 为 M5 检索器回填的可选字段（M1 契约向后
+    兼容）：conflict_with 非空 = 该记录与所指记录存在 PERSONAL_CONTEXT_
+    CONFLICT（设计 §10.6，冲突不静默消除）。
     """
 
     record_id: str
     relation_reason: str
     state: str
     source_ref: str | None = None
+    kind: str | None = None
+    text: str | None = None
+    conflict_with: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not self.record_id:
