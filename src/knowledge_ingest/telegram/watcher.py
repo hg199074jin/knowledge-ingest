@@ -174,7 +174,9 @@ class TelegramWatcher:
         error_backoff_seconds 后继续下一 tick。
         """
         tick = 0
-        last_reconcile = 0.0
+        # -inf：首个 tick 立即 reconcile（冷启动机器 monotonic≈0，
+        # 若用 0.0 会无谓推迟首轮安全网 5 分钟——CI 短生命周期直接暴露）
+        last_reconcile = -float("inf")
         while max_ticks is None or tick < max_ticks:
             tick += 1
             try:

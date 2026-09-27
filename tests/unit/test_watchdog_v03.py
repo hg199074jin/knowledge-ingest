@@ -40,6 +40,10 @@ def fake_home(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "_home", lambda: home)
     fake_ki = tmp_path / "bin" / "knowledge-ingest"
     monkeypatch.setattr(watchdog, "_resolve_ki", lambda: str(fake_ki))
+    # hermetic：CI 的 macos runner 仓库就在 /Users/runner 下，
+    # 不隔离 _repo_root 会让 "/Users/ 不入脚本" 断言误报
+    monkeypatch.setattr(watchdog, "_repo_root",
+                        lambda: tmp_path / "repo")
     calls: list[list[str]] = []
     loaded: list[bool] = [False]
 
