@@ -9,8 +9,8 @@
 [简体中文](README.zh-CN.md)
 
 A multi-source knowledge ingestion and capability-distillation pipeline for
-macOS (Apple Silicon). It routes material from **Baidu Netdisk, Quark Drive,
-or local paths** through the existing toolchain:
+macOS (Apple Silicon). It routes material from **Telegram channels, Baidu
+Netdisk, Quark Drive, or local paths** through the existing toolchain:
 
 ```text
 media-transcriber (video/audio → Markdown)
@@ -24,7 +24,8 @@ it provides orchestration, durable state, resumable breakpoints, dedup,
 caching, human confirmation gates, and final reporting.
 
 ```text
-Baidu / Quark / local material → verifiable Corpus → Agent Skills + capability assets
+Telegram channels → filter → materialize ─┐
+Baidu / Quark / local material → Corpus ───┴→ Agent Skills + capability assets (k2c target)
 ```
 
 ## How it works
@@ -97,16 +98,33 @@ As an Agent Skill, the natural-language entry points are: *"turn this Baidu
 Netdisk PDF into a skill"*, *"learn this Quark course and distill it"*, *"continue
 the ingestion task"*, *"where is that job at?"* — see [SKILL.md](SKILL.md).
 
+### Telegram source (quick start)
+
+```bash
+knowledge-ingest telegram watch --config ./config.example.yaml   # always-on watcher
+knowledge-ingest telegram watch-agent install    # launchd wrapper (RunAtLoad + KeepAlive)
+knowledge-ingest telegram doctor                 # 18-check read-only health audit
+knowledge-ingest telegram review list            # human queue for uncertain items
+knowledge-ingest telegram review resolve ID --decision SKIP|KEEP|DOWNLOAD_ONCE
+knowledge-ingest telegram classify-dryrun [--limit N]   # read-only LLM channel validation
+knowledge-ingest telegram rules-distill [--source llm] [--apply]  # distill SKIP verdicts into fingerprint rules
+knowledge-ingest telegram rules-list / rules-disable ID      # audit / rollback learned rules
+knowledge-ingest telegram budget show / reset    # per-source LLM call ledger
+knowledge-ingest telegram digest [--send]        # collection digest (3x-daily agent)
+knowledge-ingest telegram handoff ITEM_ID        # explicit item → k2c capability handoff
+```
+
 ## Repository layout
 
 | Path | Purpose |
 |---|---|
 | `src/knowledge_ingest/` | Python CLI (stdlib + PyYAML + pydantic, managed by uv) |
+| `src/knowledge_ingest/telegram/` | Telegram Source V2 runtime: watcher, classification, learned rules, review queue, digest/notification, doctor |
 | `SKILL.md` | Agent Skill entry point |
 | `references/` | Architecture, routing, cloud sources, target gates, recovery, handoff contracts |
 | `schemas/` | Source/Target handoff contract examples |
-| `docs/` | Design v1.1, implementation plan v1.1, runtime inventory, acceptance record |
-| `tests/` | Unit + integration tests (TDD throughout) |
+| `docs/` | Design v1.1 + Telegram V2 design/implementation/acceptance, runtime inventory |
+| `tests/` | Unit + integration tests, 562 green (TDD throughout) |
 
 ## v0.2.0 — evolved from the first production run
 
@@ -152,11 +170,58 @@ The first end-to-end job (11 GB / 32 videos / two overnight reboots) drove five 
   "unknown / not instrumented" markers, all sourced from existing manifest
   fields (v1-migrated manifests render safely).
 
+## Telegram Source V2 — an always-on knowledge channel
+
+The Telegram source turns channel noise into a curated, auditable knowledge
+stream that feeds the same Corpus → capability pipeline:
+
+```text
+Telegram channels (live updates + periodic reconcile)
+  → deterministic item aggregation (albums/collections merge; edits & deletes tracked)
+  → three-layer classification:
+      1. static rules (obvious ads / whitelist — zero LLM calls)
+      2. learned fingerprints (distilled SKIP verdicts; NFKC-normalized so
+         emoji/spacing/full-width obfuscation still matches — zero LLM calls)
+      3. injectable LLM for boundary cases (any stdin→stdout CLI; per-source
+         budget ledger, empty/rate-limit breakers, fail-safe → human REVIEW)
+  → KEEP: materialized Markdown per item (provenance preserved)
+  → PDF/video attachments: SHA-256-verified download, ASR via media-transcriber
+  → handoff → knowledge-ingest job → docchunk Corpus → k2c target
+    (staged capability; publish/activate stays a human gate)
+```
+
+Design guarantees:
+
+- **Fail-safe, never silent**: parse errors, unknown enums, channel failures,
+  and exhausted budgets all degrade to REVIEW (a human queue) — knowledge is
+  never silently skipped to save cost.
+- **Review decisions actually act**: `review resolve` materializes KEEP items
+  and terminalizes SKIP ones (no write-only queue); every decision is
+  auditable in `classifier_audit`.
+- **Learned rules are reversible**: fingerprints distilled only from
+  high-confidence SKIP verdicts (or human rulings), never from KEEP;
+  `rules-disable` rolls any rule back individually.
+- **Ops-first**: `telegram doctor` runs 18 read-only checks (session, schema,
+  cursors, reconcile freshness, file integrity, backlog, delivery, agents);
+  digest agent summarizes 3× daily; WxPusher notifications are write-ahead,
+  idempotent, and retry-safe.
+- **Crash-proof state**: SQLite WAL + `user_version` schema migrations under
+  maintenance locks; atomic materialization; watcher survives `kill -9` and
+  reboots via launchd.
+
+Production-proven on 14 channels (~300 items/day): eight review rounds,
+dual acceptance records (A–W matrix, 25 checks), and a real end-to-end
+sample (SCMP 10.87 MB PDF → staged k2c capability).
+
 ## Docs
 
 - [Design document v1.1](docs/knowledge-ingest-design-v1.md)
 - [Implementation plan v1.1](docs/knowledge-ingest-implementation-v1.md)
 - [Acceptance record](docs/acceptance-v1.md)
+- [Telegram Source V2 design (frozen)](docs/k2c-telegram-knowledge-source-v2-design.md)
+- [Telegram Source V2 implementation plan](docs/k2c-telegram-knowledge-source-v2-实施方案.md)
+- [Telegram Source V2 acceptance record](docs/k2c-telegram-knowledge-source-v2-验收记录.md)
+
 
 ## Related projects
 

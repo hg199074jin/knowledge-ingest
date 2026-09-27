@@ -8,8 +8,8 @@
 
 [English](README.md)
 
-macOS（Apple Silicon）上的多源知识摄取与能力蒸馏流水线。把**本地文件、
-百度网盘、夸克网盘**的资料统一送入现有能力：
+macOS（Apple Silicon）上的多源知识摄取与能力蒸馏流水线。把**Telegram 频道、
+本地文件、百度网盘、夸克网盘**的资料统一送入现有能力：
 
 ```text
 media-transcriber（视频/音频 → Markdown）
@@ -22,7 +22,8 @@ personal-capability-distiller（能力卡/SOP/Prompt → Obsidian 能力库）
 断点恢复、去重、缓存、人工确认门与最终报告**。
 
 ```text
-百度/夸克/本地资料 → 可验证 Corpus → Agent Skill + 个人能力资产
+Telegram 频道 → 过滤 → 物化 ─────────────┐
+百度/夸克/本地资料 → 可验证 Corpus ────────┴→ Agent Skill + 能力资产（k2c target）
 ```
 
 ## 工作方式
@@ -93,16 +94,33 @@ knowledge-ingest report JOB           # 含"运行审计"段
 "把夸克网盘这个课程学习掉并蒸馏"、"继续刚才那个知识摄取任务"、
 "刚才那个课程处理到哪一步了"——见 [SKILL.md](SKILL.md)。
 
+### Telegram 源（快速上手）
+
+```bash
+knowledge-ingest telegram watch --config ./config.example.yaml   # 常驻 watcher
+knowledge-ingest telegram watch-agent install    # launchd 包装（RunAtLoad + KeepAlive）
+knowledge-ingest telegram doctor                 # 18 项只读健康体检
+knowledge-ingest telegram review list            # 拿不准条目的人工队列
+knowledge-ingest telegram review resolve ID --decision SKIP|KEEP|DOWNLOAD_ONCE
+knowledge-ingest telegram classify-dryrun [--limit N]   # 只读验证 LLM 通道
+knowledge-ingest telegram rules-distill [--source llm] [--apply]  # SKIP 判决蒸馏为指纹规则
+knowledge-ingest telegram rules-list / rules-disable ID      # 学习规则审计 / 回滚
+knowledge-ingest telegram budget show / reset    # 每源 LLM 调用账本
+knowledge-ingest telegram digest [--send]        # 采集日报（每日 3 次的 agent）
+knowledge-ingest telegram handoff ITEM_ID        # 显式条目 → k2c 能力交付
+```
+
 ## 仓库结构
 
 | 路径 | 用途 |
 |---|---|
 | `src/knowledge_ingest/` | Python CLI（标准库 + PyYAML + pydantic，uv 管理） |
+| `src/knowledge_ingest/telegram/` | Telegram Source V2 运行时：watcher、三层分类、学习指纹、审核队列、日报/通知、doctor |
 | `SKILL.md` | Agent Skill 入口 |
 | `references/` | 架构、路由、云源、确认门映射、恢复策略、handoff 契约 |
 | `schemas/` | Source/Target handoff 契约示例 |
-| `docs/` | 设计文档 v1.1、实施计划 v1.1、Runtime Inventory、验收记录 |
-| `tests/` | 单元 + 集成测试（全程 TDD） |
+| `docs/` | v1.1 设计/实施 + Telegram V2 设计/实施/验收、Runtime Inventory |
+| `tests/` | 单元 + 集成测试，562 绿（全程 TDD） |
 
 ## v0.3.0 — 通用 Target Runtime + 预算守卫
 
@@ -128,11 +146,51 @@ knowledge-ingest report JOB           # 含"运行审计"段
   用量与诚实的 "unknown / not instrumented" 标注，全部来自 manifest 已有
   字段（v1 迁移 manifest 渲染不崩）。
 
+## Telegram Source V2 —— 常驻知识频道
+
+Telegram 源把频道噪音变成一条可审计的知识流，汇入同一条
+Corpus → 能力流水线：
+
+```text
+Telegram 频道（实时更新 + 周期 reconcile）
+  → 确定性 Item 聚合（图集/合集合并；编辑与删除全程留痕）
+  → 三层分类：
+      1. 静态规则（明确广告 / 白名单 —— 0 次 LLM 调用）
+      2. 学习指纹（从高置信 SKIP 判决蒸馏；NFKC 归一化，
+         emoji/空格/全角障眼法照样命中 —— 0 次 LLM 调用）
+      3. 可注入 LLM 边界判定（任意 stdin→stdout 命令；每源独立
+         预算账本、空回/限流熔断、fail-safe 转人工 REVIEW）
+  → KEEP：逐条物化 Markdown（保留来源链路）
+  → PDF/视频附件：SHA-256 校验下载、media-transcriber 本地转写
+  → handoff → knowledge-ingest job → docchunk Corpus → k2c target
+    （staged 能力；publish/activate 保持人工门）
+```
+
+设计保证：
+
+- **fail-safe，绝不静默**：JSON 解析失败、未知枚举、通道异常、预算耗尽
+  一律降级 REVIEW（人工队列）——绝不为了省成本静默丢弃知识。
+- **审核决策真实生效**：`review resolve` 对 KEEP 物化、对 SKIP 终态化
+  （没有只写不读的黑洞队列）；每个判定可在 `classifier_audit` 追溯。
+- **学习规则可回滚**：指纹只从高置信 SKIP 判决（或人工裁决）蒸馏，
+  永不蒸馏 KEEP；`rules-disable` 逐条回滚。
+- **运维优先**：`telegram doctor` 18 项只读体检（session/schema/游标/
+  reconcile 时效/文件完整性/积压/投递/agent）；digest agent 每日 3 次
+  日报；WxPusher 通知写前记录、幂等、可重试。
+- **崩溃无忧状态**：SQLite WAL + `user_version` 迁移持维护锁；物化原子写；
+  watcher 经 launchd 扛住 kill -9 与重启。
+
+14 个频道生产验证（约 300 Item/天）：八轮评审、双验收记录（A–W 矩阵
+25 项检查）、真实端到端样本（SCMP 10.87MB PDF → staged k2c 能力）。
+
 ## 文档
 
 - [设计文档 v1.1](docs/knowledge-ingest-design-v1.md)
 - [实施计划 v1.1](docs/knowledge-ingest-implementation-v1.md)
 - [验收记录](docs/acceptance-v1.md)
+- [Telegram Source V2 设计（冻结版）](docs/k2c-telegram-knowledge-source-v2-design.md)
+- [Telegram Source V2 实施方案](docs/k2c-telegram-knowledge-source-v2-实施方案.md)
+- [Telegram Source V2 验收记录](docs/k2c-telegram-knowledge-source-v2-验收记录.md)
 
 ## 相关项目
 
