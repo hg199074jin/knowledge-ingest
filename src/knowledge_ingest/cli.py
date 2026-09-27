@@ -408,6 +408,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "classify-dryrun", parents=[common],
         help="run the classifier channel over parked samples (read-only)")
     tg_dryrun.add_argument("--limit", type=int, default=None)
+    tg_rules_distill = tg_sub.add_parser(
+        "rules-distill", parents=[common],
+        help="distill high-confidence SKIP verdicts into learned rules "
+             "(preview by default; --apply to activate)")
+    tg_rules_distill.add_argument("--min-confidence", type=float, default=0.9)
+    tg_rules_distill.add_argument(
+        "--source", choices=("all", "llm", "human"), default="all",
+        help="only distill verdicts from this source (default: all)")
+    tg_rules_distill.add_argument("--apply", action="store_true",
+                                  help="write learned rules (default: preview)")
+    tg_sub.add_parser(
+        "rules-list", parents=[common],
+        help="list learned rules (incl. deactivated)")
+    tg_rules_disable = tg_sub.add_parser(
+        "rules-disable", parents=[common],
+        help="deactivate one learned rule (rollback)")
+    tg_rules_disable.add_argument("rule_id", type=int)
     tg_sub.add_parser(
         "notify", parents=[common],
         help="send a test notification (WxPusher; H2 credentials)")
@@ -1444,6 +1461,12 @@ def _cmd_telegram(config: AppConfig, args) -> int:
         return _cmd_telegram_handoff(config, args)
     if args.telegram_command == "classify-dryrun":
         return _cmd_telegram_classify_dryrun(config, args)
+    if args.telegram_command == "rules-distill":
+        return _cmd_telegram_rules_distill(config, args)
+    if args.telegram_command == "rules-list":
+        return _cmd_telegram_rules_list(config, args)
+    if args.telegram_command == "rules-disable":
+        return _cmd_telegram_rules_disable(config, args)
     if args.telegram_command == "budget":
         return _cmd_telegram_budget(config, args)
     if args.telegram_command == "watch-agent":
@@ -1828,6 +1851,7 @@ def _cmd_telegram_watch(config: AppConfig, args) -> int:
         return 2
     from knowledge_ingest.telegram.handoff import TelegramHandoffRunner
     from knowledge_ingest.telegram.items import SourceItemPipeline
+    from knowledge_ingest.telegram.learned import LearnedRuleIndex
 
     try:
         channel, budget = _tg_classifier_channel(store)
@@ -1836,7 +1860,8 @@ def _cmd_telegram_watch(config: AppConfig, args) -> int:
         return 2
     pipeline = SourceItemPipeline(store, data_root=config.pipeline_root,
                                   noise_llm=channel, interest_llm=channel,
-                                  budget=budget)
+                                  budget=budget,
+                                  learned_rules=LearnedRuleIndex.load(store))
     watcher = TelegramWatcher(store, client=adapter, pipeline=pipeline)
     handoff_scan = None
     if os.environ.get("KI_TELEGRAM_HANDOFF") == "1":
@@ -1911,6 +1936,7 @@ def _cmd_telegram_classify_dryrun(config: AppConfig, args, *,
         classify_noise,
     )
     from knowledge_ingest.telegram.items import SourceItemPipeline
+    from knowledge_ingest.telegram.learned import LearnedRuleIndex
 
     store = _open_telegram_store(config, create=False)
     if store is None:
@@ -1923,6 +1949,7 @@ def _cmd_telegram_classify_dryrun(config: AppConfig, args, *,
                   "(set KI_TELEGRAM_LLM_CMD)", file=sys.stderr)
             return 2
     pipeline = SourceItemPipeline(store, data_root=config.pipeline_root)
+    learned_idx = LearnedRuleIndex.load(store)
     rows = [row for row in store.list_source_items()
             if row["processing_status"] in ("noise_review",
                                             "interest_review")]
@@ -1951,12 +1978,14 @@ def _cmd_telegram_classify_dryrun(config: AppConfig, args, *,
                                             if source else None),
                 }
                 decision = classify_interest(meta, llm=channel,
-                                             source_id=row["source_id"])
+                                             source_id=row["source_id"],
+                                             learned=learned_idx)
                 label, reason = decision.decision, decision.reason
             else:
                 decision = classify_noise(pipeline.live_text(row["item_id"]),
                                           llm=channel,
-                                          source_id=row["source_id"])
+                                          source_id=row["source_id"],
+                                          learned=learned_idx)
                 label, reason = decision.decision, decision.reason_code
         except Exception as exc:            # noqa: BLE001 —— 试跑不中断
             print(f"{row['item_id']:20} ERROR  {exc}")
@@ -1972,6 +2001,74 @@ def _cmd_telegram_classify_dryrun(config: AppConfig, args, *,
           f"mean {elapsed_total / max(counted, 1):.1f}s; "
           f"decisions={decisions or '{}'}")
     print("note: nothing was written (no budget, no item status change)")
+    return 0
+
+
+def _cmd_telegram_rules_distill(config: AppConfig, args) -> int:
+    """V2.2：把高置信 SKIP 判决蒸馏为学习规则（默认预览，--apply 激活）。"""
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+    from knowledge_ingest.telegram.learned import collect_skip_candidates
+
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("telegram state not initialized (no state.db)")
+        return 0
+    pipeline = SourceItemPipeline(store, data_root=config.pipeline_root)
+    candidates = collect_skip_candidates(
+        store, pipeline, min_confidence=args.min_confidence)
+    if getattr(args, "source", "all") != "all":
+        candidates = [c for c in candidates if c["source"] == args.source]
+    if not candidates:
+        print("no new SKIP fingerprints to distill")
+        return 0
+    print(f"{'fingerprint':16} {'source':6} {'conf':5} {'n':3} "
+          f"reason_code / preview")
+    for cand in candidates:
+        print(f"{cand['fingerprint'][:14]}.. {cand['source']:6} "
+              f"{cand['confidence']:<5} {len(cand['evidence']):<3} "
+              f"{cand['reason_code']} / {cand['preview']}")
+    if not getattr(args, "apply", False):
+        print(f"\npreview: {len(candidates)} candidate rule(s); "
+              "re-run with --apply to activate")
+        return 0
+    inserted = 0
+    for cand in candidates:
+        if store.create_learned_rule(
+                "fingerprint", cand["fingerprint"],
+                reason_code=cand["reason_code"], source=cand["source"],
+                confidence=cand["confidence"],
+                evidence=cand["evidence"]) is not None:
+            inserted += 1
+    print(f"\napplied: {inserted} new learned rule(s) active "
+          f"({len(candidates) - inserted} already existed)")
+    return 0
+
+
+def _cmd_telegram_rules_list(config: AppConfig, args) -> int:
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("telegram state not initialized (no state.db)")
+        return 0
+    rules = store.list_learned_rules()
+    if not rules:
+        print("no learned rules yet (run rules-distill)")
+        return 0
+    print(f"{'id':4} {'type':12} {'active':6} {'source':6} "
+          f"reason_code / pattern")
+    for rule in rules:
+        print(f"{rule['rule_id']:<4} {rule['rule_type']:12} "
+              f"{bool(rule['active']):<6} {rule['source']:6} "
+              f"{rule['reason_code']} / {rule['pattern'][:24]}")
+    return 0
+
+
+def _cmd_telegram_rules_disable(config: AppConfig, args) -> int:
+    store = _open_telegram_store(config, create=False)
+    if store is None:
+        print("telegram state not initialized (no state.db)")
+        return 0
+    store.set_learned_rule_active(args.rule_id, False)
+    print(f"learned rule #{args.rule_id} deactivated")
     return 0
 
 

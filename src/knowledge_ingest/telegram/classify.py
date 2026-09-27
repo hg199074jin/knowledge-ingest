@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 POLICY_VERSION = "tg-v2.1"
-CLASSIFIER_VERSION = "rules+injectable-llm-1"
+CLASSIFIER_VERSION = "rules+learned-1"
 
 NOISE_DECISIONS = ("KEEP", "SKIP", "REVIEW")
 INTEREST_DECISIONS = ("INCLUDE", "EXCLUDE", "REVIEW")
@@ -152,11 +152,18 @@ def _budget_call(budget, source_id, kind):
 
 
 def classify_noise(text: str | None, *, llm=None, budget=None,
-                   source_id: str = "") -> NoiseDecision:
-    """TEXT 噪声判定：规则优先，LLM 只接疑似边界。"""
+                   source_id: str = "", learned=None) -> NoiseDecision:
+    """TEXT 噪声判定：学习规则 → 静态规则 → LLM 疑似边界。"""
     content = (text or "").strip()
     if not content:
         return NoiseDecision("REVIEW", "empty_text", 0.0)
+    # V2.2 学习规则短路：已知广告指纹 0 次调用，先于白名单
+    # （障眼法广告常绕过疑似信号，若不先查会掉进 whitelist KEEP）
+    if learned is not None:
+        hit = learned.match(content)
+        if hit is not None:
+            return NoiseDecision("SKIP", f"learned:{hit.reason_code}",
+                                 float(hit.confidence))
     hit = _rule_hit(content)
     if hit is not None:
         return NoiseDecision("SKIP", hit[0], 1.0)
@@ -190,16 +197,24 @@ def _settle(budget, source_id, kind, request_id, outcome) -> None:
 
 
 def classify_interest(pdf_meta: dict, *, llm=None, budget=None,
-                      source_id: str = "") -> InterestDecision:
+                      source_id: str = "", learned=None) -> InterestDecision:
     """PDF Interest 判定（下载前，仅凭可见元数据；§11.4）。
 
-    广告预筛直接 EXCLUDE（0 次调用）；信息不足或无通道 → REVIEW，
-    不猜测内容。
+    学习规则/广告预筛直接 EXCLUDE（0 次调用）；信息不足或无通道 →
+    REVIEW，不猜测内容。
     """
     caption = (pdf_meta.get("caption") or "").strip()
     filename = (pdf_meta.get("filename") or "").strip()
     source_name = (pdf_meta.get("source_display_name") or "").strip()
     visible = f"{caption}\n{filename}"
+    if learned is not None:
+        # 先匹配 caption 本身（复读广告的 caption 恒定、文件名常变），
+        # 再匹配 caption+filename 全文
+        hit = learned.match(caption) or learned.match(visible)
+        if hit is not None:
+            return InterestDecision("EXCLUDE", "",
+                                    f"learned:{hit.reason_code}",
+                                    float(hit.confidence))
     hit = _rule_hit(visible)
     if hit is not None:
         return InterestDecision("EXCLUDE", "ad", hit[0], 1.0)

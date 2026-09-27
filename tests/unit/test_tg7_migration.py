@@ -134,7 +134,12 @@ def test_tg7_migration_backfills_and_extends(tmp_path):
     db = tmp_path / "state.db"
     _make_v1_db(db)
     store = TelegramEventStore(db)
-    assert store.user_version() == SCHEMA_VERSION == 2
+    # 1→2 迁移后由幂等 _SCHEMA 补齐至当前版本（V2.2 起为 3，
+    # 新增 learned_rules 表）
+    assert store.user_version() == SCHEMA_VERSION == 3
+    assert store._conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='learned_rules'").fetchone() is not None
 
     # 存量误标回填：mime=video/mp4 的 pdf → video
     row = store.get_source_item("tg_a:10")
@@ -153,7 +158,7 @@ def test_tg7_migration_backfills_and_extends(tmp_path):
     # 迁移幂等：重开同一库不再变化
     store.close()
     store2 = TelegramEventStore(db)
-    assert store2.user_version() == 2
+    assert store2.user_version() == SCHEMA_VERSION
     store2.close()
 
 
