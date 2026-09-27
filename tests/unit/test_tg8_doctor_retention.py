@@ -1,6 +1,5 @@
 """TG8：telegram doctor（只读体检）与 retention（SKIP 载荷清理）。"""
 
-import pathlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -37,11 +36,12 @@ def healthy_store(tmp_path, monkeypatch):
 
     _os.chmod(sess / "session.session", 0o600)
     real_is_dir = Path.is_dir
+    # hermetic 基线：ORICO 指向 tmp 下真实存在的目录（本地/CI 同构）
+    orico = tmp_path / "orico"
+    orico.mkdir()
+    monkeypatch.setattr(doctor, "ORICO_ROOT", orico)
     monkeypatch.setattr(
-        doctor, "ORICO_ROOT", pathlib.Path("/Volumes/ORICO"))
-    monkeypatch.setattr(
-        doctor, "orico_online",
-        lambda: real_is_dir(pathlib.Path("/Volumes/ORICO")))
+        doctor, "orico_online", lambda: real_is_dir(orico))
     store = TelegramEventStore(config.pipeline_root / "telegram" / "state.db")
     store.add_source("tg_a", chat_id=-1, start_at=None, display_name="A")
     # 最新 reconcile 时间

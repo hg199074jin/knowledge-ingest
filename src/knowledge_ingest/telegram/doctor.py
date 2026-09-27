@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import stat
 from datetime import UTC, datetime, timedelta
@@ -19,7 +20,8 @@ from .event_store import SCHEMA_VERSION, TelegramEventStore
 
 RECONCILE_STALE_SECONDS = 1800
 NOTIFY_UNDELIVERED_WARN = 5
-ORICO_ROOT = Path("/Volumes/ORICO")
+ORICO_ROOT = Path(os.environ.get(
+    "KI_TELEGRAM_ORICO_ROOT", "/Volumes/ORICO"))  # CI/测试可覆盖；生产默认 fail-closed
 
 
 def orico_online() -> bool:
@@ -72,7 +74,7 @@ def run_checks(config: AppConfig, *,
     # 4 ORICO 在线（经 orico_online() 间接判断，测试可拦截）
     online = orico_online()
     checks.append(_check("ORICO 在线", "PASS" if online else "FAIL",
-                         "/Volumes/ORICO"))
+                         str(ORICO_ROOT)))
 
     # 5-16 state.db 各项
     checks.append(_check("state.db 存在", "PASS", str(db_path)))

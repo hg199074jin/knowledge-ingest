@@ -16,6 +16,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # CI 无 /Volumes/ORICO：数据根检查指向工作区（fail-closed 语义保留）
+      KI_TELEGRAM_ORICO_ROOT: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5

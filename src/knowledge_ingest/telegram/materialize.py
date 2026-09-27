@@ -10,7 +10,8 @@ from pathlib import Path
 
 from knowledge_ingest.fingerprint import fingerprint_file
 
-ORICO_ROOT = Path("/Volumes/ORICO")
+ORICO_ROOT = Path(os.environ.get(
+    "KI_TELEGRAM_ORICO_ROOT", "/Volumes/ORICO"))  # CI/测试可覆盖；生产默认 fail-closed
 TEXT_HEADER = "# Telegram Knowledge Item"
 MAX_AUTO_DOWNLOAD_BYTES = 50 * 1024 * 1024  # §12：≤50 MiB 自动，>50 需授权
 MAX_DOWNLOAD_ATTEMPTS = 5  # I2：毒丸熔断阈值（超限转人工 REVIEW）
