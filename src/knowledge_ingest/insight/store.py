@@ -158,9 +158,14 @@ CREATE TABLE IF NOT EXISTS trend_clusters (
     trend_key    TEXT NOT NULL UNIQUE,
     signal_count INTEGER NOT NULL DEFAULT 0,
     status       TEXT NOT NULL DEFAULT 'open',
+    meta_json    TEXT NOT NULL DEFAULT '{"independent": false}',
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
+
+-- WATCH 信号去重：重复扫描同 (key, source, revision) 不重复计数
+CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_signals_dedupe
+    ON watch_signals(trend_key, insight_source_id, source_revision);
 
 CREATE TABLE IF NOT EXISTS approved_cognition (
     record_id   TEXT PRIMARY KEY,
@@ -529,3 +534,55 @@ class InsightStore:
                        SET calls = 0, attempts = 0, consecutive_empty = 0,
                            consecutive_rate_limit = 0, consecutive_error = 0
                        WHERE stage = ?""", (stage,))
+
+    # ---------- watch signals / trend clusters（M4） ----------
+
+    def add_watch_signal(self, insight_source_id: str, source_revision: int,
+                         trend_key: str, reason: str = "",
+                         created_at: str | None = None) -> bool:
+        """插入 WATCH 信号；(trend_key, source, revision) 重复 → False。"""
+        try:
+            with self._conn:
+                self._conn.execute(
+                    """INSERT INTO watch_signals
+                       (insight_source_id, source_revision, trend_key,
+                        reason, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (insight_source_id, source_revision, trend_key, reason,
+                     created_at or _now_iso(), created_at or _now_iso()))
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    def count_watch_signals(self, trend_key: str, since_iso: str) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM watch_signals "
+            "WHERE trend_key = ? AND created_at >= ?",
+            (trend_key, since_iso)).fetchone()[0]
+
+    def upsert_trend_cluster(self, trend_key: str, signal_count: int, *,
+                             ready: bool) -> str:
+        cluster_id = "trend." + hashlib.sha256(
+            trend_key.encode("utf-8")).hexdigest()[:12]
+        now = _now_iso()
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO trend_clusters
+                   (cluster_id, trend_key, signal_count, status,
+                    meta_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(trend_key) DO UPDATE SET
+                       signal_count = excluded.signal_count,
+                       status = excluded.status,
+                       meta_json = excluded.meta_json,
+                       updated_at = excluded.updated_at""",
+                (cluster_id, trend_key, signal_count,
+                 "ready" if ready else "open",
+                 '{"independent": false}', now, now))
+        return cluster_id
+
+    def list_ready_clusters(self, threshold: int) -> list:
+        return self._conn.execute(
+            """SELECT * FROM trend_clusters
+               WHERE signal_count >= ? AND status = 'ready'
+               ORDER BY signal_count DESC""", (threshold,)).fetchall()
