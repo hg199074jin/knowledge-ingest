@@ -182,6 +182,16 @@ CREATE TABLE IF NOT EXISTS insight_ai_budget (
     consecutive_error      INTEGER NOT NULL DEFAULT 0
 );
 
+-- 预算 permit 幂等（M3）：request_id 重放不重复计数
+CREATE TABLE IF NOT EXISTS insight_ai_permits (
+    stage      TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    outcome    TEXT,
+    created_at TEXT NOT NULL,
+    settled_at TEXT,
+    PRIMARY KEY (stage, request_id)
+);
+
 CREATE TABLE IF NOT EXISTS insight_digest_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -432,3 +442,90 @@ class InsightStore:
         return self._conn.execute(
             "SELECT * FROM insight_runs WHERE run_id = ?",
             (run_id,)).fetchone()
+
+    # ---------- insight AI budget persistence（M3） ----------
+
+    def acquire_budget_permit(self, stage: str, request_id: str) -> bool:
+        """创建 permit（幂等）；返回是否为新建。"""
+        try:
+            with self._conn:
+                self._conn.execute(
+                    """INSERT INTO insight_ai_permits
+                       (stage, request_id, created_at) VALUES (?, ?, ?)""",
+                    (stage, request_id, _now_iso()))
+        except sqlite3.IntegrityError:
+            return False
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO insight_ai_budget (stage, attempts)
+                   VALUES (?, 1)
+                   ON CONFLICT(stage) DO UPDATE SET
+                       attempts = attempts + 1""", (stage,))
+        return True
+
+    def get_budget_permit(self, stage: str, request_id: str):
+        return self._conn.execute(
+            "SELECT * FROM insight_ai_permits "
+            "WHERE stage = ? AND request_id = ?",
+            (stage, request_id)).fetchone()
+
+    def settle_budget_permit(self, stage: str, request_id: str,
+                             outcome: str) -> None:
+        with self._conn:
+            cursor = self._conn.execute(
+                """UPDATE insight_ai_permits
+                   SET outcome = ?, settled_at = ?
+                   WHERE stage = ? AND request_id = ? AND outcome IS NULL""",
+                (outcome, _now_iso(), stage, request_id))
+        if cursor.rowcount == 0:
+            raise ValueError(
+                f"budget permit not open: {stage}:{request_id}")
+
+    def bump_budget_outcome(self, stage: str, outcome: str) -> None:
+        """更新 stage 计数：success 清零连续计数，其余按类型连续累计。"""
+        if outcome not in ("success", "empty", "rate_limit", "error"):
+            raise ValueError(f"unknown budget outcome: {outcome!r}")
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO insight_ai_budget (stage) VALUES (?)
+                   ON CONFLICT(stage) DO NOTHING""", (stage,))
+            if outcome == "success":
+                self._conn.execute(
+                    """UPDATE insight_ai_budget
+                       SET calls = calls + 1, consecutive_empty = 0,
+                           consecutive_rate_limit = 0, consecutive_error = 0
+                       WHERE stage = ?""", (stage,))
+            else:
+                column = {"empty": "consecutive_empty",
+                          "rate_limit": "consecutive_rate_limit",
+                          "error": "consecutive_error"}[outcome]
+                others = {"empty": ("consecutive_rate_limit",
+                                    "consecutive_error"),
+                          "rate_limit": ("consecutive_empty",
+                                         "consecutive_error"),
+                          "error": ("consecutive_empty",
+                                    "consecutive_rate_limit")}[outcome]
+                self._conn.execute(
+                    f"""UPDATE insight_ai_budget
+                        SET {column} = {column} + 1,
+                            {others[0]} = 0, {others[1]} = 0
+                        WHERE stage = ?""", (stage,))
+
+    def get_budget_row(self, stage: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM insight_ai_budget WHERE stage = ?",
+            (stage,)).fetchone()
+
+    def reset_budget(self, stage: str | None = None) -> None:
+        with self._conn:
+            if stage is None:
+                self._conn.execute(
+                    """UPDATE insight_ai_budget
+                       SET calls = 0, attempts = 0, consecutive_empty = 0,
+                           consecutive_rate_limit = 0, consecutive_error = 0""")
+            else:
+                self._conn.execute(
+                    """UPDATE insight_ai_budget
+                       SET calls = 0, attempts = 0, consecutive_empty = 0,
+                           consecutive_rate_limit = 0, consecutive_error = 0
+                       WHERE stage = ?""", (stage,))
