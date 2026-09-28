@@ -150,7 +150,7 @@ def test_critic_failure_yields_blocked_not_summary_card():
 def test_outcome_retains_full_audit_trail():
     """M6 复核②：Outcome 保留 initial draft/review 与 revision
     instructions——needs_review 必须可解释。"""
-    orch, thinker, _ = make_orchestrator(
+    orch, _thinker, _ = make_orchestrator(
         [dict(CRITIC_FAIL), dict(CRITIC_PASS)])
     outcome = orch.run(PACK)
     assert outcome.initial_draft == DRAFT

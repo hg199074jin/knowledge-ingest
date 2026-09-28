@@ -172,14 +172,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_signals_dedupe
     ON watch_signals(trend_key, insight_source_id, source_revision);
 
 CREATE TABLE IF NOT EXISTS approved_cognition (
-    record_id   TEXT PRIMARY KEY,
-    proposal_id TEXT NOT NULL,
-    domain      TEXT,
-    cognition   TEXT NOT NULL,
-    state       TEXT NOT NULL DEFAULT 'CONFIRMED',
-    source_ref  TEXT,
-    approved_at TEXT NOT NULL,
-    approved_by TEXT NOT NULL DEFAULT 'human_gate'
+    record_id       TEXT PRIMARY KEY,
+    proposal_id     TEXT NOT NULL,
+    domain          TEXT,
+    cognition       TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'CONFIRMED',
+    source_ref      TEXT,
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    approved_at     TEXT NOT NULL,
+    approved_by     TEXT NOT NULL DEFAULT 'human_gate'
 );
 
 CREATE TABLE IF NOT EXISTS insight_ai_budget (
@@ -664,19 +665,72 @@ class InsightStore:
     def upsert_approved_cognition(self, record_id: str, proposal_id: str,
                                   cognition: str, *, domain: str | None,
                                   approved_at: str,
-                                  approved_by: str = "human_gate") -> None:
+                                  approved_by: str = "human_gate",
+                                  provenance_json: str = "{}") -> None:
         with self._conn:
             self._conn.execute(
                 """INSERT INTO approved_cognition
                    (record_id, proposal_id, domain, cognition, state,
-                    source_ref, approved_at, approved_by)
-                   VALUES (?, ?, ?, ?, 'CONFIRMED', NULL, ?, ?)
+                    source_ref, provenance_json, approved_at, approved_by)
+                   VALUES (?, ?, ?, ?, 'CONFIRMED', NULL, ?, ?, ?)
                    ON CONFLICT(record_id) DO UPDATE SET
                        cognition = excluded.cognition,
                        proposal_id = excluded.proposal_id,
+                       provenance_json = excluded.provenance_json,
                        approved_at = excluded.approved_at""",
-                (record_id, proposal_id, domain, cognition, approved_at,
-                 approved_by))
+                (record_id, proposal_id, domain, cognition, provenance_json,
+                 approved_at, approved_by))
+
+    def save_proposal(self, proposal) -> None:
+        """持久化 Proposal（同 proposal_id 幂等）。"""
+        payload = {
+            "source_item_id": proposal.source_item_id,
+            "context_pack_id": proposal.context_pack_id,
+            "proposed_cognition": proposal.proposed_cognition,
+            "old_cognition": list(proposal.old_cognition),
+            "reasons": list(proposal.reasons),
+            "evidence_refs": list(proposal.evidence_refs),
+            "related_cognition_refs": list(proposal.related_cognition_refs),
+            "card_path": proposal.card_path,
+            "domain": proposal.domain,
+        }
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO cognition_proposals
+                   (proposal_id, card_id, insight_source_id,
+                    source_revision, change_type, proposal_json,
+                    gate_status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                   ON CONFLICT(proposal_id) DO NOTHING""",
+                (proposal.proposal_id, proposal.card_id,
+                 proposal.insight_source_id, proposal.source_revision,
+                 proposal.change_type,
+                 json.dumps(payload, ensure_ascii=False), _now_iso()))
+
+    def get_proposal(self, proposal_id: str):
+        return self._conn.execute(
+            "SELECT * FROM cognition_proposals WHERE proposal_id = ?",
+            (proposal_id,)).fetchone()
+
+    def resolve_gate(self, proposal_id: str, decision: str, *,
+                     gate_status: str, resolved_by: str) -> None:
+        """落 gate 决策；已有决策时幂等跳过（冲突检测在 Gate 层）。"""
+        with self._conn:
+            cursor = self._conn.execute(
+                """UPDATE cognition_proposals
+                   SET gate_status = ?, gate_decision = ?,
+                       gate_decision_source = ?, gate_resolved_at = ?
+                   WHERE proposal_id = ? AND gate_decision IS NULL""",
+                (gate_status, decision, resolved_by, _now_iso(),
+                 proposal_id))
+        if (cursor.rowcount == 0
+                and self.get_proposal(proposal_id) is None):
+            raise ValueError(f"proposal not found: {proposal_id}")
+
+    def list_watch_signals_for_source(self, insight_source_id: str) -> list:
+        return self._conn.execute(
+            "SELECT * FROM watch_signals WHERE insight_source_id = ? "
+            "ORDER BY created_at", (insight_source_id,)).fetchall()
 
     def list_approved_cognition(self) -> list:
         return self._conn.execute(
