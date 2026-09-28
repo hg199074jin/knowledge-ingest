@@ -13,6 +13,8 @@ final_verdict（CARD|ARCHIVE|REJECT——深思后允许否决，即使已过 Va
 
 from __future__ import annotations
 
+import re
+
 from .model_port import ModelBadOutputError
 from .models import (
     COGNITION_DELTA_TYPES,
@@ -34,10 +36,21 @@ PROTOCOL_DIRECTIVE = (
     "4 Reconstruct：转化为用户自己的版本——不引用原作者金句、不模仿原文"
     "结构、不停留在摘要；从第一性原理重新表达机制，产出未来可直接复用的"
     "判断原则。\n"
+    "4.5 机制打捞（mechanism salvage）：在指出来源证据不足、边界和反例"
+    "之后，必须仍然回答——即使把夸张部分拿掉，剩下值得保留的机制/假设"
+    "是什么？证据不足时提炼'待验证的机制假设'，而不是只剩谨慎提醒；"
+    "批判不等于清空。\n"
     "5 Decide：认知变化（新增/强化/修正/推翻/无变化）、商业机会判断、"
     "行动（最多 3 个，允许 ARCHIVE/REJECT）。\n"
     "Evidence before Advice：先证据后建议。旧认知只是个人主张，允许被"
-    "新证据修正或推翻。")
+    "新证据修正或推翻。\n\n"
+    "行动语义（label 必须与正文行为一致，M6 复核④冻结）：\n"
+    "- NONE：无需行动；\n"
+    "- WATCH：等待新的外部证据/条件触发，本人暂不主动验证——必须写明"
+    "触发条件，禁止编造任何时间点（如'三个月后'）；\n"
+    "- EXPERIMENT：主动做一个低成本验证——必须写明验证什么与判停条件；\n"
+    "- IMMEDIATE：已有足够条件直接应用。\n"
+    "给 WATCH 写'去主动选任务做验证'之类的正文是标签错误。")
 
 
 def _bad(message: str) -> ModelBadOutputError:
@@ -62,8 +75,10 @@ class PersonalThinkingEngine:
             "protocol": PROTOCOL_DIRECTIVE,
             "output_contract": (
                 '只输出一个 JSON 对象，字段与类型：'
-                '{"bottom_line": str, "source_understanding": str, '
-                '"mechanism": str, "challenge": str, '
+                '{"title": str（≤40 字的认知命题，作卡片标题，不得与 '
+                'bottom_line 全文相同）, "bottom_line": str, '
+                '"source_understanding": str, "mechanism": str, '
+                '"challenge": str, '
                 '"personal_connections": [{"record_id": str, '
                 '"connection": str}], "project_impacts": '
                 '[{"project": str, "impact": str}], '
@@ -77,10 +92,14 @@ class PersonalThinkingEngine:
                 "不要输出 JSON 以外的任何文字。无商业机会则 "
                 "business_opportunity=null；challenge 无实质内容就给空串。"),
             "kind_notes": (
-                "personal_connections 只能引用 pack.personal_context 中的 "
-                "record_id；connection 必须说明真实因果（为什么它影响本次"
-                "判断），主题级硬关联无效。market_opportunity 与 "
-                "personal_opportunity 必须分开判断。"),
+                "personal_connections 必须覆盖 pack.personal_context 中的"
+                "每一条记录（每条恰好一个条目）：能建立真实因果就写它"
+                "具体改变/条件化哪个判断维度；确实不受影响也要写明为什么"
+                "不受影响——禁止只字不提（这是上下文丢失）。"
+                "connection 只能引用 pack.personal_context 中的 record_id，"
+                "主题级硬关联无效。批判之后仍须完成机制打捞：指出证据不足"
+                "的同时，把值得保留的机制/假设放进 own_version。"
+                "market_opportunity 与 personal_opportunity 必须分开判断。"),
             "pack": {
                 "source_claims": list(pack.source_claims),
                 "source_evidence": list(pack.source_evidence),
@@ -100,16 +119,20 @@ class PersonalThinkingEngine:
         if extra is not None:
             payload["revision"] = extra
         raw = self.model_port.run("thinking", payload)
-        return self._parse(raw)
+        thought = self._parse(raw)
+        self._validate_connections(thought, pack)
+        self._validate_watch_no_timepoints(thought)
+        return thought
 
     @staticmethod
     def _parse(raw) -> dict:
         if not isinstance(raw, dict):
             raise _bad("output is not an object")
-        required = ("bottom_line", "source_understanding", "mechanism",
-                    "challenge", "personal_connections", "project_impacts",
-                    "business_opportunity", "own_version", "cognition_delta",
-                    "actions", "human_gate_recommendation", "final_verdict")
+        required = ("title", "bottom_line", "source_understanding",
+                    "mechanism", "challenge", "personal_connections",
+                    "project_impacts", "business_opportunity",
+                    "own_version", "cognition_delta", "actions",
+                    "human_gate_recommendation", "final_verdict")
         missing = [k for k in required if k not in raw]
         if missing:
             raise _bad(f"missing fields: {missing}")
@@ -147,8 +170,43 @@ class PersonalThinkingEngine:
             raise _bad(
                 "business_opportunity requires market_opportunity and "
                 "personal_opportunity")
-        for key in ("bottom_line", "source_understanding", "mechanism",
-                    "own_version"):
+        for key in ("title", "bottom_line", "source_understanding",
+                    "mechanism", "own_version"):
             if not str(raw.get(key, "")).strip():
                 raise _bad(f"{key} must be non-empty")
+        if str(raw["title"]).strip() == str(raw["bottom_line"]).strip():
+            raise _bad("title must differ from bottom_line "
+                       "(renderer splits H1 vs conclusion)")
         return dict(raw)
+
+    @staticmethod
+    def _validate_connections(raw: dict, pack: EvidencePack) -> None:
+        """连接完整性强制（M6 复核①的 Thinker 侧修复）：
+        pack 中每条 ref 恰好一个连接条目——缺条即上下文丢失。"""
+        expected = {r.record_id for r in pack.personal_context}
+        got = [c.get("record_id") for c in raw["personal_connections"]]
+        missing = sorted(expected - set(got))
+        if missing:
+            raise _bad(
+                "personal_connections must cover every context ref; "
+                f"missing: {missing}")
+        extra = sorted(set(got) - expected)
+        if extra:
+            raise _bad(f"connections reference unknown records: {extra}")
+        seen = set()
+        for conn in raw["personal_connections"]:
+            rid = conn.get("record_id")
+            if rid in seen:
+                raise _bad(f"duplicate connection for {rid!r}")
+            seen.add(rid)
+
+    @staticmethod
+    def _validate_watch_no_timepoints(raw: dict) -> None:
+        """M6 复核④：WATCH 禁止编造时间点（如'三个月后'）。"""
+        pattern = re.compile(r"[一二三四五六七八九十\d]+\s*(?:天|周|个?月|年)后")
+        for action in raw["actions"]:
+            if action["action"] == "WATCH" and pattern.search(
+                    action["detail"]):
+                raise _bad(
+                    "WATCH actions must use condition triggers, not "
+                    f"fabricated timepoints: {action['detail']!r}")

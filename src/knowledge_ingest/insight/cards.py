@@ -48,8 +48,15 @@ def insight_card_path(insight_root: Path, view: InsightSourceView, *,
 
 def render_card_markdown(view: InsightSourceView, pack: EvidencePack,
                          thought: dict, *, quality_status: str,
-                         human_gate: str = "pending") -> str:
-    """自适应渲染：后台契约已由 Thinker/Critic 保证，前台按内容取舍。"""
+                         human_gate: str = "pending",
+                         context_pack_id: str | None = None) -> str:
+    """自适应渲染：后台契约已由 Thinker/Critic 保证，前台按内容取舍。
+
+    M6 复核⑤：H1=短认知命题（thought.title），"## 结论"=完整
+    bottom_line——两者不得原样重复。
+    M6 复核①：frontmatter 带 context_pack_id（追溯链
+    source_revision → context_pack_id → context_refs → card）。
+    """
     delta = thought["cognition_delta"]
     actions = thought.get("actions", [])
     action_state = actions[0]["action"] if actions else "NONE"
@@ -63,6 +70,7 @@ def render_card_markdown(view: InsightSourceView, pack: EvidencePack,
         "---",
         f"source: {view.provider}",
         f"source_item_id: {view.source_item_id}",
+        f"context_pack_id: {context_pack_id or 'none'}",
         f"topics: {json.dumps(_topics(pack), ensure_ascii=False)}",
         f"value_type: {json.dumps(_topics(pack), ensure_ascii=False)}",
         f"cognition_delta: {delta}",
@@ -72,7 +80,7 @@ def render_card_markdown(view: InsightSourceView, pack: EvidencePack,
         f"human_gate: {human_gate}",
         "---",
         "",
-        f"# {view.title or thought['bottom_line']}",
+        f"# {thought['title']}",
         "",
         "## 结论",
         "",
@@ -150,7 +158,8 @@ class DeepInsightCardWriter:
 
     def write(self, *, view: InsightSourceView, pack: EvidencePack,
               thought: dict, quality_status: str, now: str,
-              human_gate: str = "pending") -> Path:
+              human_gate: str = "pending",
+              context_pack_id: str | None = None) -> Path:
         if quality_status not in ("passed", "needs_review"):
             raise ValueError(f"invalid quality_status: {quality_status!r}")
         card_id = card_id_for(view.source_item_id, view.source_revision,
@@ -159,7 +168,8 @@ class DeepInsightCardWriter:
                                  now=now)
         markdown = render_card_markdown(view, pack, thought,
                                         quality_status=quality_status,
-                                        human_gate=human_gate)
+                                        human_gate=human_gate,
+                                        context_pack_id=context_pack_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".md.tmp")
         tmp.write_text(markdown, encoding="utf-8")

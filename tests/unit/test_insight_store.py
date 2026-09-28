@@ -132,6 +132,27 @@ def test_distinct_sources_get_distinct_ids(tmp_path):
 
 # ---------- decisions bind revision / idempotent ----------
 
+def test_context_pack_id_stable_and_content_addressed(tmp_path):
+    """M6 复核①：pack_id 内容寻址、同 refs 稳定、refs 变则 id 变、
+    get_context_pack 返回可追溯三元组。"""
+    store = make_store(tmp_path)
+    sid = store.register_source_view(make_view())
+    ref_a = PersonalContextRef(record_id="PC-001",
+                               relation_reason="改变判定层边界",
+                               state="CONFIRMED", relation="CONDITIONING")
+    ref_b = PersonalContextRef(record_id="PC-002",
+                               relation_reason="r2", state="TENTATIVE")
+    pack_id_1 = store.replace_context_refs(sid, (ref_a, ref_b))
+    assert pack_id_1.startswith("ctxpack.")
+    assert store.replace_context_refs(sid, (ref_a, ref_b)) == pack_id_1
+    pack_id_2 = store.replace_context_refs(sid, (ref_b,))
+    assert pack_id_2 != pack_id_1
+    pack = store.get_context_pack(sid)
+    assert pack.pack_id == pack_id_2
+    assert pack.source_revision == 1
+    assert [r.record_id for r in pack.refs] == ["PC-002"]
+
+
 def test_candidate_decision_idempotent_and_revision_bound(tmp_path):
     store = make_store(tmp_path)
     sid = store.register_source_view(make_view())

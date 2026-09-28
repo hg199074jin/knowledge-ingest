@@ -47,6 +47,13 @@ CONTEXT_RELATION_TYPES = ("DIRECT", "CONDITIONING", "CONFLICT")
 
 COGNITION_DELTA_TYPES = ("ADD", "REINFORCE", "REVISE", "OVERTURN", "NONE")
 
+ACTION_TYPE_DEFINITIONS = {
+    "NONE": "无需行动",
+    "WATCH": "等待新的外部证据/条件触发，本人暂不主动验证（须写明触发条件，禁止编造时间点）",
+    "EXPERIMENT": "主动进行一个低成本验证（须写明验证什么与判停条件）",
+    "IMMEDIATE": "已有足够条件直接应用",
+}
+
 THINKING_ACTION_TYPES = ("IMMEDIATE", "EXPERIMENT", "WATCH", "NONE")
 
 
@@ -205,6 +212,19 @@ class PersonalContextRef:
 
 
 @dataclass(frozen=True)
+class ContextPack:
+    """已持久化的 Personal Context Pack（M6 复核①：稳定 ID 可追溯）。
+
+    source_revision → context_pack_id → refs → card 的追溯链锚点。
+    """
+
+    pack_id: str
+    insight_source_id: str
+    source_revision: int
+    refs: tuple = ()
+
+
+@dataclass(frozen=True)
 class EvidencePack:
     """Evidence Pack（设计 §12）：个人主张与源证据严格分离。
 
@@ -223,7 +243,12 @@ class EvidencePack:
 
 @dataclass(frozen=True)
 class CriticResult:
-    """Quality Critic 输出（设计 §18.2/§18.3；实施方案 Task 6 Step 5）。"""
+    """Quality Critic 输出（设计 §18.2/§18.3；M6 复核新增 mechanism_salvage）。
+
+    mechanism_salvage（M6 复核③冻结）：批判证据不足之后是否仍提炼出
+    "即使拿掉夸张部分，剩下值得保留的机制/假设"——防止退化成
+    "高级怀疑式摘要器"。
+    """
 
     source_understanding: str = "unknown"
     critical_reasoning: str = "unknown"
@@ -233,6 +258,7 @@ class CriticResult:
     actionability: str = "unknown"
     business_rigor: str = "unknown"
     traceability: str = "unknown"
+    mechanism_salvage: str = "unknown"
     genericity_detected: bool = False
     revision_required: bool = False
     revision_instructions: tuple[str, ...] = ()

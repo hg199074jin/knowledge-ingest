@@ -50,12 +50,14 @@ def make_pack(**overrides) -> EvidencePack:
 
 
 THOUGHT = {
+    "title": "Jev 范式映射为三级决策结构",
     "bottom_line": "Jev 范式在本管道的映射是第三层判定",
     "source_understanding": "作者主张判定式模型承接 Agent 高频小决策",
     "mechanism": "成本差两个数量级 → 决策迁移",
     "challenge": "误判率数据缺失；DomA 案例显示纯 LLM 仍最稳",
     "personal_connections": [
         {"record_id": "PC-001", "connection": "两级筛选架构可扩展为三级"}],
+    # pack 仅含 PC-001 → 完整性满足
     "project_impacts": [
         {"project": "knowledge-ingest", "impact": "budget_denied 下降"}],
     "business_opportunity": None,
@@ -189,6 +191,51 @@ def test_revise_includes_draft_and_instructions():
     _, payload = port.calls[1]
     assert "personal_connections 缺少真实因果" in str(payload)
     assert "Jev 范式" in str(payload)          # 上一稿随附
+
+
+def test_title_required_and_must_differ_from_bottom_line():
+    engine, _ = make_engine([dict(THOUGHT, title="")])
+    with pytest.raises(ModelBadOutputError):
+        engine.think(make_pack())
+    engine2, _ = make_engine([dict(THOUGHT, title=THOUGHT["bottom_line"])])
+    with pytest.raises(ModelBadOutputError):
+        engine2.think(make_pack())
+
+
+def test_connections_must_cover_every_context_ref():
+    """M6 复核①的 Thinker 侧修复：pack 每条 ref 恰好一个连接，
+    缺条=上下文丢失=坏输出。"""
+    engine, _ = make_engine([dict(THOUGHT, personal_connections=[])])
+    with pytest.raises(ModelBadOutputError):
+        engine.think(make_pack())          # pack 有 PC-001，连接为空
+    dup = dict(THOUGHT, personal_connections=[
+        {"record_id": "PC-001", "connection": "a"},
+        {"record_id": "PC-001", "connection": "b"}])
+    engine2, _ = make_engine([dup])
+    with pytest.raises(ModelBadOutputError):
+        engine2.think(make_pack())
+
+
+def test_unknown_connection_record_rejected():
+    bad = dict(THOUGHT, personal_connections=[
+        {"record_id": "PC-999", "connection": "硬关联"}])
+    engine, _ = make_engine([bad])
+    with pytest.raises(ModelBadOutputError):
+        engine.think(make_pack())
+
+
+def test_watch_action_forbids_fabricated_timepoints():
+    """M6 复核④：'三个月后再看'类无依据时间点必须被拒。"""
+    bad = dict(THOUGHT, actions=[
+        {"action": "WATCH", "detail": "三个月后若仍有相关任务再复查"}])
+    engine, _ = make_engine([bad])
+    with pytest.raises(ModelBadOutputError):
+        engine.think(make_pack())
+    ok = dict(THOUGHT, actions=[
+        {"action": "WATCH",
+         "detail": "当实际出现需要筛选该生态工具的任务时重新评估"}])
+    engine2, _ = make_engine([ok])
+    assert engine2.think(make_pack())["actions"][0]["action"] == "WATCH"
 
 
 def test_final_verdict_types_frozen():

@@ -22,7 +22,8 @@ from .models import CriticResult, EvidencePack
 
 _DIMENSIONS = ("source_understanding", "critical_reasoning",
                "personal_connection", "cognition_delta", "own_version",
-               "actionability", "business_rigor", "traceability")
+               "actionability", "business_rigor", "traceability",
+               "mechanism_salvage")
 _BOOL_FIELDS = ("genericity_detected", "revision_required")
 
 CRITIC_DIRECTIVE = (
@@ -35,6 +36,13 @@ CRITIC_DIRECTIVE = (
     "（持续关注/深入学习/积极探索）？\n"
     "8 商业机会是否只看收入案例？9 是否忽视相关旧认知状态？\n"
     "10 是否为凑模板强行制造反对意见？\n"
+    "11 机制打捞（mechanism_salvage）：在指出来源证据不足之后，是否仍然"
+    "提炼出了'即使拿掉夸张部分，剩下值得保留的机制/假设'？如果批判之后"
+    "只剩谨慎提醒、没有榨出任何待验证的机制假设 → mechanism_salvage=fail"
+    "（防止退化成'高级怀疑式摘要器'）。\n"
+    "12 行动标签与正文行为一致：WATCH 不得安排主动验证动作、不得编造"
+    "时间点（如'三个月后'，应改条件触发）；EXPERIMENT 必须是主动低成本"
+    "验证；不一致 → actionability=fail 并给出修正指令。\n"
     "两个硬测试：\n"
     "【陌生人测试】遮掉用户身份后，这份卡片能否原封不动发给任何一个"
     "喜欢 AI/商业的人？能 → genericity_detected=true（个性化失败）。\n"
@@ -61,8 +69,9 @@ class QualityCritic:
                 '"personal_connection": ..., "cognition_delta": ..., '
                 '"own_version": ..., "actionability": ..., '
                 '"business_rigor": ..., "traceability": ..., '
+                '"mechanism_salvage": ..., '
                 '"genericity_detected": bool, "revision_required": bool, '
-                '"revision_instructions": ["..."]}。8 个维度取值只能是 '
+                '"revision_instructions": ["..."]}。9 个维度取值只能是 '
                 "pass/partial/fail。不要输出 JSON 以外的任何文字。"),
             "source_material": {
                 "source_claims": list(pack.source_claims),
@@ -108,11 +117,19 @@ class QualityCritic:
 
 @dataclass(frozen=True)
 class ThinkingOutcome:
-    """深思编排结果：passed / needs_review / blocked（blocked 可恢复）。"""
+    """深思编排结果：passed / needs_review / blocked（blocked 可恢复）。
+
+    M6 复核②：保留完整审计链——initial_draft / initial_review /
+    revision_instructions / revised draft / final_review，needs_review
+    必须可解释。
+    """
 
     draft: dict
     final_review: CriticResult | None
     status: str
+    initial_draft: dict | None = None
+    initial_review: CriticResult | None = None
+    revision_instructions: tuple[str, ...] = ()
 
 
 class ThinkingOrchestrator:
@@ -130,24 +147,38 @@ class ThinkingOrchestrator:
         self.max_revisions = max_revisions
 
     def run(self, pack: EvidencePack) -> ThinkingOutcome:
-        draft = self.thinker.think(pack)
+        initial_draft = self.thinker.think(pack)
+        draft = initial_draft
         try:
-            review = self.critic.review(pack, draft)
+            initial_review = self.critic.review(pack, draft)
         except ModelBadOutputError:
             return ThinkingOutcome(draft=draft, final_review=None,
-                                   status="blocked")
+                                   status="blocked",
+                                   initial_draft=initial_draft)
+        instructions: tuple[str, ...] = ()
         revisions_left = self.max_revisions
-        while review.revision_required and revisions_left > 0:
+        while initial_review.revision_required and revisions_left > 0:
             revisions_left -= 1
-            draft = self.thinker.revise(pack, draft,
-                                        list(review.revision_instructions))
+            instructions = tuple(initial_review.revision_instructions)
+            draft = self.thinker.revise(pack, draft, list(instructions))
             try:
-                review = self.critic.review(pack, draft)
+                final_review = self.critic.review(pack, draft)
             except ModelBadOutputError:
-                return ThinkingOutcome(draft=draft, final_review=None,
-                                       status="blocked")
-        if review.revision_required:
-            return ThinkingOutcome(draft=draft, final_review=review,
-                                   status="needs_review")
-        return ThinkingOutcome(draft=draft, final_review=review,
-                               status="passed")
+                return ThinkingOutcome(
+                    draft=draft, final_review=None, status="blocked",
+                    initial_draft=initial_draft,
+                    initial_review=initial_review,
+                    revision_instructions=instructions)
+            break
+        else:
+            final_review = initial_review
+        if final_review.revision_required:
+            return ThinkingOutcome(
+                draft=draft, final_review=final_review,
+                status="needs_review", initial_draft=initial_draft,
+                initial_review=initial_review,
+                revision_instructions=instructions)
+        return ThinkingOutcome(
+            draft=draft, final_review=final_review, status="passed",
+            initial_draft=initial_draft, initial_review=initial_review,
+            revision_instructions=instructions)

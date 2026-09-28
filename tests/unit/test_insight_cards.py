@@ -37,7 +37,8 @@ def make_view(**overrides) -> InsightSourceView:
 
 def make_thought(**overrides):
     thought = {
-        "bottom_line": "Jev 范式映射为三级决策结构",
+        "title": "Jev 范式映射为三级决策结构",
+        "bottom_line": "判定模型以两个数量级的成本差承接 Agent 高频小决策，映射为本管道第三层",
         "source_understanding": "作者主张判定模型承接高频小决策",
         "mechanism": "成本差两个数量级",
         "challenge": "误判率数据缺失",
@@ -67,7 +68,8 @@ def make_pack(**overrides) -> EvidencePack:
 
 
 def write_card(tmp_path: Path, view=None, thought=None, *,
-               quality_status="passed", pack=None):
+               quality_status="passed", pack=None,
+               context_pack_id=None):
     from knowledge_ingest.insight.cards import DeepInsightCardWriter
     if thought is None:
         thought = make_thought(
@@ -77,7 +79,8 @@ def write_card(tmp_path: Path, view=None, thought=None, *,
     return writer.write(
         view=view or make_view(), pack=pack or make_pack(),
         thought=thought, quality_status=quality_status,
-        now="2026-09-28T12:00:00+00:00")
+        now="2026-09-28T12:00:00+00:00",
+        context_pack_id=context_pack_id)
 
 
 # ---------- id / path ----------
@@ -116,6 +119,22 @@ def test_frontmatter_metadata_complete(tmp_path):
         assert key in text, key
     assert "related_knowledge" in text
     assert "PC-001" in text
+
+
+def test_h1_is_title_conclusion_is_bottom_line(tmp_path):
+    """M6 复核⑤：bottom_line 不得同时充当 H1 与结论正文。"""
+    path = write_card(tmp_path)
+    text = path.read_text(encoding="utf-8")
+    assert "# Jev 范式映射为三级决策结构" in text
+    assert "判定模型以两个数量级的成本差承接" in text
+    title_line = "# Jev 范式映射为三级决策结构"
+    assert text.count(title_line) == 1
+
+
+def test_frontmatter_carries_context_pack_id(tmp_path):
+    path = write_card(tmp_path, context_pack_id="ctxpack.abc123def456")
+    text = path.read_text(encoding="utf-8")
+    assert "context_pack_id: ctxpack.abc123def456" in text
 
 
 def test_own_version_and_delta_always_visible_for_passed(tmp_path):

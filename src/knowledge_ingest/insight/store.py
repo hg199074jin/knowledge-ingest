@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS insight_context_refs (
     source_ref        TEXT,
     kind              TEXT,
     text              TEXT,
+    context_pack_id   TEXT,
     created_at        TEXT NOT NULL
 );
 
@@ -592,14 +593,21 @@ class InsightStore:
 
     # ---------- context pack persistence（M6 修复①） ----------
 
-    def replace_context_refs(self, insight_source_id: str,
-                             refs) -> None:
+    def replace_context_refs(self, insight_source_id: str, refs) -> str:
         """持久化当前 revision 的 Context Pack（替换语义）。
 
-        一旦写入，下游 Evidence/Thinking/Critic/Card 必须读这一份
-        （get_context_refs），不允许静默重新检索出另一套。
+        返回稳定 context_pack_id（内容寻址：refs 排序后哈希）——
+        下游 Evidence/Thinking/Critic/Card 必须消费这一份
+        （get_context_pack），卡面回填 pack_id 可追溯：
+        source_revision → context_pack_id → context_refs → card。
         """
         revision = self._require_source_revision(insight_source_id)
+        canonical = "|".join(sorted(
+            f"{r.record_id}:{r.relation}:{r.relation_reason}"
+            for r in refs))
+        pack_id = "ctxpack." + hashlib.sha256(
+            f"{insight_source_id}|{revision}|{canonical}".encode()
+        ).hexdigest()[:12]
         now = _now_iso()
         with self._conn:
             self._conn.execute(
@@ -611,11 +619,27 @@ class InsightStore:
                     """INSERT INTO insight_context_refs
                        (insight_source_id, source_revision, record_id,
                         relation, relation_reason, state, source_ref,
-                        kind, text, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        kind, text, context_pack_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (insight_source_id, revision, ref.record_id,
                      ref.relation, ref.relation_reason, ref.state,
-                     ref.source_ref, ref.kind, ref.text, now))
+                     ref.source_ref, ref.kind, ref.text, pack_id, now))
+        return pack_id
+
+    def get_context_pack(self, insight_source_id: str):
+        """当前 revision 已持久化的 ContextPack；未确定返回 None。"""
+        refs = self.get_context_refs(insight_source_id)
+        if not refs:
+            return None
+        row = self._conn.execute(
+            "SELECT context_pack_id, source_revision FROM insight_context_refs "
+            "WHERE insight_source_id = ? ORDER BY id LIMIT 1",
+            (insight_source_id,)).fetchone()
+        from .models import ContextPack
+        return ContextPack(pack_id=row["context_pack_id"],
+                           insight_source_id=insight_source_id,
+                           source_revision=int(row["source_revision"]),
+                           refs=refs)
 
     def get_context_refs(self, insight_source_id: str):
         """当前 revision 已持久化的 Context Pack；未确定为空元组。"""

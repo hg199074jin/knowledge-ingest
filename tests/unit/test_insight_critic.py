@@ -47,6 +47,7 @@ CRITIC_PASS = {
     "personal_connection": "pass", "cognition_delta": "pass",
     "own_version": "pass", "actionability": "pass",
     "business_rigor": "pass", "traceability": "pass",
+    "mechanism_salvage": "pass",
     "genericity_detected": False, "revision_required": False,
     "revision_instructions": [],
 }
@@ -56,9 +57,11 @@ CRITIC_FAIL = {
     "personal_connection": "fail", "cognition_delta": "fail",
     "own_version": "fail", "actionability": "pass",
     "business_rigor": "pass", "traceability": "pass",
+    "mechanism_salvage": "fail",
     "genericity_detected": True, "revision_required": True,
     "revision_instructions": ["own_version 只是换说法；补机制级重构",
-                              "personal_connection 是主题级硬关联"],
+                              "personal_connection 是主题级硬关联",
+                              "mechanism_salvage：批判后没有榨出待验证机制"],
 }
 
 
@@ -142,6 +145,19 @@ def test_critic_failure_yields_blocked_not_summary_card():
     assert outcome.status == "blocked"
     assert outcome.draft is not None           # 草稿保留待恢复
     assert outcome.final_review is None
+
+
+def test_outcome_retains_full_audit_trail():
+    """M6 复核②：Outcome 保留 initial draft/review 与 revision
+    instructions——needs_review 必须可解释。"""
+    orch, thinker, _ = make_orchestrator(
+        [dict(CRITIC_FAIL), dict(CRITIC_PASS)])
+    outcome = orch.run(PACK)
+    assert outcome.initial_draft == DRAFT
+    assert outcome.initial_review.revision_required is True
+    assert outcome.revision_instructions == tuple(
+        CRITIC_FAIL["revision_instructions"])
+    assert outcome.final_review.revision_required is False
 
 
 def test_revision_instructions_forwarded():
