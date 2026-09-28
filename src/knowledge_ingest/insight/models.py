@@ -202,7 +202,11 @@ class PersonalContextRef:
 
 @dataclass(frozen=True)
 class EvidencePack:
-    """Evidence Pack（设计 §12）：个人主张与源证据严格分离。"""
+    """Evidence Pack（设计 §12）：个人主张与源证据严格分离。
+
+    source_parts 保留解析后的原文分片（M6：Thinking 引用全文用），
+    不参与六类分离语义。
+    """
 
     source_claims: tuple[str, ...] = ()
     source_evidence: tuple[str, ...] = ()
@@ -210,6 +214,7 @@ class EvidencePack:
     unknown_variables: tuple[str, ...] = ()
     personal_context: tuple[PersonalContextRef, ...] = ()
     verification_flags: tuple[str, ...] = ()
+    source_parts: tuple = ()
 
 
 @dataclass(frozen=True)
