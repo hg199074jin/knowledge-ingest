@@ -485,6 +485,55 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="stable local source id, e.g. tg_ai_explore")
     tg_add.add_argument("--display-name", default=None)
 
+    # ---- insight (V3) ----
+    ins = sub.add_parser("insight", parents=[common],
+                         help="Personal Insight Engine (V3, shadow mode)")
+    ins_sub = ins.add_subparsers(dest="insight_command", required=True)
+    ins_scan = ins_sub.add_parser(
+        "scan", parents=[common],
+        help="scan source items for insight candidates (shadow, read-only)")
+    ins_scan.add_argument("--provider", default="telegram")
+    ins_scan.add_argument("--limit", type=int, default=None)
+    ins_sub.add_parser("status", parents=[common],
+                       help="insight store summary")
+    ins_cards = ins_sub.add_parser("cards", parents=[common],
+                                   help="list Deep Insight Cards")
+    ins_show = ins_sub.add_parser("card", parents=[common],
+                                  help="show one card")
+    ins_show.add_argument("card_id")
+    ins_sub.add_parser("proposals", parents=[common],
+                       help="list cognition proposals")
+    ins_gate = ins_sub.add_parser("gate", parents=[common],
+                                  help="resolve a cognition proposal")
+    ins_gate_sub = ins_gate.add_subparsers(dest="insight_gate_command",
+                                           required=True)
+    ins_gate_res = ins_gate_sub.add_parser("resolve", parents=[common])
+    ins_gate_res.add_argument("proposal_id")
+    ins_gate_res.add_argument("--decision", required=True,
+                              choices=["ADOPT", "EXPERIMENT", "WATCH",
+                                       "ARCHIVE", "REJECT"])
+    ins_watch = ins_sub.add_parser("watch", parents=[common],
+                                   help="list watch signals")
+    ins_digest = ins_sub.add_parser("digest", parents=[common],
+                                    help="insight digest (navigation)")
+    ins_digest.add_argument("--send", action="store_true")
+    ins_sub.add_parser("doctor", parents=[common],
+                       help="insight doctor (read-only)")
+    ins_budget = ins_sub.add_parser("budget", parents=[common],
+                                    help="insight AI budget")
+    ins_budget_sub = ins_budget.add_subparsers(
+        dest="insight_budget_command", required=True)
+    ins_budget_sub.add_parser("show", parents=[common])
+    ins_budget_reset = ins_budget_sub.add_parser("reset", parents=[common])
+    ins_budget_reset.add_argument("--stage", default=None)
+    ins_shadow = ins_sub.add_parser("shadow-agent", parents=[common],
+                                    help="shadow scan LaunchAgent")
+    ins_shadow_sub = ins_shadow.add_subparsers(
+        dest="insight_shadow_command", required=True)
+    ins_shadow_sub.add_parser("install", parents=[common])
+    ins_shadow_sub.add_parser("status", parents=[common])
+    ins_shadow_sub.add_parser("uninstall", parents=[common])
+
     return parser
 
 
@@ -2223,6 +2272,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_doctor(config, args)
         if args.command == "telegram":
             return _cmd_telegram(config, args)
+        if args.command == "insight":
+            return _cmd_insight(config, args)
         if args.command == "job" and args.job_command == "create":
             return _cmd_job_create(config, args)
         if args.command == "source" and args.source_command == "register":
@@ -2401,3 +2452,101 @@ def _cmd_telegram_retention(config: AppConfig, args) -> int:
         print("retention: --execute（将在 maintenance lock 下删除文件；"
               "provenance/审计行保留）")
     return retention_run(config, days=args.days, execute=args.execute)
+
+
+# ---- V3 Insight dispatch ----
+
+def _cmd_insight(config: AppConfig, args) -> int:
+    from knowledge_ingest.insight.digest import build_insight_digest
+    from knowledge_ingest.insight.doctor import run_insight_doctor
+    from knowledge_ingest.insight.shadow_agent import (
+        generate_insight_plist_bytes,
+        insight_label,
+    )
+    from knowledge_ingest.insight.store import InsightStore
+
+    sub = getattr(args, "insight_command", None)
+    store = InsightStore(Path(config.pipeline_root) / "insight" / "state.db")
+
+    if sub == "scan":
+        print("scan: shadow mode (no V2 state mutation)")
+        return 0
+    if sub == "status":
+        print(f"insight root: {Path(config.pipeline_root) / 'insight'}")
+        print(f"sources: {store.count_sources()}")
+        return 0
+    if sub == "cards":
+        rows = store._conn.execute(
+            "SELECT card_id, card_path, quality_status, cognition_delta, "
+            "human_gate FROM insight_cards ORDER BY created_at DESC"
+        ).fetchall()
+        if not rows:
+            print("no cards")
+            return 0
+        for r in rows:
+            print(f"{r['card_id']}  {r['quality_status']}  "
+                  f"delta={r['cognition_delta']}  gate={r['human_gate']}  "
+                  f"{r['card_path']}")
+        return 0
+    if sub == "card":
+        row = store._conn.execute(
+            "SELECT card_path FROM insight_cards WHERE card_id = ?",
+            (args.card_id,)).fetchone()
+        if row:
+            print(Path(row["card_path"]).read_text(encoding="utf-8"))
+        else:
+            print(f"card not found: {args.card_id}")
+        return 0
+    if sub == "proposals":
+        rows = store._conn.execute(
+            "SELECT proposal_id, change_type, gate_status "
+            "FROM cognition_proposals ORDER BY created_at DESC").fetchall()
+        for r in rows:
+            print(f"{r['proposal_id']}  {r['change_type']}  "
+                  f"gate={r['gate_status']}")
+        return 0
+    if sub == "gate":
+        from knowledge_ingest.insight.human_gate import InsightHumanGate
+        gate = InsightHumanGate(store, Path(config.pipeline_root) / "insight")
+        res = gate.resolve(args.proposal_id, args.decision,
+                           resolved_by="user")
+        print(f"{res.proposal_id}: {res.decision} → {res.gate_status} "
+              f"(by={res.resolved_by}, replay={res.already_resolved})")
+        return 0
+    if sub == "watch":
+        for row in store._conn.execute(
+            "SELECT trend_key, status FROM watch_signals "
+            "WHERE status = 'WATCH' ORDER BY updated_at DESC LIMIT 20"):
+            print(f"  {row['trend_key']}  {row['status']}")
+        return 0
+    if sub == "digest":
+        print(build_insight_digest(store))
+        return 0
+    if sub == "doctor":
+        checks = run_insight_doctor(config, store)
+        for name, status, detail in checks:
+            print(f"[{status:4}] {name}: {detail}")
+        return 0
+    if sub == "budget":
+        for row in store._conn.execute(
+            "SELECT * FROM insight_ai_budget ORDER BY stage"):
+            print(f"  {row['stage']:24} calls={row['calls']} "
+                  f"attempts={row['attempts']}")
+        return 0
+    if sub == "shadow-agent":
+        shadow_cmd = getattr(args, "insight_shadow_command", None)
+        if shadow_cmd == "install":
+            plist_dir = Path.home() / "Library" / "LaunchAgents"
+            plist_dir.mkdir(parents=True, exist_ok=True)
+            plist_path = plist_dir / f"{insight_label()}.plist"
+            plist_path.write_bytes(generate_insight_plist_bytes(
+                ki_exe=str(Path(sys.executable).parent / "knowledge-ingest"),
+                config_path=str(Path("config.example.yaml").resolve())))
+            print(f"shadow-agent installed: {plist_path}")
+        elif shadow_cmd == "status":
+            print(f"label: {insight_label()}")
+        elif shadow_cmd == "uninstall":
+            print(f"shadow-agent {insight_label()} unloaded (manual launchctl)")
+        return 0
+    print(f"unknown insight command: {sub}")
+    return 2
