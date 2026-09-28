@@ -128,8 +128,8 @@ def test_approved_cognition_port_returns_confirmed_records(tmp_path):
 
 
 def test_approved_cognition_port_high_recall_ordering(tmp_path):
-    """High Recall：token 重叠只影响排序，绝不过滤——精确取舍是
-    Selector 的职责（中文整句无分词，子串过滤会系统性漏召回）。"""
+    """High Recall：relevance hint 只影响排序，绝不过滤——精确取舍是
+    Selector 的职责。"""
     store = InsightStore(tmp_path / "insight" / "state.db")
     store.upsert_approved_cognition("PC-201", "cp-2", "民宿定价靠转化率",
                                     domain="minsu", approved_at=NOW)
@@ -137,8 +137,45 @@ def test_approved_cognition_port_high_recall_ordering(tmp_path):
                                     domain="audit", approved_at=NOW)
     port = ApprovedCognitionKnowledgePort(store)
     hits = port.search(["审计"], statuses=["CONFIRMED"], limit=5)
-    # 命中 token 的排前，未命中的仍返回（不丢召回）
+    # CJK bigram 命中的排前，未命中的仍返回（不丢召回）
     assert [r.record_id for r in hits] == ["PC-202", "PC-201"]
+
+
+def test_cjk_bigram_ranking_prevents_starvation_beyond_cap(tmp_path):
+    """>20 条中文候选、唯一相关记录排在最后：CJK-aware 排序必须让它
+    进入送给 Selector 的 candidate window（不允许 score=0 淹没）。
+    只验证 ranking 不造成 starvation，不要求 Selector 最终选中。"""
+    store = InsightStore(tmp_path / "insight" / "state.db")
+    for n in range(24):                      # 24 条无关中文认知
+        store.upsert_approved_cognition(
+            f"NOISE-{n:02d}", f"cp-n{n}",
+            f"分段计时收费第{n}则：夜间时段上浮加收服务费用条目",
+            domain="noise", approved_at=f"2026-01-01T00:00:{n:02d}+00:00")
+    relevant = ("两级筛选架构：明确情况走规则低成本路径，"
+                "模糊边界才调用高成本判定模型")
+    store.upsert_approved_cognition(
+        "RELEVANT-01", "cp-r", relevant, domain="AI.Agent",
+        approved_at="2026-09-28T12:00:00+00:00")   # 故意排最后
+    port = ApprovedCognitionKnowledgePort(store)
+    queries = ["你在知识采集分类管线上是否用过判定模型来筛规则？"]
+    window = port.search(queries, statuses=["CONFIRMED"], limit=20)
+    assert len(window) == 20
+    assert "RELEVANT-01" in [r.record_id for r in window], \
+        "CJK-aware ranking failed: relevant record starved beyond cap"
+
+
+def test_zero_hint_records_still_returned_after_scored(tmp_path):
+    """score=0 绝不删除：全部无命中时按 approved_at 稳定返回。"""
+    store = InsightStore(tmp_path / "insight" / "state.db")
+    store.upsert_approved_cognition("PC-401", "cp-1", "认知甲",
+                                    domain="d",
+                                    approved_at="2026-01-01T00:00:00+00:00")
+    store.upsert_approved_cognition("PC-402", "cp-2", "认知乙",
+                                    domain="d",
+                                    approved_at="2026-02-01T00:00:00+00:00")
+    port = ApprovedCognitionKnowledgePort(store)
+    hits = port.search(["完全无关的查询词"], statuses=["CONFIRMED"], limit=5)
+    assert [r.record_id for r in hits] == ["PC-401", "PC-402"]
 
 
 def test_approved_cognition_respects_statuses_filter(tmp_path):

@@ -43,6 +43,8 @@ VERIFICATION_STATUSES = ("source_only", "corpus_verified")
 # 无可靠个人认知证据时禁止推测，宁可多进 DEEP_READ）
 GATE_DIMENSION_LEVELS = ("low", "medium", "high", "unknown")
 
+CONTEXT_RELATION_TYPES = ("DIRECT", "CONDITIONING", "CONFLICT")
+
 COGNITION_DELTA_TYPES = ("ADD", "REINFORCE", "REVISE", "OVERTURN", "NONE")
 
 THINKING_ACTION_TYPES = ("IMMEDIATE", "EXPERIMENT", "WATCH", "NONE")
@@ -189,6 +191,7 @@ class PersonalContextRef:
     kind: str | None = None
     text: str | None = None
     conflict_with: tuple[str, ...] = ()
+    relation: str = "DIRECT"
 
     def __post_init__(self):
         if not self.record_id:
@@ -198,6 +201,7 @@ class PersonalContextRef:
                 "relation_reason required — topic-level hard links are "
                 "invalid (设计 §10.4)")
         _require_choice(self.state, PERSONAL_KNOWLEDGE_STATES, "state")
+        _require_choice(self.relation, CONTEXT_RELATION_TYPES, "relation")
 
 
 @dataclass(frozen=True)

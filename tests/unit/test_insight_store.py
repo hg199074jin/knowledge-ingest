@@ -18,6 +18,7 @@ from knowledge_ingest.insight.models import (
     CandidateDecision,
     DeepValueDecision,
     InsightSourceView,
+    PersonalContextRef,
 )
 from knowledge_ingest.insight.store import (
     INSIGHT_SCHEMA_VERSION,
@@ -176,6 +177,33 @@ def test_decisions_reject_unknown_source(tmp_path):
 
 
 # ---------- runs ----------
+
+def test_context_refs_persist_and_revision_bound(tmp_path):
+    """M6 修复①：某 revision 的 Context Pack 一旦确定即持久化；
+    下游（Evidence/Thinking/Critic/Card）读同一份，不允许静默重检索。"""
+    store = make_store(tmp_path)
+    sid = store.register_source_view(make_view())
+    ref = PersonalContextRef(record_id="PC-001",
+                             relation_reason="改变判定层边界",
+                             state="CONFIRMED", source_ref="src://PC-001",
+                             kind="cognition", text="两级筛选架构",
+                             relation="CONDITIONING")
+    assert store.get_context_refs(sid) == ()      # 未确定前为空
+    store.replace_context_refs(sid, (ref,))
+    loaded = store.get_context_refs(sid)
+    assert len(loaded) == 1
+    assert loaded[0].record_id == "PC-001"
+    assert loaded[0].relation == "CONDITIONING"
+    assert loaded[0].relation_reason == "改变判定层边界"
+    assert loaded[0].text == "两级筛选架构"
+    # 重写同 revision：替换而非追加
+    store.replace_context_refs(sid, (PersonalContextRef(
+        record_id="PC-002", relation_reason="r2", state="TENTATIVE"),))
+    assert [r.record_id for r in store.get_context_refs(sid)] == ["PC-002"]
+    # EDIT → 新 revision：refs 从空开始（旧 revision 判定不被继承）
+    store.register_source_view(make_view(content_fingerprint="fp-2"))
+    assert store.get_context_refs(sid) == ()
+
 
 def test_run_lifecycle(tmp_path):
     store = make_store(tmp_path)

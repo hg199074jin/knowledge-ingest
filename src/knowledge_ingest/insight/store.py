@@ -25,7 +25,7 @@ from pathlib import Path
 
 from knowledge_ingest.config import AppConfig
 
-from .models import CandidateDecision, DeepValueDecision, InsightSourceView
+from .models import CandidateDecision, DeepValueDecision, InsightSourceView, PersonalContextRef
 
 INSIGHT_SCHEMA_VERSION = 1
 BUSY_TIMEOUT_MS = 5000
@@ -109,9 +109,12 @@ CREATE TABLE IF NOT EXISTS insight_context_refs (
     insight_source_id TEXT NOT NULL REFERENCES insight_sources(insight_source_id),
     source_revision   INTEGER NOT NULL,
     record_id         TEXT NOT NULL,
+    relation          TEXT NOT NULL DEFAULT 'DIRECT',
     relation_reason   TEXT NOT NULL,
     state             TEXT NOT NULL,
     source_ref        TEXT,
+    kind              TEXT,
+    text              TEXT,
     created_at        TEXT NOT NULL
 );
 
@@ -586,6 +589,51 @@ class InsightStore:
             """SELECT * FROM trend_clusters
                WHERE signal_count >= ? AND status = 'ready'
                ORDER BY signal_count DESC""", (threshold,)).fetchall()
+
+    # ---------- context pack persistence（M6 修复①） ----------
+
+    def replace_context_refs(self, insight_source_id: str,
+                             refs) -> None:
+        """持久化当前 revision 的 Context Pack（替换语义）。
+
+        一旦写入，下游 Evidence/Thinking/Critic/Card 必须读这一份
+        （get_context_refs），不允许静默重新检索出另一套。
+        """
+        revision = self._require_source_revision(insight_source_id)
+        now = _now_iso()
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM insight_context_refs "
+                "WHERE insight_source_id = ? AND source_revision = ?",
+                (insight_source_id, revision))
+            for ref in refs:
+                self._conn.execute(
+                    """INSERT INTO insight_context_refs
+                       (insight_source_id, source_revision, record_id,
+                        relation, relation_reason, state, source_ref,
+                        kind, text, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (insight_source_id, revision, ref.record_id,
+                     ref.relation, ref.relation_reason, ref.state,
+                     ref.source_ref, ref.kind, ref.text, now))
+
+    def get_context_refs(self, insight_source_id: str):
+        """当前 revision 已持久化的 Context Pack；未确定为空元组。"""
+        revision = self._require_source_revision(insight_source_id)
+        rows = self._conn.execute(
+            """SELECT * FROM insight_context_refs
+               WHERE insight_source_id = ? AND source_revision = ?
+               ORDER BY id""", (insight_source_id, revision)).fetchall()
+        from .models import CONTEXT_RELATION_TYPES
+        return tuple(
+            PersonalContextRef(
+                record_id=r["record_id"],
+                relation_reason=r["relation_reason"],
+                state=r["state"], source_ref=r["source_ref"],
+                kind=r["kind"], text=r["text"],
+                relation=(r["relation"] if r["relation"]
+                          in CONTEXT_RELATION_TYPES else "DIRECT"))
+            for r in rows)
 
     # ---------- approved cognition（M5/M7：仅 Human Gate ADOPT 后写入） ----------
 

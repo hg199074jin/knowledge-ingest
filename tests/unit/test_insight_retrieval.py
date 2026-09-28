@@ -76,15 +76,17 @@ PLAN = {"queries": ["Q1 用户如何判断决策层架构？", "Q2 有没有放�
                     "Q3 当前哪些项目会被影响？"],
         "include_history": False}
 
-SELECTED = {"selected": [
-    {"record_id": "PC-001", "relation_reason": "可能新增判定层，改变现有两级结构",
-     "state": "CONFIRMED"},
-    {"record_id": "PC-002", "relation_reason": "此前的否决理由可能被新成本数据推翻",
-     "state": "REJECTED"},
+JUDGED = {"judgements": [
+    {"record_id": "PC-001", "relation": "DIRECT",
+     "relation_reason": "可能新增判定层，改变现有两级结构",
+     "confidence": 0.8},
+    {"record_id": "PC-002", "relation": "CONDITIONING",
+     "relation_reason": "此前的否决理由可能被新成本数据推翻",
+     "confidence": 0.7},
 ], "conflicts": []}
 
 
-def make_retriever(records=None, planner=PLAN, selector=SELECTED, **kwargs):
+def make_retriever(records=None, planner=PLAN, selector=JUDGED, **kwargs):
     if records is None:
         records = [rec("PC-001", "三级决策结构"),
                    rec("PC-002", "曾放弃类似方向", state="REJECTED")]
@@ -135,7 +137,7 @@ def test_include_history_adds_superseded_states():
 
 # ---------- selector ----------
 
-def test_selected_refs_carry_record_payload_and_reason():
+def test_judged_refs_carry_payload_reason_and_relation():
     retriever, _m, _k = make_retriever(
         records=[rec("PC-001", "三级决策结构"), rec("PC-002", "曾放弃 jev 方向",
                                                     state="REJECTED")])
@@ -144,34 +146,86 @@ def test_selected_refs_carry_record_payload_and_reason():
     assert by_id["PC-001"].relation_reason.startswith("可能新增判定层")
     assert by_id["PC-001"].text == "三级决策结构"
     assert by_id["PC-001"].kind == "cognition"
+    assert by_id["PC-001"].relation == "DIRECT"
+    assert by_id["PC-002"].relation == "CONDITIONING"
     assert by_id["PC-002"].state == "REJECTED"   # include_history 才可能入选
 
 
-def test_selector_may_select_zero():
-    retriever, _m, _k = make_retriever(selector={"selected": []})
+def test_all_none_is_the_only_way_to_empty():
+    """空结果 = 模型对每条候选显式判 NONE（可审计），
+    而不是模型偶然少输出一个数组元素。"""
+    all_none = {"judgements": [
+        {"record_id": "PC-001", "relation": "NONE",
+         "relation_reason": "无判断影响", "confidence": 0.9},
+        {"record_id": "PC-002", "relation": "NONE",
+         "relation_reason": "无判断影响", "confidence": 0.9},
+    ]}
+    retriever, _m, _k = make_retriever(selector=all_none)
     refs = retriever.retrieve(make_view(), CONTENT)
-    assert refs == ()                            # 合法空结果
+    assert refs == ()
 
 
-def test_selected_without_relation_reason_is_malformed():
-    selector = {"selected": [{"record_id": "PC-001", "relation_reason": ""}]}
-    retriever, _m, _k = make_retriever(records=[rec("PC-001")],
-                                       selector=selector)
+def test_missing_candidate_judgement_is_malformed():
+    """5 条候选只裁决 2 条 = 坏输出（反翻转的核心防线）。"""
+    partial = {"judgements": [JUDGED["judgements"][0]]}
+    retriever, _m, _k = make_retriever(selector=partial)
     with pytest.raises(ModelBadOutputError):
         retriever.retrieve(make_view(), CONTENT)
 
 
-def test_selection_of_unknown_record_rejected():
-    retriever, _m, _k = make_retriever(records=[])   # selector 选了不存在的
+def test_duplicate_judgement_rejected():
+    dup = {"judgements": JUDGED["judgements"] + [JUDGED["judgements"][0]]}
+    retriever, _m, _k = make_retriever(selector=dup)
     with pytest.raises(ModelBadOutputError):
         retriever.retrieve(make_view(), CONTENT)
+
+
+def test_unknown_relation_rejected():
+    bad = {"judgements": [
+        {"record_id": "PC-001", "relation": "MAYBE",
+         "relation_reason": "r", "confidence": 0.5},
+        {"record_id": "PC-002", "relation": "NONE", "relation_reason": "",
+         "confidence": 0.5},
+    ]}
+    retriever, _m, _k = make_retriever(selector=bad)
+    with pytest.raises(ModelBadOutputError):
+        retriever.retrieve(make_view(), CONTENT)
+
+
+def test_non_none_without_reason_rejected():
+    bad = {"judgements": [
+        {"record_id": "PC-001", "relation": "DIRECT",
+         "relation_reason": "", "confidence": 0.5},
+        {"record_id": "PC-002", "relation": "NONE", "relation_reason": "",
+         "confidence": 0.5},
+    ]}
+    retriever, _m, _k = make_retriever(selector=bad)
+    with pytest.raises(ModelBadOutputError):
+        retriever.retrieve(make_view(), CONTENT)
+
+
+def test_selection_of_unknown_record_rejected_kept():
+    retriever, _m, _k = make_retriever(
+        records=[rec("PC-001")],
+        selector={"judgements": [
+            {"record_id": "PC-001", "relation": "NONE",
+             "relation_reason": "", "confidence": 0.5},
+            {"record_id": "PC-999", "relation": "DIRECT",
+             "relation_reason": "r", "confidence": 0.5},
+        ]})
+    with pytest.raises(ModelBadOutputError):
+        retriever.retrieve(make_view(), CONTENT)
+
+
+
 
 
 def test_max_selected_enforced(tmp_path=None):
     records = [rec(f"PC-{i:03d}") for i in range(15)]
-    selector = {"selected": [{"record_id": r.record_id,
-                              "relation_reason": f"理由{i}"}
-                             for i, r in enumerate(records)]}
+    selector = {"judgements": [
+        {"record_id": r.record_id, "relation": "DIRECT",
+         "relation_reason": f"理由{n}", "confidence": 0.8}
+        for n, r in enumerate(records)]}
     retriever, _m, _k = make_retriever(records=records, selector=selector)
     refs = retriever.retrieve(make_view(), CONTENT)
     assert len(refs) == 12                       # 硬上限
@@ -188,11 +242,11 @@ def test_hard_caps_frozen_in_signature_defaults():
 # ---------- conflicts ----------
 
 def test_conflicting_cognitions_both_survive_with_marker():
-    selector = {"selected": [
-        {"record_id": "PC-001", "relation_reason": "支持轻量判定层",
-         "state": "CONFIRMED"},
-        {"record_id": "PC-002", "relation_reason": "坚持单一生成模型",
-         "state": "CONFIRMED"}],
+    selector = {"judgements": [
+        {"record_id": "PC-001", "relation": "CONFLICT",
+         "relation_reason": "支持轻量判定层", "confidence": 0.8},
+        {"record_id": "PC-002", "relation": "CONFLICT",
+         "relation_reason": "坚持单一生成模型", "confidence": 0.8}],
         "conflicts": [{"record_ids": ["PC-001", "PC-002"],
                        "reason": "对判定层必要性的判断相反"}]}
     retriever, _m, _k = make_retriever(

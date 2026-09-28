@@ -120,37 +120,57 @@ class CommandPersonalKnowledgePort:
 class ApprovedCognitionKnowledgePort:
     """Insight Store 内已批准认知（仅 CONFIRMED，Human Gate ADOPT 产物）。
 
-    High Recall 语义（设计 §7.2 在检索层的延伸）：返回全部 CONFIRMED
-    记录（token 重叠数仅作排序提示，绝不过滤）——本库是人类门控的
-    小集合，精确取舍是下游 Selector 的职责；本层绝不因匹配粒度
-    （尤其中文整句无分词的天然缺陷）丢掉可能相关的个人证据。
+    High Recall 语义（设计 §7.2 在检索层的延伸；M5 修复②冻结）：
+    全部保留 eligible 记录 → CJK-aware relevance hint 排序 →
+    再应用 candidate cap → Selector 精确判断。hint 绝不过滤：
+    score=0 的记录仍返回（排在命中者之后、按 approved_at 稳定序），
+    防止认知库增长后"相关记录排在第 21 条"的 starvation。
+    不引入 embedding/向量库——确定性字符 n-gram 粗召回排序。
     """
 
     def __init__(self, store: InsightStore):
         self.store = store
 
     @staticmethod
-    def _tokens(queries: list[str]) -> list[str]:
-        tokens: set[str] = set()
-        for query in queries:
-            for token in re.findall(r"[\w\u4e00-\u9fff]+", query or ""):
-                if len(token) >= 2:
-                    tokens.add(token.casefold())
-        return sorted(tokens)
+    def _latin_tokens(text: str) -> set[str]:
+        return {t.casefold() for t in re.findall(r"[A-Za-z0-9]+", text or "")
+                if len(t) >= 2}
+
+    @staticmethod
+    def _cjk_bigrams(text: str) -> set[str]:
+        """CJK 连续段的相邻字符对（中文无空格分词的确定性近似）。"""
+        bigrams: set[str] = set()
+        for run in re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]+", text or ""):
+            for i in range(len(run) - 1):
+                bigrams.add(run[i:i + 2])
+        return bigrams
+
+    @classmethod
+    def _relevance_hint(cls, queries: list[str], text: str) -> int:
+        """排序提示（非过滤）：拉丁 token 命中 + CJK bigram 命中。"""
+        query_latin = set()
+        query_bigrams = set()
+        for query in queries or []:
+            query_latin |= cls._latin_tokens(query)
+            query_bigrams |= cls._cjk_bigrams(query)
+        text_latin = cls._latin_tokens(text)
+        text_bigrams = cls._cjk_bigrams(text)
+        latin_hits = len(query_latin & text_latin)
+        bigram_hits = len(query_bigrams & text_bigrams)
+        return latin_hits + bigram_hits
 
     def search(self, queries: list[str], *, statuses: list[str],
                limit: int) -> list[PersonalKnowledgeRecord]:
         if "CONFIRMED" not in statuses:
             return []
-        tokens = self._tokens(queries)
         scored = []
         for row in self.store.list_approved_cognition():
-            text = row["cognition"].casefold()
-            overlap = sum(1 for t in tokens if t in text)
-            scored.append((overlap, row))
+            hint = self._relevance_hint(queries or [""], row["cognition"])
+            scored.append((hint, row))
+        # hint 降序 → approved_at 稳定序；score=0 仍全部保留
         scored.sort(key=lambda pair: (-pair[0], pair[1]["approved_at"]))
         records = []
-        for _overlap, row in scored:
+        for _hint, row in scored:
             records.append(PersonalKnowledgeRecord(
                 record_id=row["record_id"], kind="cognition",
                 state="CONFIRMED", text=row["cognition"],
