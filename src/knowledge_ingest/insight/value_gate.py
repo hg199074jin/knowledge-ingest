@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .model_port import ModelBadOutputError
 from .models import DEEP_VALUE_STATES, DeepValueDecision, InsightSourceView
@@ -27,6 +27,15 @@ CONTRADICTION_UNKNOWN_POLICY = (
     "此刻没有用户的个人认知检索结果（它发生在 DEEP_READ 之后）。"
     "判断 contradiction_value 时不要推测用户过去的认知：没有可靠"
     "依据就填 unknown，绝不为了填字段编造冲突或一致。")
+
+# M10-R3（P1）：一次有界 contract repair——只针对结构化输出违约，
+# 不针对 rate limit / 子进程瞬态错误；绝不由 parser 猜 decision。
+CONTRACT_REPAIR_INSTRUCTION = (
+    "你上一次的回复违反了输出契约（见 previous_violation）。"
+    "请只返回一个完整 JSON 对象，必须包含 decision 字段且取值仅限 "
+    "decision_states 列表内的字面量，八个小写维度字段取值仅限 "
+    "low/medium/high/unknown。不允许散文、不允许省略 decision、"
+    "不允许添加 JSON 之外的任何文字。基于同一原始材料重新给出完整判定。")
 
 
 def _bad(message: str) -> ModelBadOutputError:
@@ -52,8 +61,25 @@ class DeepValueGate:
                 "confidence": candidate.get("confidence"),
             },
         }
-        raw = self.model_port.run("deep_value_gate", payload)
-        return self._parse(raw)
+        try:
+            raw = self.model_port.run("deep_value_gate", payload)
+            return self._parse(raw)
+        except ModelBadOutputError as first:
+            repair_payload = dict(payload, contract_repair={
+                "previous_violation": str(first),
+                "repair_instruction": CONTRACT_REPAIR_INSTRUCTION,
+            })
+            try:
+                raw = self.model_port.run("deep_value_gate", repair_payload)
+                decision = self._parse(raw)
+            except ModelBadOutputError as second:
+                raise _bad("BLOCKED_MODEL_BAD_OUTPUT after contract "
+                           f"repair; first={first}; second={second}") \
+                    from second
+            return replace(decision, contract_repair={
+                "first_attempt_valid": False, "repair_attempted": True,
+                "repair_result": "repaired",
+                "first_violation": str(first)})
 
     @staticmethod
     def _parse(raw: dict) -> DeepValueDecision:

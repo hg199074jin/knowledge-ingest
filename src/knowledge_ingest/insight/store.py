@@ -27,7 +27,7 @@ from knowledge_ingest.config import AppConfig
 
 from .models import CandidateDecision, DeepValueDecision, InsightSourceView, PersonalContextRef
 
-INSIGHT_SCHEMA_VERSION = 1
+INSIGHT_SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5000
 
 
@@ -117,6 +117,19 @@ CREATE TABLE IF NOT EXISTS insight_context_refs (
     text              TEXT,
     context_pack_id   TEXT,
     created_at        TEXT NOT NULL
+);
+
+-- M10-R1（P0 修复）：Context Pack 元数据一等持久化。
+-- NO_RELEVANT_PERSONAL_CONTEXT（refs=[]）是合法结果：pack 必须不依赖
+-- ref 行反推即可存在与恢复——`source_revision → context_pack_id →
+-- refs=[]` 在进程退出后仍成立。禁止用假 cognition ref 占位。
+CREATE TABLE IF NOT EXISTS insight_context_packs (
+    insight_source_id TEXT NOT NULL REFERENCES insight_sources(insight_source_id),
+    source_revision   INTEGER NOT NULL,
+    context_pack_id   TEXT NOT NULL,
+    ref_count         INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT NOT NULL,
+    PRIMARY KEY (insight_source_id, source_revision)
 );
 
 CREATE TABLE IF NOT EXISTS insight_cards (
@@ -381,6 +394,7 @@ class InsightStore:
             "evidence_quality": decision.evidence_quality,
             "contradiction_value": decision.contradiction_value,
             "thinking_space": decision.thinking_space,
+            "contract_repair": decision.contract_repair,
         }
         blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         now = _now_iso()
@@ -413,6 +427,35 @@ class InsightStore:
                WHERE insight_source_id = ?
                ORDER BY source_revision DESC, id DESC LIMIT 1""",
             (insight_source_id,)).fetchone()
+
+    def record_card(self, *, card_id: str, insight_source_id: str,
+                    source_revision: int, content_fingerprint: str,
+                    card_path: str, quality_status: str,
+                    cognition_delta: str | None, context_pack_id: str | None,
+                    human_gate: str = "pending",
+                    created_at: str | None = None) -> None:
+        """卡片行落库（M10-R2）：digest/doctor 的数据源 + 卡片幂等权威。
+
+        同 card_id 重写（重启续写/重扫）为覆盖语义，不产生第二行。
+        """
+        meta = json.dumps({"context_pack_id": context_pack_id},
+                          ensure_ascii=False, sort_keys=True)
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO insight_cards
+                   (card_id, insight_source_id, source_revision,
+                    content_fingerprint, card_path, quality_status,
+                    cognition_delta, human_gate, meta_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(card_id) DO UPDATE SET
+                     card_path = excluded.card_path,
+                     quality_status = excluded.quality_status,
+                     cognition_delta = excluded.cognition_delta,
+                     meta_json = excluded.meta_json""",
+                (card_id, insight_source_id, source_revision,
+                 content_fingerprint, card_path, quality_status,
+                 cognition_delta, human_gate, meta,
+                 created_at or _now_iso()))
 
     def count_value_gates(self, insight_source_id: str) -> int:
         return self._conn.execute(
@@ -625,22 +668,41 @@ class InsightStore:
                     (insight_source_id, revision, ref.record_id,
                      ref.relation, ref.relation_reason, ref.state,
                      ref.source_ref, ref.kind, ref.text, pack_id, now))
+            # M10-R1：pack 元数据与 refs 同事务落库——空 pack 也是一等对象
+            self._conn.execute(
+                """INSERT INTO insight_context_packs
+                   (insight_source_id, source_revision, context_pack_id,
+                    ref_count, created_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(insight_source_id, source_revision)
+                   DO UPDATE SET context_pack_id = excluded.context_pack_id,
+                                 ref_count = excluded.ref_count""",
+                (insight_source_id, revision, pack_id, len(refs), now))
         return pack_id
 
     def get_context_pack(self, insight_source_id: str):
-        """当前 revision 已持久化的 ContextPack；未确定返回 None。"""
-        refs = self.get_context_refs(insight_source_id)
-        if not refs:
+        """当前 revision 已持久化的 ContextPack；检索未发生返回 None。
+
+        M10-R1：pack 由元数据表权威（空 refs 也是合法 pack），
+        不再从 ref 行反推。
+        """
+        src = self._conn.execute(
+            "SELECT source_revision FROM insight_sources "
+            "WHERE insight_source_id = ?", (insight_source_id,)).fetchone()
+        if src is None:
             return None
         row = self._conn.execute(
-            "SELECT context_pack_id, source_revision FROM insight_context_refs "
-            "WHERE insight_source_id = ? ORDER BY id LIMIT 1",
-            (insight_source_id,)).fetchone()
+            "SELECT context_pack_id FROM insight_context_packs "
+            "WHERE insight_source_id = ? AND source_revision = ?",
+            (insight_source_id, src["source_revision"])).fetchone()
+        if row is None:
+            return None
         from .models import ContextPack
         return ContextPack(pack_id=row["context_pack_id"],
                            insight_source_id=insight_source_id,
-                           source_revision=int(row["source_revision"]),
-                           refs=refs)
+                           source_revision=int(src["source_revision"]),
+                           refs=tuple(self.get_context_refs(
+                               insight_source_id)))
 
     def get_context_refs(self, insight_source_id: str):
         """当前 revision 已持久化的 Context Pack；未确定为空元组。"""

@@ -112,6 +112,9 @@ class DeepValueDecision:
     evidence_quality: str | None = None
     contradiction_value: str | None = None
     thinking_space: str | None = None
+    # M10-R3：契约修复审计（None=首过即合法）。
+    # {first_attempt_valid, repair_attempted, repair_result, first_violation}
+    contract_repair: dict | None = None
 
     def __post_init__(self):
         _require_choice(self.decision, DEEP_VALUE_STATES, "decision")

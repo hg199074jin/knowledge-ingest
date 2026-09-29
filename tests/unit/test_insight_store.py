@@ -31,9 +31,9 @@ NOW = "2026-09-28T12:00:00+00:00"
 
 REQUIRED_TABLES = (
     "insight_sources", "insight_candidates", "insight_runs",
-    "insight_context_refs", "insight_cards", "cognition_proposals",
-    "watch_signals", "trend_clusters", "approved_cognition",
-    "insight_ai_budget", "insight_digest_state")
+    "insight_context_refs", "insight_context_packs", "insight_cards",
+    "cognition_proposals", "watch_signals", "trend_clusters",
+    "approved_cognition", "insight_ai_budget", "insight_digest_state")
 
 
 def make_config(tmp_path: Path) -> AppConfig:
@@ -68,10 +68,12 @@ def make_view(**overrides) -> InsightSourceView:
 
 def test_schema_version_and_required_tables(tmp_path):
     store = make_store(tmp_path)
-    assert store.user_version() == INSIGHT_SCHEMA_VERSION == 1
+    # M10-R1 起版本 2（insight_context_packs）；只升不降
+    assert store.user_version() == INSIGHT_SCHEMA_VERSION >= 2
     names = {row["name"] for row in store._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert set(REQUIRED_TABLES) <= names
+    assert "insight_context_packs" in names
 
 
 def test_wal_and_foreign_keys(tmp_path):

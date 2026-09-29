@@ -27,7 +27,7 @@ from .content_resolver import (
 )
 from .critic import QualityCritic, ThinkingOrchestrator
 from .evidence import EvidenceExtractionError, build_evidence_pack
-from .model_port import ModelPortError
+from .model_port import ModelBadOutputError, ModelPortError
 from .models import EvidencePack, InsightSourceView, PersonalContextRef
 from .proposals import InsightCard, build_cognition_proposal
 from .store import InsightStore
@@ -88,7 +88,19 @@ class InsightService:
         # 3) Deep Value（增量：同 revision 已判定则复用）
         gate_row = self.store.latest_value_gate(sid)
         if gate_row is None or int(gate_row["source_revision"]) != revision:
-            gate_decision = self.value_gate.evaluate(view, payload)
+            # M10-R3：契约修复后仍非法 → 终态留痕（blocked run）再
+            # fail-closed 上抛；fail-closed 语义不变，但 M10-R 可统计。
+            try:
+                gate_decision = self.value_gate.evaluate(view, payload)
+            except ModelPortError as exc:
+                run_id = self.store.create_run(sid, "deep_value_gate",
+                                               "running")
+                code = ("BLOCKED_MODEL_BAD_OUTPUT"
+                        if isinstance(exc, ModelBadOutputError)
+                        else "MODEL_TRANSIENT_ERROR")
+                self.store.finish_run(run_id, "blocked",
+                                      error_code=f"{code}: {str(exc)[:100]}")
+                raise
             self.store.record_value_gate(sid, gate_decision)
         gate_row = self.store.latest_value_gate(sid)
         decision_value = json.loads(gate_row["decision_json"])["decision"]
@@ -96,10 +108,14 @@ class InsightService:
             return StageOutcome("value_gate", decision_value.lower())
 
         # 4) DEEP_READ → Retrieval（Context Pack 绑定，只检索一次）
-        refs = self.store.get_context_refs(sid)
-        if not refs:
+        # M10-R1：以 pack 元数据行为准（空 refs 也是合法 pack）——
+        # 重启后零 refs 条目不再重检索。
+        context_pack = self.store.get_context_pack(sid)
+        if context_pack is None:
             refs = self.retriever.retrieve(view, content)
             self.store.replace_context_refs(sid, refs)
+            context_pack = self.store.get_context_pack(sid)
+        refs = context_pack.refs
 
         # 5) Evidence（增量：以 run 记录判重）
         if self._stage_done(sid, revision, "evidence"):
@@ -117,30 +133,54 @@ class InsightService:
             self._save_pack(sid, pack)
 
         # 6) Thinker → Critic（最多一次修订）
-        run_id = self.store.create_run(sid, "thinking", "running")
-        try:
-            outcome = self.orchestrator.run(pack)
-        except ModelPortError as exc:
-            self.store.finish_run(run_id, "blocked",
-                                  error_code=str(exc)[:80])
-            return StageOutcome("thinking", "blocked", detail=str(exc)[:120])
+        # M10-R2：thinking/critic 与 evidence 同权——成功完成即持久化
+        # 完整审计链产物；重启时从产物恢复，绝不重复调用模型。
+        if self._stage_done(sid, revision, "thinking"):
+            outcome = self._load_thought(sid, revision)
+        else:
+            outcome = None
+        if outcome is None:
+            run_id = self.store.create_run(sid, "thinking", "running")
+            try:
+                outcome = self.orchestrator.run(pack)
+            except ModelPortError as exc:
+                self.store.finish_run(run_id, "blocked",
+                                      error_code=str(exc)[:80])
+                return StageOutcome("thinking", "blocked", detail=str(exc)[:120])
+            self._save_thought(sid, revision, outcome)
+            self.store.finish_run(
+                run_id, outcome.status if outcome.status in ("passed", "needs_review") else "blocked",
+                output_ref=f"digest_state:thought:{sid}:{revision}")
         quality = ("passed" if outcome.status == "passed"
                    else "needs_review")
-        self.store.finish_run(run_id, quality)
 
         # 7) Card（同 revision+指纹幂等）
+        # M10-R1：retrieval 完成后 pack 必已存在；此处 None = 内部不变量
+        # 破坏，显式报错而非 AttributeError。
+        card_pack = self.store.get_context_pack(sid)
+        if card_pack is None:
+            raise RuntimeError(
+                f"context pack missing after retrieval: {sid}")
         card_id = card_id_for(view.source_item_id, revision,
                               view.content_fingerprint)
         card_path = self.card_writer.write(
             view=view, pack=pack, thought=outcome.draft,
             quality_status=quality, now=self._now(),
-            context_pack_id=self.store.get_context_pack(sid).pack_id)
+            context_pack_id=card_pack.pack_id)
+        # M10-R2：卡片行落库（digest/doctor 数据源；同卡重写幂等）
+        self.store.record_card(
+            card_id=card_id, insight_source_id=sid, source_revision=revision,
+            content_fingerprint=view.content_fingerprint,
+            card_path=str(card_path), quality_status=quality,
+            cognition_delta=outcome.draft["cognition_delta"],
+            context_pack_id=card_pack.pack_id,
+            created_at=self._now())
 
         # 8) Proposal 入口（passed 且 delta != NONE）
         proposal_id = None
         card = InsightCard(
             card_id=card_id, insight_source_id=sid, source_revision=revision,
-            context_pack_id=self.store.get_context_pack(sid).pack_id,
+            context_pack_id=card_pack.pack_id,
             card_path=str(card_path), quality_status=quality,
             cognition_delta=outcome.draft["cognition_delta"],
             title=outcome.draft["title"],
@@ -230,3 +270,21 @@ class InsightService:
                 ContentPart(part_id=p["part_id"], text=p["text"],
                             source_ref=p["source_ref"])
                 for p in data["source_parts"]))
+
+    def _save_thought(self, sid: str, revision: int, outcome) -> None:
+        """ThinkingOutcome 全量 JSON 持久化（M10-R2 restart-safe 产物）。"""
+        from .critic import outcome_to_json
+        with self.store._conn:
+            self.store._conn.execute(
+                """INSERT INTO insight_digest_state (key, value)
+                   VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (f"thought:{sid}:{revision}", outcome_to_json(outcome)))
+
+    def _load_thought(self, sid: str, revision: int):
+        """从持久化 JSON 恢复 ThinkingOutcome；无产物返回 None。"""
+        from .critic import outcome_from_json
+        row = self.store._conn.execute(
+            "SELECT value FROM insight_digest_state WHERE key = ?",
+            (f"thought:{sid}:{revision}",)).fetchone()
+        return None if row is None else outcome_from_json(row["value"])

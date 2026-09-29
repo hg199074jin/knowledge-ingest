@@ -182,3 +182,55 @@ class ThinkingOrchestrator:
             draft=draft, final_review=final_review, status="passed",
             initial_draft=initial_draft, initial_review=initial_review,
             revision_instructions=instructions)
+
+
+# ---------- M10-R2：ThinkingOutcome 产物持久化（restart-safe） ----------
+
+def outcome_to_json(outcome: ThinkingOutcome) -> str:
+    """完整审计链序列化：draft / final_review / initial_draft /
+    initial_review / revision_instructions / status。"""
+    import json
+    from dataclasses import asdict
+
+    def _review(value):
+        return None if value is None else asdict(value)
+
+    payload = {
+        "schema_version": 1,
+        "status": outcome.status,
+        "draft": outcome.draft,
+        "initial_draft": outcome.initial_draft,
+        "initial_review": _review(outcome.initial_review),
+        "revision_instructions": list(outcome.revision_instructions),
+        "final_review": _review(outcome.final_review),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def outcome_from_json(blob: str) -> ThinkingOutcome:
+    import json
+
+    data = json.loads(blob)
+
+    def _review(value):
+        if value is None:
+            return None
+        fields = {
+            "source_understanding", "critical_reasoning",
+            "personal_connection", "cognition_delta", "own_version",
+            "actionability", "business_rigor", "traceability",
+            "mechanism_salvage", "genericity_detected",
+            "revision_required", "revision_instructions"}
+        kwargs = {k: v for k, v in value.items() if k in fields}
+        kwargs["revision_instructions"] = tuple(
+            kwargs.get("revision_instructions") or ())
+        return CriticResult(**kwargs)
+
+    return ThinkingOutcome(
+        status=data["status"],
+        draft=data["draft"],
+        initial_draft=data.get("initial_draft"),
+        initial_review=_review(data.get("initial_review")),
+        revision_instructions=tuple(
+            data.get("revision_instructions") or ()),
+        final_review=_review(data.get("final_review")))

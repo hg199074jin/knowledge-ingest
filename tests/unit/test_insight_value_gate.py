@@ -7,7 +7,8 @@
   无总分阈值；
 - contradiction_value 允许 unknown：此时无可靠个人认知证据，
   绝不为填字段推测用户旧认知；
-- 模型坏输出/未知 decision → 类型化可重试错误。
+- 契约违约（M10-R3）：首次违约触发一次有界 contract repair，
+  两次仍非法 → 类型化可重试错误（BLOCKED_MODEL_BAD_OUTPUT）。
 """
 
 import inspect
@@ -101,15 +102,22 @@ def test_contradiction_unknown_is_legal():
 
 
 def test_unknown_decision_raises_retryable():
-    gate, _ = make_gate([dict(GATE_OK, decision="MAYBE")])
-    with pytest.raises(ModelBadOutputError):
+    # M10-R3：首次违约触发一次 contract repair；两次仍非法才 fail-closed
+    gate, port = make_gate([dict(GATE_OK, decision="MAYBE"),
+                            dict(GATE_OK, decision="MAYBE")])
+    with pytest.raises(ModelBadOutputError) as exc:
         gate.evaluate(make_view(), CANDIDATE_SUMMARY)
+    assert len(port.calls) == 2
+    assert "BLOCKED_MODEL_BAD_OUTPUT" in str(exc.value)
 
 
 def test_bad_output_raises_retryable():
-    gate, _ = make_gate([{"novelty": "high"}])   # 缺 decision
-    with pytest.raises(ModelBadOutputError):
+    # M10-R3：缺 decision → 一次 repair → 仍缺 → fail-closed
+    gate, port = make_gate([{"novelty": "high"}, {"novelty": "high"}])
+    with pytest.raises(ModelBadOutputError) as exc:
         gate.evaluate(make_view(), CANDIDATE_SUMMARY)
+    assert len(port.calls) == 2
+    assert "BLOCKED_MODEL_BAD_OUTPUT" in str(exc.value)
 
 
 def test_interface_has_no_personal_preview_parameter():
