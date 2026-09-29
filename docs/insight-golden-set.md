@@ -36,8 +36,14 @@
 - deep_read_precision
 - false_personal_link_rate
 - stale_context_leakage
-- critic_pass_rate
+- critic_reach_rate（到达 Critic 的比例，≠ pass rate）
+- critic_first_pass_rate（首轮 PASS / 到达 Critic 数）
+- critic_final_pass_rate（修订后最终 PASS / 到达 Critic 数）
 - human_quality_pending
+
+⚠️ Calls = 实际模型调用次数，不等于 case 数；revision/retry 会增加
+call count。safe fail-closed（如模型输出缺 decision → blocked）不计入
+正确语义分类，单独归类为 SAFE_FAIL_CLOSED。
 
 人工指标（与 ChatGPT 对照，M10-P 执行）：
 - semantic judgment convergence（8 维度 MATCH/PARTIAL/MISMATCH）
