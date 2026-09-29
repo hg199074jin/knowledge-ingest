@@ -108,7 +108,7 @@ def test_eight_categories_covered():
          "expected": {"candidate": True, "deep_value": "DEEP_READ"}}
         for i, cat in categories.items()
     ]
-    p = write_manifest(Path(str(manifest_cases[0])), manifest_cases) \
+    _p = write_manifest(Path(str(manifest_cases[0])), manifest_cases) \
         if False else None
     # 直接验证 categories dict 的完整性
     assert len(categories) == 8

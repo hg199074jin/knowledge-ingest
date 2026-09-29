@@ -212,7 +212,7 @@ def test_value_watch_is_terminal(tmp_path):
 
 def test_waiting_content_returns_waiting(tmp_path):
     model = FakeModel([], [])
-    store, service = make_service(tmp_path, model=model)
+    _store, service = make_service(tmp_path, model=model)
     outcome = service.process(make_view(full_text_available=False))
     assert outcome.stage == "content" and outcome.status == "waiting"
 
@@ -254,7 +254,7 @@ def test_second_run_skips_candidate_and_gate_models(tmp_path):
     model = FakeModel([dict(GOOD_THOUGHT), dict(GOOD_THOUGHT)],
                       [dict(CRITIC_PASS), dict(CRITIC_PASS)],
                       evidence_outputs=[dict(EVIDENCE), dict(EVIDENCE)])
-    store, service = make_service(tmp_path, model=model)
+    _store, service = make_service(tmp_path, model=model)
     service.process(make_view())
     # 第二轮：candidate/gate 判定已持久化 → 只有 evidence/thinking/critic 再跑
     outcome = service.process(make_view())

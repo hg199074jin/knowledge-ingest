@@ -496,7 +496,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ins_scan.add_argument("--limit", type=int, default=None)
     ins_sub.add_parser("status", parents=[common],
                        help="insight store summary")
-    ins_cards = ins_sub.add_parser("cards", parents=[common],
+    _ins_cards = ins_sub.add_parser("cards", parents=[common],
                                    help="list Deep Insight Cards")
     ins_show = ins_sub.add_parser("card", parents=[common],
                                   help="show one card")
@@ -512,7 +512,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ins_gate_res.add_argument("--decision", required=True,
                               choices=["ADOPT", "EXPERIMENT", "WATCH",
                                        "ARCHIVE", "REJECT"])
-    ins_watch = ins_sub.add_parser("watch", parents=[common],
+    _ins_watch = ins_sub.add_parser("watch", parents=[common],
                                    help="list watch signals")
     ins_digest = ins_sub.add_parser("digest", parents=[common],
                                     help="insight digest (navigation)")
