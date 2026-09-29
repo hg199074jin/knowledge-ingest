@@ -235,3 +235,23 @@ def test_card_row_recorded_with_pack_provenance(tmp_path):
     assert row["cognition_delta"] == "ADD"
     meta = json.loads(row["meta_json"])
     assert meta["context_pack_id"].startswith("ctxpack.")
+
+
+# ---------- M10-R4 复验发现：needs_review 产物也必须 resume ----------
+
+def test_needs_review_thought_resumed_without_model_recall(tmp_path):
+    """critic needs_review 是成功完成的昂贵 stage（重启恢复语义，
+    不是可重跑草稿）：needs_review 卡片重启后不得重跑 thinking/critic。
+    （M10-R4 复验实测：52258 thinking x2 = main + rescan，即此缺口。）"""
+    model = CountingModel(critic=CRITIC_STRICT)
+    _store, service, retriever = make_service(tmp_path, model)
+    outcome = service.process(make_view())
+    assert outcome.stage == "card" and outcome.status == "needs_review"
+    baseline = (model.evidence_calls, model.thinking_calls,
+                model.critic_calls)
+    assert baseline[1] >= 1               # 含修订轮
+
+    service.process(make_view())          # 同 revision 重扫
+    assert (model.evidence_calls, model.thinking_calls,
+            model.critic_calls) == baseline   # 零新增=从产物恢复
+    assert retriever.calls == 1

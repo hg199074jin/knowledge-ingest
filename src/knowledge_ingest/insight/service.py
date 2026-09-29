@@ -135,8 +135,12 @@ class InsightService:
         # 6) Thinker → Critic（最多一次修订）
         # M10-R2：thinking/critic 与 evidence 同权——成功完成即持久化
         # 完整审计链产物；重启时从产物恢复，绝不重复调用模型。
-        if self._stage_done(sid, revision, "thinking"):
-            outcome = self._load_thought(sid, revision)
+        # M10-R4：needs_review 也是成功完成的终态（重启恢复产物，
+        # 不重跑草稿）；仅 blocked/无产物才重新思考。
+        thought = self._load_thought(sid, revision)
+        if thought is not None and self._stage_status(
+                sid, revision, "thinking") in ("passed", "needs_review"):
+            outcome = thought
         else:
             outcome = None
         if outcome is None:
@@ -216,6 +220,15 @@ class InsightService:
                AND stage = ? ORDER BY run_id DESC LIMIT 1""",
             (sid, revision, stage)).fetchone()
         return row is not None and row["status"] == "passed"
+
+    def _stage_status(self, sid: str, revision: int,
+                      stage: str) -> str | None:
+        row = self.store._conn.execute(
+            """SELECT status FROM insight_runs
+               WHERE insight_source_id = ? AND source_revision = ?
+               AND stage = ? ORDER BY run_id DESC LIMIT 1""",
+            (sid, revision, stage)).fetchone()
+        return None if row is None else row["status"]
 
     def _save_pack(self, sid: str, pack) -> None:
         """Evidence Pack 全量 JSON 持久化（restart-safe 权威产物）。"""
