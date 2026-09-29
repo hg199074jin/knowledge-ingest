@@ -1,9 +1,11 @@
 # Knowledge-Ingest V3 Personal Insight Engine — M10 生产 Shadow 验收记录
 
-- 日期：2026-09-29
-- 分支：`v3-insight-engine`（HEAD=1e8970a）
-- 结论先行：**M10 Verdict = FAIL（P0 修复后需重跑 DEEP_READ 路径复验）**
-- 工程边界（幂等 / V2 隔离 / fail-closed / Human Gate）全部成立；失败集中于两处已精确定位、可修复的缺陷（1×P0 代码崩溃 + 1×P1 模型输出契约可靠性）。**不进入 M10-P。**
+- 日期：2026-09-29（首次验收同日完成 M10-R 修复与复验）
+- 分支：`v3-insight-engine`
+- 结论先行：
+  - **首次 M10 = FAIL**（验收记录 commit `203862d`；1×P0 代码崩溃 + 1×P1 模型契约可靠性；工程边界全部成立）——历史结论保留于 §1–§12，不覆盖；
+  - **M10-R 修复与复验完成后：M10 最终 Verdict = PASS WITH CALIBRATION ITEMS**（3 项校准/可靠性项透明列出，见 §M10-R-8）。
+- 不进入 M10-P（等用户对 Production Shadow Review 的最终裁定）。
 
 ---
 
@@ -130,6 +132,96 @@ Batch-2：成功终态条目每频道前 3 条复扫（3 条）→ **新模型�
 3. **[P1] M10-CAL-01**：deep_value_gate 输出契约可靠性 —— retry-with-backoff 或 contract/parser 修复；修复后以跨频道重扫验证首过失败率降到可运行水位（建议 <10%）再谈生产。
 4. 重跑范围：P0 修复后，对 4 个已知 DEEP_READ 条目 + 新到货条目做跨频道补扫，验证卡片真实落盘 + M10-6 补齐卡面抽检，再出 PASS/PASS WITH CALIBRATION ITEMS 终判。
 
-## 12. STOP 声明
+## 12. STOP 声明（首次验收）
 
 按用户 2026-09-29 复核指令：M10 Batch-2 完成即 STOP，**不进入 M10-P**（Cross-Agent Parity）。待 P0/P1 修复并复验后，由用户裁定是否重启 Production Shadow Review，再议 M10-P。
+
+---
+
+# M10-R Production Repair & Re-Acceptance（2026-09-29）
+
+用户正式裁定：**M10 = FAIL 成立，授权进入 M10-R（Production Repair）**；不回退 M1–M9、不重设计、不为验收调 Critic 严格度；修复完成后 STOP，M10 重新 PASS 以前不启动 M10-P。
+
+## M10-R-0｜提交账目（避免"验收记录 SHA / 代码 HEAD"歧义）
+
+| 对象 | SHA |
+|---|---|
+| 首次 FAIL 验收记录 commit | `203862d` |
+| lint 机械修复（F841/RUF059，无行为变化） | `7c9a502` |
+| M10-R 修复主体（R1+R2+R3） | `8867558` |
+| M10-R4 追加修复（needs_review 产物重启恢复） | `fa37bd3` |
+| 复验扫描运行时的代码 HEAD | `fa37bd3`（812 tests 绿 + ruff 净） |
+| 本验收记录更新 commit | 见最终报告（记录本身提交后的新 SHA） |
+
+## M10-R-1｜P0 修复方式（M10-BUG-1）
+
+- **schema v1→v2**：新增 `insight_context_packs` 元数据表（`(insight_source_id, source_revision) PK`，`ref_count` 可为 0）。全部 DDL `IF NOT EXISTS`，旧库打开时前向自动补建，`user_version` 只升不降。
+- `replace_context_refs`：pack 元数据行与 refs **同事务** upsert——`refs=[]`（NO_RELEVANT_PERSONAL_CONTEXT）也是一等持久化对象；无 sentinel 假 cognition ref。
+- `get_context_pack`：改由元数据表权威读取，不再从 ref 行反推；检索未发生返回 None（语义保留）。
+- `service.py`：retrieval 守卫改为 pack 行判定（零 refs 条目重启不再重检索）；卡片写出路径取一次性 pack 引用 + 显式不变量错误，杜绝 `.pack_id` 空解引用。
+- TDD 六条验收全绿：零 refs→合法 pack_id；close/reopen 后 `revision→pack_id→refs=[]` 成立；未检索=None 保留；新 revision 不继承旧 pack；DEEP_READ 全链不崩；卡面带 `ctxpack.*` provenance。
+
+## M10-R-2｜昂贵阶段 restart guard 全清点
+
+| 阶段 | 机制 | 状态 |
+|---|---|---|
+| candidate / value_gate | 决策按 (source, revision) 持久化，幂等复用 | 原有 ✓ |
+| retrieval（query_plan+select） | pack 元数据行存在即跳过 | **R1 修复** ✓ |
+| evidence_extract | `_stage_done` + EvidencePack 全量 JSON 持久化 | 原有 ✓ |
+| thinking + critic | ThinkingOutcome 完整审计链持久化（`thought:<sid>:<revision>`，run 行带 output_ref）+ 终态守卫 | **R2 新增** ✓ |
+| card write | 幂等原子写 + **卡片行落库 `insight_cards`**（`ON CONFLICT` 覆盖；顺带修复 digest/doctor 数据源空缺） | **R2 补齐** ✓ |
+
+- **复验实抓缺口（fa37bd3）**：thinking run 以质量状态落库，守卫最初只认 "passed"——needs_review 卡片重启会重跑 thinking+critic（生产实测 52258 thinking×2）。已修：needs_review 也是成功完成的终态，恢复产物不重跑；blocked 仍可重试。
+- 回归测试：卡崩→重启→零重复模型调用→卡片恰一张；needs_review 重扫零新增；outcome JSON 往返保留完整审计链。
+- **诚实记录**：Batch-2 的 4 个历史崩溃条目无产物可恢复（旧代码未持久化 thinking），本次复验前重置其下游状态全链重跑（重付一次 thinking，如实计入成本）；修复后的未来崩溃可从产物直续。
+
+## M10-R-3｜P1 修复方式（M10-CAL-01）
+
+- `DeepValueGate.evaluate`：**一次有界 contract repair**——仅契约违约（缺必填字段/enum 非法/结构坏）触发；同输入 + `previous_violation` 明确告知违反字段 + 完整 schema 重申；第二次仍非法 → `BLOCKED_MODEL_BAD_OUTPUT` fail-closed，且 service 落一条 `deep_value_gate/blocked` run 行供统计；parser 绝不猜测 decision；rate limit / 子进程瞬态错误不走 repair。
+- 审计四元组 `first_attempt_valid / repair_attempted / repair_result / first_violation` 持久化于 `decision_json.contract_repair`。
+
+## M10-R-4｜复验扫描（真实生产 Shadow，16 条 / 7 频道）
+
+样本（按用户 R4 规定，不换困难样本）：4 已知崩溃条目（重置下游全链重跑）+ 1 gate 两次未决（52261）+ 4 个 Batch-1 坏输出条目（tg_ai_nav 3216/3247/3253/3258）+ 2 终态抽查（25080/11817）+ 5 个 watcher 自然新到货（v2ex:10698、chuhai:11821、side_hustle:25085、zaihua:44100/44101）。耗时 1906s。
+
+**P0 验收：4/4 已知 DEEP_READ 条目全链完成 → 卡片真实落盘（5 张含 44100）**；空 pack 全链走通；跨进程重启幂等 **5/5 = 0 新模型调用**（2 张 needs_review 卡从产物恢复 + 3 终态短路）。
+
+**P1 验收（分层，不隐藏）**：
+
+| 口径 | 首过尝试 | 修复触发 | 修复成功 | 终态 blocked |
+|---|---|---|---|---|
+| 全样本 | 11 | 4 | 4 | **0** |
+| 其中：故意保留的历史坏输出条目（tg_ai_nav×4 + 52261） | 5 | 4 | 4 | 0 |
+| **自然条目（5 新到货 + 2 终态抽查首评）** | 7 | **0** | — | 0 |
+
+- 4 次修复全部来自 Batch-1 已知坏输出条目（同类 `missing decision field`），修复后终态 WATCH——**这些 payload 的首过违约是持续性的模型契约弱点**（保留为生产可靠性观察项）；自然分布本批 0/7 首过合法，远优于 <10% 目标，但样本小，继续观察。
+- 卡片总账：5 张全部 `needs_review`、`cognition_delta=NONE` → **0 proposal**（设计正确：needs_review 与 NONE 都不得产生 proposal）；`approved_cognition=0`（无 ADOPT）。
+
+## M10-R-5｜R5 卡片验收类型（自然出现，不人工造）
+
+| 类型 | 结果 |
+|---|---|
+| passed card | **NOT_OBSERVED**（5/5 needs_review——critic 严格度与 M9 一致） |
+| needs_review card | ✓ 5 张（抽检 11803 AiToEarn 卡：H1=标题≠结论、provenance 带 `ctxpack.*`、诚实空连接、机制保留+证据要求清晰） |
+| WATCH / ARCHIVE_ONLY | ✓ 7 条 + REJECT NOT_OBSERVED（本批样本全是历史 candidate-true 或问题条目，自然不出现） |
+| NO_RELEVANT_PERSONAL_CONTEXT | ✓ 5/5 深读条目（诚实空 pack，非假连接） |
+| cognition delta / business opportunity / proposal | NOT_OBSERVED（delta 全 NONE，0 proposal） |
+
+## M10-R-6｜Personal Retrieval Acceptance（R6）
+
+- 已配置并实际使用**真实、非空**个人知识源：`KI_INSIGHT_RETRIEVAL_CMD` → `KnowledgePipeline/insight/retrieval_cmd.py`（approved_cognition + Obsidian 442 篇 .md 只读检索，笔记诚实标 TENTATIVE，不写生产 cognition，两个数据源零写入）。直接查询实测非空（如"民宿 定价"命中开业 SOP V1.1 与能力卡片）。
+- 生产实测：检索层正常返回候选，但 5/5 深读条目 selector 判定全 NONE → 卡片诚实呈现"无个人背景记录"。**按用户硬门：源已真实参与，不再 BLOCKED_EXTERNAL；但"生产个人连接质量"仍属 NOT_YET_OBSERVED**——selector 对弱相关 GitHub_KB 条目拒绝强连，是精度优先行为，校准项保留。
+
+## M10-R-7｜V2 边界快速复核（R7）
+
+doctor 0 FAIL / 2 WARN（两条均既有事项）；watcher PID 999 存活持续收消息；telegram 库 insight 表 0；downloads 69 / handoff 4 不变；K2C 语义零代码变更。
+
+## M10-R-8｜M10 最终 Verdict
+
+**PASS WITH CALIBRATION ITEMS**——P0 根因修复并在生产实证（4/4 出卡、重启零重复付费、空 pack 一等持久化）；P1 修复后终态错误 0、自然流 0/7 首过合法；工程边界（幂等/隔离/Human Gate/fail-closed）在修复后代码上全部保持。三项透明校准/可靠性项：
+
+1. **CAL-1（可靠性观察）**：历史坏输出 payload（tg_ai_nav 类）首过违约仍持续，repair 100% 兜底但生产需持续跟踪首过率（目标 <10%）；
+2. **CAL-2**：生产个人连接质量 NOT_YET_OBSERVED（5/5 诚实空连接；随 approved_cognition 增长与笔记匹配度提升再验）；
+3. **CAL-3**：passed card 与 proposal/Human Gate 全链在生产 NOT_OBSERVED（critic 严格度沿 M9 结论，待自然出现或专项校准）。
+
+**STOP：不进入 M10-P**，等用户对 Production Shadow Review 的最终裁定。
