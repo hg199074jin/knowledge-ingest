@@ -161,10 +161,14 @@ def _k2c_handoff_extra(*, manifest, job_dir, corpus_path=None, **_):
     target identity / k2c handoff_extra 关键字段。
     """
     identity = _read_corpus_identity(corpus_path)
+    # K2C 决议 Q5：telegram → knowledge profile，其余 provider → full
+    #（零 JobRequest 扩展：只读既有 manifest.request.provider）。
+    provider = getattr(getattr(manifest, "request", None), "provider", None)
     lines = [
         "k2c:",
         f"  data_root: {K2C_DATA_ROOT}",
         f"  job_ref: {manifest.job_id}",
+        f"  build_profile: {'knowledge' if provider == 'telegram' else 'full'}",
         "  handoff_mode: build --handoff target-k2c.yaml",
         "  corpus:",
         f"    corpus_id: {identity['corpus_id']}",

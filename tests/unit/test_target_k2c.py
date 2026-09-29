@@ -9,12 +9,15 @@ corpus 身份（fingerprints + verify_status）、budget 段与 k2c data root
 import json
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from knowledge_ingest.cli import _cmd_distill_prepare
 from knowledge_ingest.config import SkillNames
 from knowledge_ingest.manifest_store import ManifestStore
+from knowledge_ingest.models import JobRequest
 from knowledge_ingest.targets import REGISTRY
 from knowledge_ingest.targets import get as get_target
 
@@ -135,3 +138,85 @@ def test_distill_prepare_k2c_writes_handoff(env):
     assert "k2c:" in text
     assert "verify_status: passed" in text
     assert "budget:" in text
+
+
+# ---------- K2C Task 9：build_profile（telegram → knowledge，其余 → full） ----------
+
+
+def _fake_manifest(provider: str):
+    return SimpleNamespace(job_id="j1",
+                           request=SimpleNamespace(provider=provider))
+
+
+def test_k2c_handoff_extra_build_profile_telegram(tmp_path: Path):
+    """K2C 决议 Q5：telegram provider → build_profile: knowledge。"""
+    from knowledge_ingest.targets import _k2c_handoff_extra
+
+    corpus = _mini_corpus(tmp_path / "corpus")
+    lines = _k2c_handoff_extra(manifest=_fake_manifest("telegram"),
+                               job_dir=str(tmp_path),
+                               corpus_path=str(corpus))
+    text = "\n".join(lines)
+    assert "  build_profile: knowledge" in text
+    parsed = yaml.safe_load(text)
+    assert parsed["k2c"]["build_profile"] == "knowledge"
+
+
+@pytest.mark.parametrize("provider", ["local", "baidu", "quark"])
+def test_k2c_handoff_extra_build_profile_full_for_non_telegram(
+        tmp_path: Path, provider):
+    """K2C 决议 Q5：其余 provider（local/baidu/quark）→ build_profile: full。"""
+    from knowledge_ingest.targets import _k2c_handoff_extra
+
+    corpus = _mini_corpus(tmp_path / "corpus")
+    lines = _k2c_handoff_extra(manifest=_fake_manifest(provider),
+                               job_dir=str(tmp_path),
+                               corpus_path=str(corpus))
+    text = "\n".join(lines)
+    assert "  build_profile: full" in text
+    parsed = yaml.safe_load(text)
+    assert parsed["k2c"]["build_profile"] == "full"
+
+
+def test_build_profile_line_follows_job_ref(tmp_path: Path):
+    """冻结位置：build_profile 必须紧跟 job_ref: 之后一行。"""
+    from knowledge_ingest.targets import _k2c_handoff_extra
+
+    corpus = _mini_corpus(tmp_path / "corpus")
+    lines = _k2c_handoff_extra(manifest=_fake_manifest("telegram"),
+                               job_dir=str(tmp_path),
+                               corpus_path=str(corpus))
+    ref_index = lines.index("  job_ref: j1")
+    assert lines[ref_index + 1] == "  build_profile: knowledge"
+
+
+def test_distill_prepare_k2c_build_profile_follows_provider(env):
+    """集成（全链路）：target-k2c.yaml 的 k2c 块按 manifest.request.provider
+    携带 build_profile；除新增行外既有内容不变。"""
+    config, store = env
+    corpus_tg = _mini_corpus(config.pipeline_root / "mini-corpus-tg")
+    manifest = store.create(JobRequest(
+        raw_prompt="x", provider="telegram",
+        source="/tmp/source-k2c-telegram", targets=["k2c"]))
+    with store.edit(manifest.job_id) as m:
+        m.status = "CORPUS_READY"
+        m.docchunk.corpus_path = str(corpus_tg)
+    assert _cmd_distill_prepare(
+        config, Namespace(job_id=manifest.job_id, target="k2c")) == 0
+    tg_text = (store.job_dir(manifest.job_id) / "handoff"
+               / "target-k2c.yaml").read_text(encoding="utf-8")
+    assert yaml.safe_load(tg_text)["k2c"]["build_profile"] == "knowledge"
+    assert "verify_status: passed" in tg_text          # 既有字段不动
+
+    corpus_local = _mini_corpus(config.pipeline_root / "mini-corpus-local")
+    local_manifest = store.create(JobRequest(
+        raw_prompt="x", provider="local",
+        source="/tmp/source-k2c-local", targets=["k2c"]))
+    with store.edit(local_manifest.job_id) as m:
+        m.status = "CORPUS_READY"
+        m.docchunk.corpus_path = str(corpus_local)
+    assert _cmd_distill_prepare(
+        config, Namespace(job_id=local_manifest.job_id, target="k2c")) == 0
+    local_text = (store.job_dir(local_manifest.job_id) / "handoff"
+                  / "target-k2c.yaml").read_text(encoding="utf-8")
+    assert yaml.safe_load(local_text)["k2c"]["build_profile"] == "full"

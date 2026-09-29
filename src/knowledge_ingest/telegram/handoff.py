@@ -139,6 +139,10 @@ class TelegramHandoffRunner:
                                     if messages else None),
                 # §20.2：下游必须能知道原消息后来被删除
                 "source_deleted": any(row["deleted_at"] for row in messages),
+                # K2C Task 9：新鲜 handoff 恒定 False——handoff 之前的编辑
+                # 属于当前 Source Truth，不算"handoff 后被编辑"；handoff 后
+                # 的编辑由 items.py（ingest_edit）回写 True + edited_at
+                "source_edited_after_handoff": False,
             },
         }
 

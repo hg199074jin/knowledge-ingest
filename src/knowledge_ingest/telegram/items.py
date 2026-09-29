@@ -10,7 +10,7 @@ open 窗口内的 EDIT 天然被吸收。
 import json
 import re
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from knowledge_ingest.manifest_store import ManifestStore, atomic_write_text
@@ -77,6 +77,13 @@ def is_resource_collection_candidate(text: str | None) -> bool:
 
 def _aware(value: str) -> datetime:
     return datetime.fromisoformat(str(value))
+
+
+def _iso_utc(value: datetime) -> str:
+    """与 watcher._iso 同形：Telegram 时间戳 → UTC ISO（秒精度）。
+    K2C Task 9：provenance.edited_at 只能携带事件已归一的时间，
+    绝不使用 datetime.now() 或任何构造时间。"""
+    return value.astimezone(UTC).isoformat(timespec="seconds")
 
 
 def _sender_str(sender_id) -> str | None:
@@ -194,6 +201,10 @@ class SourceItemPipeline:
             self.store.create_review(item_id,
                                      "SOURCE_EDITED_AFTER_HANDOFF",
                                      kind=item["kind"])
+            # K2C Task 9：下游 provenance 必须能知道源在 handoff 后被编辑
+            #（时间戳用事件已归一的 edited_at，缺失时退回 message_date）
+            self._mark_downstream_edited(
+                item_id, event.edited_at or event.message_date)
             return "handoff_review"          # §6.4 C：Corpus 不动
         if item["processing_status"] == "open":
             return "absorbed"                # §6.4 A：open 窗口派生吸收
@@ -387,6 +398,48 @@ class SourceItemPipeline:
                     and provenance.get("source_deleted") is not True:
                 with manifest_store.edit(job_id) as manifest:
                     manifest.source["provenance"]["source_deleted"] = True
+        except Exception as exc:            # noqa: BLE001 —— 审计补记不致命
+            print(f"downstream provenance update failed ({job_id}): {exc}",
+                  file=sys.stderr, flush=True)
+
+    def _mark_downstream_edited(self, item_id: str, edited_at) -> None:
+        """K2C Task 9：已 handoff 的 Item 收到编辑后，下游 provenance 必须
+        能知道（镜像 _mark_downstream_deleted 的持久化纪律：source.json 与
+        job.yaml 双位置同状态；幂等可重放，且 watermark 可前进——再次编辑
+        把 edited_at 覆盖为最新事件时间，绝不使用墙钟时间）。
+        """
+        item = self.store.get_source_item(item_id)
+        job_id = item["knowledge_ingest_job_id"] if item else None
+        if not job_id:
+            return
+        stamp = _iso_utc(edited_at) if edited_at is not None else None
+        jobs_root = Path(self.data_root) / "jobs"
+        try:
+            handoff_file = jobs_root / job_id / "handoff" / "source.json"
+            if handoff_file.is_file():
+                handoff = json.loads(handoff_file.read_text(encoding="utf-8"))
+                provenance = handoff.get("provenance")
+                if isinstance(provenance, dict):
+                    provenance["source_edited_after_handoff"] = True
+                    if stamp is not None:
+                        provenance["edited_at"] = stamp
+                    atomic_write_text(handoff_file, json.dumps(
+                        handoff, ensure_ascii=False, indent=2))
+            manifest_store = ManifestStore(jobs_root=jobs_root)
+            if not manifest_store.manifest_path(job_id).is_file():
+                return
+            registered = manifest_store.load(job_id)
+            source = registered.source if isinstance(registered.source,
+                                                     dict) else None
+            provenance = source.get("provenance") if source else None
+            if isinstance(provenance, dict) and (
+                    provenance.get("source_edited_after_handoff") is not True
+                    or provenance.get("edited_at") != stamp):
+                with manifest_store.edit(job_id) as manifest:
+                    manifest.source["provenance"][
+                        "source_edited_after_handoff"] = True
+                    if stamp is not None:
+                        manifest.source["provenance"]["edited_at"] = stamp
         except Exception as exc:            # noqa: BLE001 —— 审计补记不致命
             print(f"downstream provenance update failed ({job_id}): {exc}",
                   file=sys.stderr, flush=True)
