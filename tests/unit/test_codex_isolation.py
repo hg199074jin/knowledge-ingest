@@ -26,6 +26,7 @@ from knowledge_ingest.insight.codex_isolation import (
     load_manifest,
     run_hostile_smoke,
     run_preflight,
+    sha256_file,
     validate_config,
     write_manifest,
 )
@@ -37,10 +38,22 @@ from knowledge_ingest.insight.model_port import (
 TOKEN = "Bearer super-secret-token-never-leak"
 
 
+MACHO_MAGIC = b"\xcf\xfa\xed\xfe"          # MH_MAGIC_64 (arm64 thin)
+_LAUNCHER_STUB = "#!/bin/sh\necho 'codex-cli 0.159.2'\n"
+
+
 def stub_binary(tmp_path: Path, version_line: str = "codex-cli 0.159.2") -> Path:
-    """可执行 stub：--version 输出指定版本行（真实执行，带 shebang）。"""
+    """native-style stub：Mach-O magic 开头 + 版本行（不真实执行）。"""
     binary = tmp_path / "codex-stub"
-    binary.write_text(f"#!/bin/sh\necho '{version_line}'\n", encoding="utf-8")
+    binary.write_bytes(MACHO_MAGIC + b"\x00" * 16 + version_line.encode())
+    binary.chmod(0o755)
+    return binary
+
+
+def launcher_stub(tmp_path: Path) -> Path:
+    """shebang launcher 风格 stub（P7 identity 检查应拒绝）。"""
+    binary = tmp_path / "codex-launcher"
+    binary.write_text(_LAUNCHER_STUB, encoding="utf-8")
     binary.chmod(0o755)
     return binary
 
@@ -54,7 +67,7 @@ def make_profile(tmp_path: Path, binary: Path, **overrides) -> CodexIsolationPro
     codex = tmp_path / "iso-codex-home"
     ws = tmp_path / "ws"
     for d in (home, codex, ws):
-        d.mkdir()
+        d.mkdir(parents=True, exist_ok=True)
     if "binary_sha256" in overrides:
         sha_value = overrides.pop("binary_sha256")
     else:
@@ -343,3 +356,191 @@ def test_secret_value_real_error_path_sanitized(tmp_path):
         })
     assert "super-secret-token-abc" not in str(exc.value)  # 值不入消息
     assert "KI_INSIGHT_ISOLATION_HOME" in str(exc.value)   # 只含变量名
+
+
+# ---------- Issue #10 patch：P1–P7 ----------
+
+
+
+class _FakeSubprocess:
+    """捕获 subprocess.run kwargs 的 stub（P1 默认 runner 验证）。"""
+
+    def __init__(self, stdout):
+        self.calls = []
+        self._stdout = stdout
+
+    def run(self, argv, **kwargs):
+        self.calls.append({"argv": argv, **kwargs})
+        import types
+        return types.SimpleNamespace(returncode=0, stdout=self._stdout)
+
+
+def test_default_hostile_runner_uses_isolated_env_and_workspace(
+        tmp_path, monkeypatch):
+    """P1：默认 runner 必须 env=isolated env 且 cwd=neutral workspace。"""
+    import knowledge_ingest.insight.codex_isolation as ci
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    monkeypatch.setenv("SECRET_MARKER", "ambient-secret-value")
+    fake = _FakeSubprocess(
+        "无 web 工具\n无网络访问\nexit 134 不可访问\n"
+        "PARITY-NETOFF-MARKER-Z3K\n受访问限制\n")
+    monkeypatch.setattr(ci, "subprocess", fake)
+    results = run_hostile_smoke(profile, exec_args=["exec"])
+    assert all(v["pass"] for v in results.values())
+    call = fake.calls[0]
+    env = call["env"]
+    assert env["HOME"] == str(profile.isolated_home)
+    assert env["CODEX_HOME"] == str(profile.codex_home)
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert "SECRET_MARKER" not in env
+    assert call["cwd"] == str(profile.workspace)
+
+
+def test_default_hostile_argv_contains_three_disable_flags(tmp_path):
+    """P5：默认 argv 必须自动带上三个已验证 disable flags（profile 单一来源）。"""
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    captured = {}
+
+    def run_fn(argv, stdin_text):
+        captured["argv"] = list(argv)
+        return 0, "无网络访问"
+
+    run_hostile_smoke(profile, exec_args=["exec"], run_fn=run_fn)
+    argv = captured["argv"]
+    for flag in ("--disable apps", "--disable web_search",
+                 "--disable web_search_request"):
+        parts = flag.split()
+        assert all(p in argv for p in parts), (flag, argv)
+
+
+def test_n1_empty_stdout_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    results = run_hostile_smoke(profile, exec_args=["exec"], run_fn=lambda a, s: (0, ""))
+    assert results["N1"]["pass"] is False
+
+
+def test_n1_arbitrary_text_without_marker_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    results = run_hostile_smoke(
+        profile, exec_args=["exec"],
+        run_fn=lambda a, s: (0, "hello world, nothing relevant here"))
+    assert results["N1"]["pass"] is False
+
+
+def test_n4_marker_must_be_exact(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    results = run_hostile_smoke(
+        profile, exec_args=["exec"],
+        run_fn=lambda a, s: (0, "PARITY-NETOFF-MARKER-WRONG"))
+    assert results["N4"]["pass"] is False
+
+
+def test_config_deny_entry_removed_but_description_kept_fail(tmp_path):
+    """P2：只删真实 deny entry、保留含 deny 字样的 description → 必须 FAIL。"""
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    lines = generate_config(profile).splitlines()
+    kept = [l for l in lines if not (l.strip().startswith('"/Users/sandro"')
+                                     and "deny" in l)]
+    assert kept != lines                        # 确认确实删掉了 entry 行
+    result = validate_config("\n".join(kept), profile)
+    assert result.status == "FAIL"
+
+
+def test_manifest_missing_fail_overall_not_pass(tmp_path):
+    """P3：资产完整但不创建 manifest → P5 FAIL，overall != PASS。"""
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    (profile.codex_home / "config.toml").write_text(
+        generate_config(profile), encoding="utf-8")
+    (profile.codex_home / "auth.json").write_text("{}", encoding="utf-8")
+    auth = profile.codex_home / "auth.json"
+    auth.chmod(0o600)
+    overall, checks = run_preflight(profile)
+    p5 = [c for c in checks if c.code.startswith("P5")]
+    assert p5 and all(c.status == "FAIL" for c in p5)
+    assert "missing" in p5[0].detail
+    assert overall != "PASS"
+
+
+def _write_valid_assets(profile):
+    (profile.codex_home / "config.toml").write_text(
+        generate_config(profile), encoding="utf-8")
+    auth = profile.codex_home / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    auth.chmod(0o600)
+
+
+def _drift_manifest(tmp_path, profile, **overrides):
+    binary = stub_binary(tmp_path)
+    base = make_profile(tmp_path, binary)
+    manifest = build_manifest(base)             # 用"别的 profile"的投影制造 drift
+    manifest.update(overrides)
+    return manifest
+
+
+def test_manifest_profile_id_drift_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    manifest = _drift_manifest(tmp_path, profile,
+                               profile_id="drifted-id")
+    manifest["binary_sha256"] = sha256_file(binary)
+    manifest["binary_path"] = str(binary)
+    write_manifest(profile.codex_home / MANIFEST_FILENAME, manifest)
+    _overall, checks = run_preflight(profile)
+    assert any(c.status == "FAIL" and "profile_id" in c.detail
+               for c in checks if c.code.startswith("P5"))
+
+
+def test_manifest_binary_path_drift_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    manifest = _drift_manifest(tmp_path, profile,
+                               binary_path="/somewhere/else/codex")
+    manifest["binary_sha256"] = sha256_file(binary)
+    write_manifest(profile.codex_home / MANIFEST_FILENAME, manifest)
+    _overall, checks = run_preflight(profile)
+    assert any(c.status == "FAIL" for c in checks if c.code.startswith("P5"))
+
+
+def test_manifest_policy_drift_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    manifest = _drift_manifest(tmp_path, profile, network_policy="full")
+    manifest["binary_sha256"] = sha256_file(binary)
+    manifest["binary_path"] = str(binary)
+    write_manifest(profile.codex_home / MANIFEST_FILENAME, manifest)
+    _overall, checks = run_preflight(profile)
+    assert any(c.status == "FAIL" and "network_policy" in c.detail
+               for c in checks if c.code.startswith("P5"))
+
+
+def test_manifest_required_cli_args_drift_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    manifest = _drift_manifest(tmp_path, profile,
+                               required_cli_args=["--disable", "apps"])
+    manifest["binary_sha256"] = sha256_file(binary)
+    manifest["binary_path"] = str(binary)
+    write_manifest(profile.codex_home / MANIFEST_FILENAME, manifest)
+    _overall, checks = run_preflight(profile)
+    assert any(c.status == "FAIL" and "required_cli_args" in c.detail
+               for c in checks if c.code.startswith("P5"))
+
+
+def test_native_vs_launcher_identity(tmp_path):
+    """P7：shebang launcher 必须被 identity 检查拒绝；native magic 通过。"""
+    binary = stub_binary(tmp_path)
+    ok = certify_binary(make_profile(tmp_path, binary),
+                        version_probe=lambda p: "codex-cli 0.159.2")
+    assert ok.status == "PASS"
+    launcher = launcher_stub(tmp_path)
+    bad = certify_binary(make_profile(tmp_path, launcher),
+                         version_probe=lambda p: "codex-cli 0.159.2")
+    assert bad.status == "FAIL"
+    assert "native" in bad.detail or "Mach-O" in bad.detail
