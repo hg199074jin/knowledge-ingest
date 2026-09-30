@@ -544,3 +544,110 @@ def test_native_vs_launcher_identity(tmp_path):
                          version_probe=lambda p: "codex-cli 0.159.2")
     assert bad.status == "FAIL"
     assert "native" in bad.detail or "Mach-O" in bad.detail
+
+
+# ---------- Issue #12 F1：returncode fail-closed ----------
+
+def test_f1_n1_rc1_with_correct_marker_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    results = run_hostile_smoke(
+        profile, exec_args=["exec"],
+        run_fn=lambda a, s: (1, "无 web 工具"))
+    assert results["N1"]["pass"] is False
+
+
+def test_f1_n2_rc1_with_correct_phrase_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    results = run_hostile_smoke(
+        profile, exec_args=["exec"],
+        run_fn=lambda a, s: (1, "无网络访问"))
+    assert results["N2"]["pass"] is False
+
+
+def test_f1_n3_rc1_with_correct_text_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    results = run_hostile_smoke(
+        profile, exec_args=["exec"],
+        run_fn=lambda a, s: (1, "exit 134 不可访问"))
+    assert results["N3"]["pass"] is False
+
+
+def test_f1_n4_rc1_with_correct_marker_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    results = run_hostile_smoke(
+        profile, exec_args=["exec"],
+        run_fn=lambda a, s: (1, "PARITY-NETOFF-MARKER-Z3K"))
+    assert results["N4"]["pass"] is False
+
+
+def test_f1_n5_rc1_with_correct_text_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    results = run_hostile_smoke(
+        profile, exec_args=["exec"],
+        run_fn=lambda a, s: (1, "访问限制"))
+    assert results["N5"]["pass"] is False
+
+
+def test_f1_evidence_contains_rc(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    results = run_hostile_smoke(
+        profile, exec_args=["exec"],
+        run_fn=lambda a, s: (1, "无 web 工具"))
+    assert "rc=1" in results["N1"]["evidence"]
+
+
+def test_f1_rc0_still_passes_with_positive_evidence(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    results = run_hostile_smoke(
+        profile, exec_args=["exec"],
+        run_fn=lambda a, s: (0, "PARITY-NETOFF-MARKER-Z3K"))
+    assert results["N4"]["pass"] is True
+
+
+# ---------- Issue #12 F2：manifest/binary 损坏 → fail-closed ----------
+
+def test_f2_binary_deleted_preflight_returns_p5_fail_not_exception(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    manifest = build_manifest(profile)
+    manifest["certification_state"] = "PREFLIGHT_PASS"
+    write_manifest(profile.codex_home / MANIFEST_FILENAME, manifest)
+    _write_valid_assets(profile)                   # auth provisioned：只测 binary 消失
+    binary.unlink()                                # 资产在认证后消失
+    overall, checks = run_preflight(profile)       # 不得抛异常
+    p5 = [c for c in checks if c.code.startswith("P5")]
+    assert p5 and all(c.status == "FAIL" for c in p5)
+    assert any("binary asset unavailable" in c.detail for c in p5)
+    assert overall == "FAIL"
+    blocked = [c for c in checks if c.status == "BLOCKED"]
+    assert not blocked, blocked                    # 本场景不允许任何 BLOCKED
+
+
+def test_f2_malformed_manifest_json_fail_closed(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    _write_valid_assets(profile)
+    secret_blob = '{"x": "top-secret-manifest-content-xyz"'
+    (profile.codex_home / MANIFEST_FILENAME).write_bytes(
+        secret_blob.encode())                      # 截断/损坏 JSON
+    _overall, checks = run_preflight(profile)       # 不得抛异常
+    p5 = [c for c in checks if c.code.startswith("P5")]
+    assert p5 and all(c.status == "FAIL" for c in p5)
+    assert any("invalid/unreadable manifest" in c.detail for c in p5)
+    joined = " ".join(c.detail for c in p5)
+    assert "top-secret-manifest-content-xyz" not in joined  # 不回显原文
+
+
+def _write_valid_assets(profile):
+    (profile.codex_home / "config.toml").write_text(
+        generate_config(profile), encoding="utf-8")
+    auth = profile.codex_home / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    auth.chmod(0o600)
