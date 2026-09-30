@@ -24,6 +24,9 @@ import json
 import os
 import shlex
 import subprocess
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 STAGE_ENV_VARS = {
@@ -45,6 +48,37 @@ class ModelPortError(RuntimeError):
 
 class ModelNotConfiguredError(ModelPortError):
     """该 stage 未配置命令（ neither stage override nor base）。"""
+
+
+class ModelIsolationConfigurationError(ModelPortError):
+    """R1.1：strict isolation 配置缺失/非法（construction-time fail-closed）。
+
+    消息只含环境变量名与简短原因，绝不含 payload 或 secret value。
+    """
+
+
+@dataclass(frozen=True)
+class IsolationProfile:
+    """R1.1：generic 子进程隔离边界（不含任何 provider/Codex 专有语义）。
+
+    职责仅限：给定宿主 ambient env，构造经 allowlist 过滤 + 显式覆盖的
+    child env；strict 时指定 workspace cwd。Codex 专有校验（版本/config/
+    network/fs deny）不在本类，归 provider-specific adapter（R1.2）。
+    """
+
+    profile_id: str
+    isolated_home: Path
+    workspace_cwd: Path
+    child_env_allowlist: tuple[str, ...] = ("TMPDIR", "LANG", "LC_CTYPE")
+    child_env_overrides: Mapping[str, str] = field(default_factory=dict)
+    require_strict: bool = True
+
+    def build_child_env(self, ambient: Mapping[str, str]) -> dict[str, str]:
+        """allowlist 放行 + 显式覆盖；绝不整批继承 ambient。"""
+        child = {k: ambient[k] for k in self.child_env_allowlist
+                 if k in ambient}
+        child.update(self.child_env_overrides)
+        return child
 
 
 class ModelCommandFailedError(ModelPortError):
@@ -117,9 +151,20 @@ class CommandInsightModelPort:
     """InsightModelPort 的命令行实现（不绑定任何 provider）。"""
 
     def __init__(self, env: dict | None = None, *,
-                 timeout: float | None = None):
+                 timeout: float | None = None,
+                 isolation: IsolationProfile | None = None):
+        # control-plane 配置源：仅用于解析 KI_INSIGHT_*；
+        # 子进程 env 由 isolation 另行构造，二者绝不含混。
         self.env = dict(env) if env is not None else dict(os.environ)
         self.timeout = timeout
+        self.isolation = isolation
+        if isolation is not None and isolation.require_strict:
+            overrides = [name for name in STAGE_ENV_VARS.values()
+                         if self.env.get(name, "").strip()]
+            if overrides:
+                raise ModelIsolationConfigurationError(
+                    "strict isolation forbids stage overrides: "
+                    + ",".join(overrides))
 
     def resolve_command(self, stage: str) -> str:
         override = self.env.get(STAGE_ENV_VARS[stage], "").strip()
@@ -148,11 +193,20 @@ class CommandInsightModelPort:
         argv = shlex.split(self.resolve_command(stage))
         request = json.dumps({"schema_version": 1, "stage": stage,
                               "payload": payload}, ensure_ascii=False)
-        cwd = self.env.get("KI_INSIGHT_MODEL_CWD", "").strip() or None
+        strict = self.isolation is not None and self.isolation.require_strict
+        if strict:
+            # R1.1：strict 下 workspace cwd 优先，child env 由 profile 构造，
+            # 绝不继承宿主 ambient env。
+            child_env = self.isolation.build_child_env(os.environ)
+            cwd = str(self.isolation.workspace_cwd)
+        else:
+            child_env = None
+            cwd = self.env.get("KI_INSIGHT_MODEL_CWD", "").strip() or None
         try:
             proc = subprocess.run(
                 argv, input=request, capture_output=True, text=True,
-                timeout=self._timeout_seconds(), check=False, cwd=cwd)
+                timeout=self._timeout_seconds(), check=False, cwd=cwd,
+                env=child_env)
         except subprocess.TimeoutExpired as exc:
             raise ModelTimeoutError(
                 f"model command timed out after "
@@ -169,3 +223,71 @@ class CommandInsightModelPort:
             raise ModelBadOutputError(
                 "model stdout contains no complete JSON object")
         return parsed
+
+
+# ---------- R1.1：construction-time strict factory（A5） ----------
+
+_ISOLATION_HOME_ENV = "KI_INSIGHT_ISOLATION_HOME"
+_ISOLATION_CODEX_HOME_ENV = "KI_INSIGHT_ISOLATION_CODEX_HOME"
+_ISOLATION_WORKSPACE_ENV = "KI_INSIGHT_ISOLATION_WORKSPACE"
+_ISOLATION_PROFILE_ID_ENV = "KI_INSIGHT_ISOLATION_PROFILE_ID"
+_ISOLATION_CHILD_PATH_ENV = "KI_INSIGHT_ISOLATION_CHILD_PATH"
+
+
+def build_insight_model_port_from_env(
+        env: Mapping[str, str] | None = None) -> CommandInsightModelPort:
+    """R1.1 薄工厂：读 control-plane env → 校验/构造 strict profile → 返回 port。
+
+    仅负责 generic 子进程边界；Codex 专有校验（版本/config/network/fs deny）
+    归 R1.2 provider-specific adapter。strict 校验在任何模型调用前 fail-closed。
+    """
+    env = dict(os.environ) if env is None else dict(env)
+    require = env.get("KI_INSIGHT_REQUIRE_ISOLATION", "").strip() == "1"
+    if not require:
+        # 非 strict：开发/测试兼容（旧 ambient 语义 + stage override）
+        return CommandInsightModelPort(env=env)
+
+    def _required(name: str) -> str:
+        value = env.get(name, "").strip()
+        if not value:
+            raise ModelIsolationConfigurationError(
+                f"strict isolation requires {name}")
+        return value
+
+    isolated_home = Path(_required(_ISOLATION_HOME_ENV))
+    codex_home = _required(_ISOLATION_CODEX_HOME_ENV)
+    workspace = Path(_required(_ISOLATION_WORKSPACE_ENV))
+    if not isolated_home.is_dir():
+        raise ModelIsolationConfigurationError(
+            f"strict isolation HOME directory does not exist: "
+            f"{_ISOLATION_HOME_ENV}")
+    if not workspace.is_dir():
+        raise ModelIsolationConfigurationError(
+            f"strict isolation workspace directory does not exist: "
+            f"{_ISOLATION_WORKSPACE_ENV}")
+    overrides = [name for name in STAGE_ENV_VARS.values()
+                 if env.get(name, "").strip()]
+    if overrides:
+        raise ModelIsolationConfigurationError(
+            "strict isolation forbids stage overrides: " + ",".join(overrides))
+    command = env.get("KI_INSIGHT_MODEL_CMD", "").strip()
+    if not command:
+        raise ModelIsolationConfigurationError(
+            "strict isolation requires KI_INSIGHT_MODEL_CMD")
+    if not os.path.isabs(shlex.split(command)[0]):
+        raise ModelIsolationConfigurationError(
+            "strict isolation requires an absolute model command path")
+    isolation = IsolationProfile(
+        profile_id=(env.get(_ISOLATION_PROFILE_ID_ENV, "").strip()
+                    or "strict-default"),
+        isolated_home=isolated_home,
+        workspace_cwd=workspace,
+        child_env_allowlist=("TMPDIR", "LANG", "LC_CTYPE"),
+        child_env_overrides={
+            "HOME": str(isolated_home),
+            "CODEX_HOME": codex_home,
+            "PATH": env.get(_ISOLATION_CHILD_PATH_ENV, "").strip()
+                    or "/usr/bin:/bin",
+        },
+        require_strict=True)
+    return CommandInsightModelPort(env=env, isolation=isolation)
