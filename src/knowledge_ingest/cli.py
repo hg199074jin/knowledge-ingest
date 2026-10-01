@@ -2459,10 +2459,6 @@ def _cmd_telegram_retention(config: AppConfig, args) -> int:
 def _cmd_insight(config: AppConfig, args) -> int:
     from knowledge_ingest.insight.digest import build_insight_digest
     from knowledge_ingest.insight.doctor import run_insight_doctor
-    from knowledge_ingest.insight.shadow_agent import (
-        generate_insight_plist_bytes,
-        insight_label,
-    )
     from knowledge_ingest.insight.store import InsightStore
 
     sub = getattr(args, "insight_command", None)
@@ -2534,19 +2530,36 @@ def _cmd_insight(config: AppConfig, args) -> int:
                   f"attempts={row['attempts']}")
         return 0
     if sub == "shadow-agent":
+        # R1.3：activation gate 在 shadow_agent 内部（唯一判定源）；CLI 只做
+        # 参数传递与输出。readiness 非 PASS → refuse，不写/不覆盖 plist。
+        from knowledge_ingest.insight.shadow_agent import (
+            default_plist_path,
+            install_shadow_agent,
+            shadow_agent_status,
+            status_lines,
+            uninstall_notice,
+        )
+
         shadow_cmd = getattr(args, "insight_shadow_command", None)
+        plist_path = default_plist_path()
         if shadow_cmd == "install":
-            plist_dir = Path.home() / "Library" / "LaunchAgents"
-            plist_dir.mkdir(parents=True, exist_ok=True)
-            plist_path = plist_dir / f"{insight_label()}.plist"
-            plist_path.write_bytes(generate_insight_plist_bytes(
+            result = install_shadow_agent(
+                plist_path=plist_path,
                 ki_exe=str(Path(sys.executable).parent / "knowledge-ingest"),
-                config_path=str(Path("config.example.yaml").resolve())))
-            print(f"shadow-agent installed: {plist_path}")
-        elif shadow_cmd == "status":
-            print(f"label: {insight_label()}")
-        elif shadow_cmd == "uninstall":
-            print(f"shadow-agent {insight_label()} unloaded (manual launchctl)")
+                config_path=str(Path("config.example.yaml").resolve()))
+            for line in result.rows():
+                print(line)
+            print(result.detail)
+            return 0 if result.installed else 1
+        if shadow_cmd == "status":
+            for line in status_lines(shadow_agent_status(
+                    plist_path=plist_path)):
+                print(line)
+            return 0
+        if shadow_cmd == "uninstall":
+            for line in uninstall_notice():
+                print(line)
+            return 0
         return 0
     print(f"unknown insight command: {sub}")
     return 2

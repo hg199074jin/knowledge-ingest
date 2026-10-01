@@ -16,13 +16,19 @@ import pytest
 
 from knowledge_ingest.insight.codex_isolation import (
     MANIFEST_FILENAME,
+    REQUIRED_BINARY_VERSION,
     CertificationState,
     CodexIsolationProfile,
+    CodexProfileLoadError,
     advance_certification_state,
+    build_certified_model_command,
     build_manifest,
+    canonical_manifest_path,
+    certified_model_argv,
     certify_binary,
     check_auth,
     generate_config,
+    load_codex_profile_from_runtime,
     load_manifest,
     run_hostile_smoke,
     run_preflight,
@@ -651,3 +657,299 @@ def _write_valid_assets(profile):
     auth = profile.codex_home / "auth.json"
     auth.write_text("{}", encoding="utf-8")
     auth.chmod(0o600)
+
+
+# ---------- R1.3：runtime profile loader + certified command helper ----------
+
+REAL_HOME = Path("/Users/sandro")
+
+
+def _manifest_for(tmp_path, binary, **overrides):
+    profile = make_profile(tmp_path, binary, **overrides)
+    manifest = build_manifest(profile)
+    return profile, manifest
+
+
+def _load(tmp_path, binary, manifest, **kwargs):
+    path = tmp_path / MANIFEST_FILENAME
+    write_manifest(path, manifest)
+    return load_codex_profile_from_runtime(
+        manifest_path=path, real_home=kwargs.pop("real_home", REAL_HOME))
+
+
+def test_loader_rebuilds_profile_from_sanitized_manifest(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile, manifest = _manifest_for(tmp_path, binary)
+    loaded = _load(tmp_path, binary, manifest)
+    assert loaded.profile_id == profile.profile_id
+    assert loaded.binary_path == profile.binary_path
+    assert loaded.binary_sha256 == profile.binary_sha256
+    assert loaded.isolated_home == profile.isolated_home
+    assert loaded.codex_home == profile.codex_home
+    assert loaded.workspace == profile.workspace
+    assert loaded.required_binary_version == REQUIRED_BINARY_VERSION
+    assert loaded.certification_state is CertificationState.PREPARED
+    assert loaded.deny_real_home == REAL_HOME      # 显式 runtime fact 生效
+
+
+def test_loader_preserves_required_cli_args(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    loaded = _load(tmp_path, binary, manifest)
+    assert loaded.required_cli_args == (
+        "--disable", "apps", "--disable", "web_search",
+        "--disable", "web_search_request")
+
+
+def test_loader_manifest_missing_fails(tmp_path):
+    with pytest.raises(CodexProfileLoadError) as exc:
+        load_codex_profile_from_runtime(
+            manifest_path=tmp_path / "absent.json", real_home=REAL_HOME)
+    assert "missing" in str(exc.value)
+
+
+def test_loader_malformed_manifest_fails_without_echo(tmp_path):
+    path = tmp_path / MANIFEST_FILENAME
+    path.write_text('{"binary_sha256": "top-secret-loader-7c1e"',
+                    encoding="utf-8")
+    with pytest.raises(CodexProfileLoadError) as exc:
+        load_codex_profile_from_runtime(manifest_path=path,
+                                        real_home=REAL_HOME)
+    assert "top-secret-loader-7c1e" not in str(exc.value)
+
+
+def test_loader_unsupported_schema_fails(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest["manifest_schema_version"] = 99
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert "schema" in str(exc.value)
+
+
+def test_loader_provider_drift_fails(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest["provider"] = "claude-code"
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert "provider" in str(exc.value)
+
+
+def test_loader_illegal_certification_state_fails(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest["certification_state"] = "TOTALLY_CERTIFIED"
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert "certification_state" in str(exc.value)
+
+
+@pytest.mark.parametrize("field", [
+    "binary_path", "isolated_home", "codex_home", "workspace"])
+def test_loader_relative_path_fails(tmp_path, field):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest[field] = "relative/path"
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert field in str(exc.value)
+
+
+def test_loader_cli_args_drift_fails(tmp_path):
+    """manifest 被弱化（丢掉 web_search_request disable）→ 拒绝重建。"""
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest["required_cli_args"] = ["--disable", "apps"]
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert "required_cli_args" in str(exc.value)
+
+
+def test_loader_cli_args_wrong_type_fails(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest["required_cli_args"] = "--disable apps"
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert "required_cli_args" in str(exc.value)
+
+
+def test_loader_version_pin_drift_fails(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest["required_binary_version"] = "0.160.0"
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert "required_binary_version" in str(exc.value)
+
+
+def test_loader_policy_drift_fails(tmp_path):
+    binary = stub_binary(tmp_path)
+    for key, value in (("network_policy", "on"), ("filesystem_policy", "off"),
+                       ("web_apps_policy", "enabled"),
+                       ("binary_kind", "launcher")):
+        _profile, manifest = _manifest_for(tmp_path, binary)
+        manifest[key] = value
+        with pytest.raises(CodexProfileLoadError) as exc:
+            _load(tmp_path, binary, manifest)
+        assert key in str(exc.value)
+
+
+def test_loader_bad_sha256_fails(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest["binary_sha256"] = "not-a-digest"
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert "binary_sha256" in str(exc.value)
+
+
+def test_loader_missing_required_field_fails(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    del manifest["profile_id"]
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert "profile_id" in str(exc.value)
+
+
+def test_loader_requires_explicit_real_home(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    path = tmp_path / MANIFEST_FILENAME
+    write_manifest(path, manifest)
+    with pytest.raises(CodexProfileLoadError) as exc:
+        load_codex_profile_from_runtime(manifest_path=path, real_home=None)
+    assert "real home" in str(exc.value)
+    with pytest.raises(CodexProfileLoadError):
+        load_codex_profile_from_runtime(manifest_path=path,
+                                        real_home=Path("relative/home"))
+
+
+def test_loader_refuses_isolated_home_as_deny_target(tmp_path):
+    """sanitized manifest 缺 real-home 路径时，绝不能用 isolated HOME 顶替。"""
+    binary = stub_binary(tmp_path)
+    profile, manifest = _manifest_for(tmp_path, binary)
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest, real_home=profile.isolated_home)
+    assert "isolated home" in str(exc.value)
+
+
+def test_loader_hostile_state_requires_evidence(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(
+        tmp_path, binary, certification_state=CertificationState.HOSTILE_SMOKE_PASS)
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert "hostile_smoke_ref" in str(exc.value)
+
+
+def test_loader_requires_real_user_home_deny_target(tmp_path):
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest["deny_targets"] = []
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert "deny_targets" in str(exc.value)
+
+
+def test_loader_ignores_auth_content(tmp_path):
+    """loader 不读 auth.json：有无凭据都不得影响重建，且不得回显内容。"""
+    binary = stub_binary(tmp_path)
+    profile, manifest = _manifest_for(tmp_path, binary)
+    loaded = _load(tmp_path, binary, manifest)
+    auth = profile.codex_home / "auth.json"
+    auth.write_text(TOKEN, encoding="utf-8")
+    auth.chmod(0o600)
+    assert load_codex_profile_from_runtime(
+        manifest_path=tmp_path / MANIFEST_FILENAME,
+        real_home=REAL_HOME).profile_id == loaded.profile_id
+    assert TOKEN not in repr(loaded)
+
+
+def test_loaded_profile_drives_preflight_pass(tmp_path):
+    """loader 产物直接可喂 R1.2 preflight（单一来源，零重写）。"""
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    loaded = _load(tmp_path, binary, manifest)
+    (loaded.codex_home / "config.toml").write_text(
+        generate_config(loaded), encoding="utf-8")
+    auth = loaded.codex_home / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    auth.chmod(0o600)
+    write_manifest(loaded.codex_home / MANIFEST_FILENAME, build_manifest(loaded))
+    overall, checks = run_preflight(loaded,
+                                    version_probe=lambda p: "codex-cli 0.159.2")
+    assert overall == "PASS", [c for c in checks if c.status != "PASS"]
+
+
+def test_loader_tolerates_unknown_key_but_preflight_flags_it(tmp_path):
+    """未知键：loader 前向兼容不放行激活，preflight 仍以 drift fail-closed。"""
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest["experimental_flag"] = True
+    loaded = _load(tmp_path, binary, manifest)
+    _write_valid_assets(loaded)
+    write_manifest(loaded.codex_home / MANIFEST_FILENAME,
+                   build_manifest(loaded) | {"experimental_flag": True})
+    _overall, checks = run_preflight(
+        loaded, version_probe=lambda p: "codex-cli 0.159.2")
+    assert any(c.status == "FAIL" and "experimental_flag" in c.detail
+               for c in checks)
+
+
+def test_canonical_manifest_path_matches_preflight_read_location(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    assert canonical_manifest_path(profile) == \
+        profile.codex_home / MANIFEST_FILENAME
+
+
+# ---------- certified command helper ----------
+
+def test_certified_command_exact_argv(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    argv = shlex.split(build_certified_model_command(profile))
+    assert argv[0] == str(binary)
+    assert argv[1] == "exec"
+    assert argv[-1] == "-"
+    assert "-c" in argv and "orchestrator.skills.enabled=false" in argv
+    assert "--skip-git-repo-check" in argv
+    for flag in ("--disable apps", "--disable web_search",
+                 "--disable web_search_request"):
+        assert all(part in argv for part in flag.split())
+    assert argv == list(certified_model_argv(profile))
+
+
+def test_certified_command_is_single_source_for_hostile_argv(tmp_path):
+    """hostile runner 与 production command 共用 certified argv。"""
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    captured = {}
+
+    def run_fn(argv, stdin_text):
+        captured["argv"] = list(argv)
+        return 0, "PARITY-NETOFF-MARKER-Z3K"
+
+    run_hostile_smoke(profile, exec_args=["exec"], run_fn=run_fn)
+    assert captured["argv"] == list(certified_model_argv(profile))
+    assert captured["argv"][-1] == "-"
+
+
+def test_certified_command_shell_safe_for_spaced_path(tmp_path):
+    spaced = tmp_path / "with space"
+    spaced.mkdir()
+    binary = stub_binary(spaced)
+    profile = make_profile(tmp_path, binary)
+    command = build_certified_model_command(profile)
+    assert " " in command                       # 需要引号编码
+    assert shlex.split(command)[0] == str(binary)
+
+
+def test_certified_command_has_no_stage_specific_args(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = make_profile(tmp_path, binary)
+    argv = shlex.split(build_certified_model_command(profile))
+    assert "-m" not in argv and "--model" not in argv

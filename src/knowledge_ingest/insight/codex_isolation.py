@@ -1,4 +1,4 @@
-"""R1.2: Codex 专有 certified isolation profile + preflight（provider adapter）。
+"""R1.2/R1.3: Codex 专有 certified isolation profile + preflight（provider adapter）。
 
 边界（Issue #8 §2）：全部 Codex 专有语义住在本模块——exact version pin、
 config.toml 契约、network-off/fs-deny 策略、apps/web disable、hostile smoke
@@ -7,6 +7,12 @@ primitive；generic model_port 不 import 本模块、不识 Codex TOML。
 认证状态机：PREPARED --PREFLIGHT_PASS--> PREFLIGHT_PASS
 --HOSTILE_SMOKE_PASS--> HOSTILE_SMOKE_PASS（禁止跳级；生成 config ≠ certified）。
 真实 staging hostile smoke 属 R1.4；本模块只提供 runner primitive。
+
+R1.3（Issue #14 §3/§4）只做"重建 + 生成"，不新增第二套配置：
+- `load_codex_profile_from_runtime`：由 sanitized manifest + 显式 runtime fact
+  （deny real home）fail-closed 重建 `CodexIsolationProfile`；
+- `certified_model_argv` / `build_certified_model_command`：certified 命令
+  单一来源（doctor D4 漂移检测与 shadow plist 共用）。
 """
 
 from __future__ import annotations
@@ -15,7 +21,9 @@ import enum
 import hashlib
 import json
 import os
+import shlex
 import stat
+import string
 import subprocess
 import tomllib
 from dataclasses import dataclass
@@ -28,6 +36,15 @@ MANIFEST_FILENAME = "profile-manifest.json"
 CONFIG_FILENAME = "config.toml"
 AUTH_FILENAME = "auth.json"
 _MARKER = "PARITY-NETOFF-MARKER-Z3K"
+
+#: 已认证的 CLI disable 契约（apps / web_search / web_search_request）。
+#: 单一来源：manifest 校验、hostile argv、certified command 共用同一常量。
+CERTIFIED_REQUIRED_CLI_ARGS = ("--disable", "apps", "--disable", "web_search",
+                               "--disable", "web_search_request")
+_CERTIFIED_EXTRA_ARGS = ("-c", "orchestrator.skills.enabled=false",
+                         "--skip-git-repo-check")
+_MANIFEST_PATH_FIELDS = ("binary_path", "isolated_home", "codex_home",
+                         "workspace")
 
 
 class CertificationState(str, enum.Enum):
@@ -66,6 +83,13 @@ class PreflightResult:
             raise ValueError(f"invalid preflight status: {self.status!r}")
 
 
+class CodexProfileLoadError(RuntimeError):
+    """R1.3：runtime profile 重建失败（fail-closed，无 ambient/default 回落）。
+
+    消息只含字段名/异常类型名，绝不回显 manifest 原文或任何凭据内容。
+    """
+
+
 @dataclass(frozen=True)
 class CodexIsolationProfile:
     """Codex 专有 certified profile（A6：Codex 语义不进 generic port）。"""
@@ -79,9 +103,7 @@ class CodexIsolationProfile:
     deny_real_home: Path                 # 仅用于 config 生成；manifest 记 path class
     required_binary_version: str = REQUIRED_BINARY_VERSION
     binary_kind: str = "native-macho"
-    required_cli_args: tuple[str, ...] = (
-        "--disable", "apps", "--disable", "web_search",
-        "--disable", "web_search_request")
+    required_cli_args: tuple[str, ...] = CERTIFIED_REQUIRED_CLI_ARGS
     network_policy: str = "off"
     filesystem_policy: str = "strict"
     web_apps_policy: str = "disabled"
@@ -306,6 +328,162 @@ def _check_manifest(profile: CodexIsolationProfile,
     return checks
 
 
+# ---------- R1.3：certified model command（单一来源）----------
+
+def certified_model_argv(profile: CodexIsolationProfile, *,
+                         exec_args: tuple[str, ...] = ("exec",),
+                         model_args: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """certified argv：native binary 绝对路径 + exec + disable flags + skills off
+    + --skip-git-repo-check + stdin `-`。hostile runner 与 production command
+    共用本函数，杜绝"第二套参数拼装"。"""
+    return (str(profile.binary_path), *exec_args, *profile.required_cli_args,
+            *_CERTIFIED_EXTRA_ARGS, *model_args, "-")
+
+
+def build_certified_model_command(profile: CodexIsolationProfile) -> str:
+    """生产 `KI_INSIGHT_MODEL_CMD` 的唯一生成方式（shlex 安全编码）。
+
+    doctor D4 用它对 active command 做 argv 精确比对；shadow plist 的
+    KI_INSIGHT_MODEL_CMD 也只能来自这里，绝不从任意当前 shell 字符串抄。
+    """
+    return shlex.join(certified_model_argv(profile))
+
+
+# ---------- R1.3：runtime profile loader（fail-closed）----------
+
+def _require_manifest_str(raw: dict, key: str) -> str:
+    value = raw.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise CodexProfileLoadError(
+            f"manifest field {key!r} missing or not a non-empty string")
+    return value
+
+
+def _require_manifest_path(raw: dict, key: str) -> Path:
+    value = _require_manifest_str(raw, key)
+    path = Path(value)
+    if not path.is_absolute():
+        raise CodexProfileLoadError(
+            f"manifest field {key!r} is not an absolute path")
+    return path
+
+
+def load_codex_profile_from_runtime(*, manifest_path: Path,
+                                    real_home: Path) -> CodexIsolationProfile:
+    """由 sanitized manifest + 显式 runtime fact 重建 certified profile。
+
+    `real_home` 必须由调用方在安装者真实 shell 中取得并显式传入：manifest
+    只记 semantic class `real-user-home`（R1.2 有意不落盘真实路径），但
+    "必须 deny 真 HOME" 的语义不能因为 sanitized manifest 而丢失——绝不用
+    isolated HOME 顶替（Issue #14 §3.2）。
+
+    任何解析/校验失败 → `CodexProfileLoadError`；绝不回落 ambient/default
+    profile，也绝不读 auth 内容。
+    """
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        raise CodexProfileLoadError("profile manifest missing: "
+                                    f"{manifest_path.name}")
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:  # 含 json.JSONDecodeError
+        raise CodexProfileLoadError(
+            f"profile manifest unreadable ({type(exc).__name__})") from None
+    if not isinstance(raw, dict):
+        raise CodexProfileLoadError("profile manifest is not a JSON object")
+    if raw.get("manifest_schema_version") != MANIFEST_SCHEMA_VERSION:
+        raise CodexProfileLoadError(
+            "unsupported manifest schema version: "
+            f"{raw.get('manifest_schema_version')!r}")
+    if raw.get("provider") != PROVIDER:
+        raise CodexProfileLoadError(
+            f"provider drift: {raw.get('provider')!r}")
+    state_value = raw.get("certification_state")
+    try:
+        state = CertificationState(state_value)
+    except ValueError:
+        raise CodexProfileLoadError(
+            f"illegal certification_state: {state_value!r}") from None
+    profile_id = _require_manifest_str(raw, "profile_id")
+    version = _require_manifest_str(raw, "required_binary_version")
+    if version != REQUIRED_BINARY_VERSION:
+        raise CodexProfileLoadError(
+            f"required_binary_version drift: want {REQUIRED_BINARY_VERSION}")
+    sha = raw.get("binary_sha256")
+    if (not isinstance(sha, str) or len(sha) != 64
+            or not all(c in string.hexdigits for c in sha)):
+        raise CodexProfileLoadError(
+            "manifest field 'binary_sha256' is not a sha256 digest")
+    paths = {key: _require_manifest_path(raw, key)
+             for key in _MANIFEST_PATH_FIELDS}
+    if raw.get("binary_kind") != "native-macho":
+        raise CodexProfileLoadError(
+            f"binary_kind drift: {raw.get('binary_kind')!r}")
+    for key, want in (("network_policy", "off"),
+                      ("filesystem_policy", "strict"),
+                      ("web_apps_policy", "disabled")):
+        if raw.get(key) != want:
+            raise CodexProfileLoadError(f"{key} drift: {raw.get(key)!r}")
+    cli_args = raw.get("required_cli_args")
+    if (not isinstance(cli_args, list) or not cli_args
+            or not all(isinstance(a, str) and a for a in cli_args)):
+        raise CodexProfileLoadError(
+            "manifest field 'required_cli_args' missing or not a string list")
+    if tuple(cli_args) != CERTIFIED_REQUIRED_CLI_ARGS:
+        # manifest 被改成弱化参数（如丢掉 web_search disable）→ 直接拒绝，
+        # 绝不"按 manifest 现状"生成 production command。
+        raise CodexProfileLoadError(
+            "manifest field 'required_cli_args' drift from certified set")
+    deny_targets = raw.get("deny_targets")
+    if not isinstance(deny_targets, list) or "real-user-home" not in deny_targets:
+        raise CodexProfileLoadError(
+            "manifest 'deny_targets' must record 'real-user-home'")
+    ref = raw.get("hostile_smoke_ref", "")
+    if not isinstance(ref, str):
+        raise CodexProfileLoadError(
+            "manifest field 'hostile_smoke_ref' is not a string")
+    if state is CertificationState.HOSTILE_SMOKE_PASS and not ref.strip():
+        raise CodexProfileLoadError(
+            "HOSTILE_SMOKE_PASS without hostile_smoke_ref evidence")
+    if real_home is None or not str(real_home).strip():
+        raise CodexProfileLoadError(
+            "deny real home not provided (explicit runtime fact required)")
+    real = Path(real_home)
+    if not real.is_absolute():
+        raise CodexProfileLoadError("deny real home is not an absolute path")
+    if real == paths["isolated_home"]:
+        raise CodexProfileLoadError(
+            "deny real home equals isolated home (would deny nothing)")
+    for key in ("created_at", "verified_at"):
+        if not isinstance(raw.get(key, ""), str):
+            raise CodexProfileLoadError(
+                f"manifest field {key!r} is not a string")
+    return CodexIsolationProfile(
+        profile_id=profile_id,
+        binary_path=paths["binary_path"],
+        binary_sha256=sha,
+        isolated_home=paths["isolated_home"],
+        codex_home=paths["codex_home"],
+        workspace=paths["workspace"],
+        deny_real_home=real,
+        required_binary_version=version,
+        binary_kind="native-macho",
+        required_cli_args=tuple(cli_args),
+        network_policy="off",
+        filesystem_policy="strict",
+        web_apps_policy="disabled",
+        created_at=raw.get("created_at", ""),
+        verified_at=raw.get("verified_at", ""),
+        certification_state=state,
+        hostile_smoke_ref=ref,
+    )
+
+
+def canonical_manifest_path(profile: CodexIsolationProfile) -> Path:
+    """R1.2 preflight 读取 manifest 的唯一位置（与 loader 显式路径做对照）。"""
+    return profile.codex_home / MANIFEST_FILENAME
+
+
 # ---------- Preflight 聚合 ----------
 
 def run_preflight(profile: CodexIsolationProfile, *,
@@ -395,11 +573,8 @@ def run_hostile_smoke(profile: CodexIsolationProfile, *,
                                   env=isolated_env)
             return proc.returncode, proc.stdout
 
-    argv = [str(profile.binary_path), *exec_args,
-            *profile.required_cli_args,
-            "-c", "orchestrator.skills.enabled=false",
-            "--skip-git-repo-check", *model_args, "-"]
-
+    argv = list(certified_model_argv(
+        profile, exec_args=tuple(exec_args), model_args=tuple(model_args)))
 
     results: dict[str, dict] = {}
     for name, task, judge in _PROBES:
