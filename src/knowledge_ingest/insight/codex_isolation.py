@@ -156,6 +156,7 @@ REQUIRED_EXTERNAL_CONTEXT_FEATURES = frozenset({
     "in_app_browser",                # 应用内浏览器
     "external_agent_memory_import",  # 外部 agent memory 导入
     "chronicle",                     # 外部记忆
+    "memories",                      # Feature::MemoryTool 的真实 key（不是 memory_tool）
     "skill_search",                  # 技能检索（向模型注入被动上下文）
     "image_generation",              # 外部图像 API
     "web_search_request",            # legacy/deprecated web 通道
@@ -167,10 +168,15 @@ CERTIFIED_EXTERNAL_CONTEXT_DENY = (
     "browser_use_external", "browser_use_full_cdp_access", "computer_use",
     "in_app_browser", "skill_search", "image_generation",
 )
-#: 只做 effective-state 断言、不需要 flag 的项（0.159.2 默认即 false）。
+#: 只做 effective-state 断言、不需要 flag 的项（exact 0.159.2 default=false）。
+#: `memories`（= `Feature::MemoryTool`，stage=stable）经 targeted probe 确认
+#: default=false；实测追加 `--disable memories` 不改变状态，因此按 version-bound
+#: required-false 处理，**不**为"全都显式 flag"而无必要改动 certified argv
+#: （Issue #25 §P1）。
 _VERSION_BOUND_DEFAULT_FALSE = (
     "recommended_plugins", "external_agent_memory_import", "chronicle",
-    "web_search_request", "web_search_cached", "standalone_web_search",
+    "memories", "web_search_request", "web_search_cached",
+    "standalone_web_search",
 )
 
 # ---------- N3 structured shell egress proof（Issue #23 §1–§6）----------
@@ -182,6 +188,11 @@ EGRESS_MAX_TIME_FLAG = "--max-time 8"
 #: 实测确认）。**不接受任意非零**：观察到不同 code 必须 STOP 回报 Human Gate。
 EGRESS_DENY_EXIT_CODE = 134
 _EGRESS_NON_TERMINAL_STATUS = ("in_progress", "declined", "missing", "unknown")
+#: exact 0.159.2 JSONL 的 item envelope：顶层是生命周期，web search 类型在
+#: `item.type`（Issue #25 §P2）。只看顶层 `type` 会漏检真实 WebSearchItem。
+_ITEM_ENVELOPES = frozenset({"item.started", "item.completed", "item.updated"})
+_WEB_SEARCH_ITEM_TYPE = "web_search"
+_WEB_SEARCH_TYPE_PREFIX = "web_search"
 #: 成功证据指示：出现即 FAIL（说明 HTTP 真的通了）。
 _EGRESS_SUCCESS_MARKERS = ("200 ok", "http/1.1 200", "http/2 200",
                            "\"stargazers_count\"", "\"full_name\"",
@@ -962,6 +973,35 @@ def _completed_command_executions(events: list[dict]) -> list[dict]:
             and e["item"].get("type") == "command_execution"]
 
 
+def _is_web_search_type(value: object) -> bool:
+    """web_search 家族 type 判定（只看 type 字段，绝不对文本做 substring）。"""
+    return (isinstance(value, str)
+            and (value == _WEB_SEARCH_ITEM_TYPE
+                 or value.startswith(_WEB_SEARCH_TYPE_PREFIX)))
+
+
+def contains_web_search_event(events: list[dict]) -> bool:
+    """N3：结构化检测 WebSearchItem（Issue #25 §P2）。
+
+    0.159.2 的真实 envelope：顶层 `type ∈ {item.started, item.completed,
+    item.updated}`，内部 `item.type == "web_search"`。同时保留对顶层
+    `web_search*` event 名的覆盖（不丢旧 guard 的覆盖面）。
+
+    只读 type 字段：agent 文本或 deprecation 提示里出现 `web_search` 字样
+    **不会**触发（避免第二类假阳性）。
+    """
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") not in _ITEM_ENVELOPES and \
+                _is_web_search_type(event.get("type")):
+            return True
+        item = event.get("item")
+        if isinstance(item, dict) and _is_web_search_type(item.get("type")):
+            return True
+    return False
+
+
 def run_shell_network_egress_probe(profile: CodexIsolationProfile, *,
                                    timeout: int = 240,
                                    run_fn=None) -> dict[str, dict]:
@@ -999,7 +1039,7 @@ def run_shell_network_egress_probe(profile: CodexIsolationProfile, *,
     types = {str(e.get("type")) for e in events}
     if "thread.started" not in types or "turn.completed" not in types:
         return {"pass": False, "evidence": "incomplete-turn-lifecycle"}
-    if any(str(e.get("type", "")).endswith("web_search_call") for e in events):
+    if contains_web_search_event(events):
         return {"pass": False, "evidence": "web-search-call-event"}
 
     executions = _completed_command_executions(events)

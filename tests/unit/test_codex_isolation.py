@@ -37,6 +37,7 @@ from knowledge_ingest.insight.codex_isolation import (
     certified_probe_env,
     certify_binary,
     check_auth,
+    contains_web_search_event,
     egress_probe_argv,
     generate_config,
     load_codex_profile_from_runtime,
@@ -1125,6 +1126,7 @@ CLEAN_FEATURES = (
     "external_agent_memory_import              under development false\n"
     "image_generation                          stable             false\n"
     "in_app_browser                            stable             false\n"
+    "memories                                  stable             false\n"
     "plugins                                   stable             false\n"
     "recommended_plugins                       stable             false\n"
     "remote_plugin                             stable             false\n"
@@ -1385,7 +1387,7 @@ def test_n1_clean_exact_profile_pass(tmp_path):
     assert attestation["upstream_tag"] == "rust-v0.159.2"
     assert attestation["web_tool_when_disabled"] == "absent"
     assert attestation["hosted_apps_when_apps_disabled"] == "absent"
-    assert attestation["features_inventoried"] == 20
+    assert attestation["features_inventoried"] == 21
 
 
 def test_n1_apply_patch_presence_does_not_affect_verdict(tmp_path):
@@ -1486,14 +1488,32 @@ def test_n1_g_missing_feature_from_inventory_fail(tmp_path):
         checks["N1-G-feature-surface"].detail
 
 
-def test_n1_g_unregistered_candidate_is_not_gated(tmp_path):
-    """`memory_tool` 在 exact 0.159.2 inventory 中不存在 → 不进入 required set。
-
-    缺席意味着该 exact 版本根本没有这个能力（比 false 更强），因此不作为
-    gated feature；但任何**已在 required set** 的 feature 缺席都会 FAIL。
-    """
+def test_n1_g_memory_tool_key_is_memories(tmp_path):
+    """Issue #25 §P1：`Feature::MemoryTool` 的真实 key 是 `memories`，不是
+    `memory_tool`；0.159.2 中 stage=stable、default=false → 必须纳入 required。"""
+    assert "memories" in REQUIRED_EXTERNAL_CONTEXT_FEATURES
+    assert "memories" not in CERTIFIED_EXTERNAL_CONTEXT_DENY  # default-false，不加 flag
     assert "memory_tool" not in REQUIRED_EXTERNAL_CONTEXT_FEATURES
-    assert "apps" in REQUIRED_EXTERNAL_CONTEXT_FEATURES
+
+
+def test_n1_g_memories_missing_from_inventory_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (
+        0, _inventory_with(memories=None)))
+    assert checks["N1-G-feature-surface"].status == "FAIL"
+    assert "absent-from-inventory:memories" in \
+        checks["N1-G-feature-surface"].detail
+
+
+def test_n1_g_memories_effectively_enabled_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (
+        0, _inventory_with(memories="true")))
+    assert checks["N1-G-feature-surface"].status == "FAIL"
+    assert "effective-enabled:memories" in \
+        checks["N1-G-feature-surface"].detail
 
 
 def test_n1_g_parser_unknown_state_fail(tmp_path):
@@ -1793,3 +1813,107 @@ def test_n3_started_event_is_not_counted_as_execution(tmp_path):
             status="in_progress", exit_code=None)},
         {"type": "item.completed", "item": _exec_item()}))
     assert result["pass"] is True
+
+
+# ---------- R1.4 final patch（Issue #25 §P2）：web_search JSONL 事件结构化检测 ----------
+
+@pytest.mark.parametrize("envelope", ["item.started", "item.completed",
+                                      "item.updated"])
+def test_n3_structured_web_search_item_fail(tmp_path, envelope):
+    """真实 envelope：顶层生命周期 + `item.type == "web_search"`。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_jsonl(
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "turn.started"},
+        {"type": envelope, "item": {"id": "w0", "type": "web_search",
+                                    "query": "github stars"}},
+        {"type": envelope, "item": {"id": "i0", "type": "command_execution",
+                                    "command": EGRESS_WRAPPER_PREFIX
+                                    + EGRESS_CURL_FULL + "'",
+                                    "status": "failed",
+                                    "exit_code": EGRESS_DENY_EXIT_CODE,
+                                    "aggregated_output": ""}},
+        {"type": "turn.completed", "usage": {}}))
+    assert result["pass"] is False
+    assert "web-search-call-event" in result["evidence"]
+
+
+@pytest.mark.parametrize("item_type", ["web_search", "web_search_call",
+                                       "web_search_begin"])
+def test_n3_web_search_item_type_variants_fail(tmp_path, item_type):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_jsonl(
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"type": item_type}},
+        {"type": "item.completed", "item": _exec_item()},
+        {"type": "turn.completed", "usage": {}}))
+    assert result["pass"] is False
+    assert "web-search-call-event" in result["evidence"]
+
+
+def test_n3_top_level_web_search_event_still_detected(tmp_path):
+    """旧 guard 的覆盖面不丢：顶层 web_search* event 名同样 FAIL。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_jsonl(
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "turn.started"},
+        {"type": "web_search_call", "query": "x"},
+        {"type": "item.completed", "item": _exec_item()},
+        {"type": "turn.completed", "usage": {}}))
+    assert result["pass"] is False
+    assert "web-search-call-event" in result["evidence"]
+
+
+def test_n3_agent_text_mentioning_web_search_does_not_fail(tmp_path):
+    """agent 文本里出现 `web_search` 字样不是结构化事件 → 不得 FAIL。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_lifecycle(
+        {"type": "item.completed", "item": _exec_item()},
+        {"type": "item.completed", "item": {
+            "id": "m", "type": "agent_message",
+            "text": "我没有使用 web_search 或 web.run 工具。"}}))
+    assert result["pass"] is True
+
+
+def test_n3_deprecation_warning_text_does_not_fail(tmp_path):
+    """`[features].web_search*` deprecation 提示（真实会出现在 stderr/item 文本里）
+    不得被当成 web_search 事件。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_jsonl(
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "item.completed", "item": {
+            "id": "e0", "type": "error",
+            "message": "`[features].web_search_request` is deprecated because "
+                       "web search is enabled by default."}},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": _exec_item()},
+        {"type": "turn.completed", "usage": {}}))
+    assert result["pass"] is True
+
+
+def test_n3_clean_134_event_still_pass(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile)
+    assert result["pass"] is True
+
+
+def test_contains_web_search_event_is_structured_only():
+    events = [
+        {"type": "thread.started"},
+        {"type": "item.completed", "item": {"type": "agent_message",
+                                            "text": "web_search web.run"}},
+        {"type": "item.completed", "item": {"type": "command_execution"}},
+    ]
+    assert contains_web_search_event(events) is False
+    events.append({"type": "item.completed", "item": {"type": "web_search"}})
+    assert contains_web_search_event(events) is True
+    assert contains_web_search_event([{"type": "item.completed"}]) is False
+    assert contains_web_search_event([{"type": "item.completed",
+                                       "item": "not-a-dict"}]) is False
