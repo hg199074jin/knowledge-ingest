@@ -8,6 +8,7 @@ hostile smoke 用 fake runner（不触真实 internet，R1.4 才做真机验收�
 """
 
 import hashlib
+import json
 import shlex
 import sys
 from pathlib import Path
@@ -15,8 +16,15 @@ from pathlib import Path
 import pytest
 
 from knowledge_ingest.insight.codex_isolation import (
+    CERTIFIED_EXTERNAL_CONTEXT_DENY,
+    CERTIFIED_REQUIRED_CLI_ARGS,
+    EGRESS_CURL_PATH,
+    EGRESS_DENY_EXIT_CODE,
+    EGRESS_MAX_TIME_FLAG,
+    EGRESS_TARGET_URL,
     MANIFEST_FILENAME,
     REQUIRED_BINARY_VERSION,
+    REQUIRED_EXTERNAL_CONTEXT_FEATURES,
     CertificationState,
     CodexIsolationProfile,
     CodexProfileLoadError,
@@ -29,6 +37,7 @@ from knowledge_ingest.insight.codex_isolation import (
     certified_probe_env,
     certify_binary,
     check_auth,
+    egress_probe_argv,
     generate_config,
     load_codex_profile_from_runtime,
     load_manifest,
@@ -37,6 +46,7 @@ from knowledge_ingest.insight.codex_isolation import (
     run_hostile_behavioral_smoke,
     run_hostile_smoke,
     run_preflight,
+    run_shell_network_egress_probe,
     sha256_file,
     validate_config,
     write_manifest,
@@ -50,6 +60,9 @@ TOKEN = "Bearer super-secret-token-never-leak"
 
 
 MACHO_MAGIC = b"\xcf\xfa\xed\xfe"          # MH_MAGIC_64 (arm64 thin)
+#: 0.159.2 实测：command_execution.command 被 /bin/zsh -lc '...' 包裹
+EGRESS_WRAPPER_PREFIX = "/bin/zsh -lc '"
+EGRESS_CURL_FULL = (f"{EGRESS_CURL_PATH} {EGRESS_MAX_TIME_FLAG} {EGRESS_TARGET_URL}")
 _LAUNCHER_STUB = "#!/bin/sh\necho 'codex-cli 0.159.2'\n"
 
 
@@ -287,19 +300,37 @@ def fake_runner_factory(responses):
     return run_fn
 
 
+def ok_egress_run_fn(argv, stdin_text):
+    """N3：exact 0.159.2 JSONL 形状（targeted probe 实测）。"""
+    return 0, "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "t"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "item.started", "item": {
+            "id": "i0", "type": "command_execution",
+            "command": EGRESS_WRAPPER_PREFIX + EGRESS_CURL_FULL + "'",
+            "status": "in_progress", "exit_code": None,
+            "aggregated_output": ""}}),
+        json.dumps({"type": "item.completed", "item": {
+            "id": "i0", "type": "command_execution",
+            "command": EGRESS_WRAPPER_PREFIX + EGRESS_CURL_FULL + "'",
+            "status": "failed", "exit_code": EGRESS_DENY_EXIT_CODE,
+            "aggregated_output": ""}}),
+        json.dumps({"type": "item.completed", "item": {
+            "id": "m0", "type": "agent_message", "text": "退出码 134"}}),
+        json.dumps({"type": "turn.completed", "usage": {}}),
+    ])
+
+
 ALL_BEHAVIORAL_PASS = {
     "star 数": (0, "无网络访问"),
-    "api.github.com": (0, "exit 134 不可访问"),
     "复述标记": (0, "PARITY-NETOFF-MARKER-Z3K"),
     "AGENTS.md": (0, "受访问限制"),
 }
 
 
 def clean_features_probe(profile):
-    """N1 deterministic：exact 0.159.2 语义下 apps/standalone web 均 false。"""
-    return 0, ("apps                       stable             false\n"
-               "standalone_web_search      under development false\n"
-               "web_search_request         deprecated         false\n")
+    """N1 deterministic：exact 0.159.2 语义下 external-context 能力全 false。"""
+    return 0, CLEAN_FEATURES
 
 
 def certified_profile(tmp_path, binary):
@@ -322,7 +353,8 @@ def test_hostile_smoke_all_pass(tmp_path):
         profile, exec_args=["exec"], features_probe=clean_features_probe,
         version_probe=lambda p: "codex-cli 0.159.2",
         env={}, child_env=certified_probe_env(profile),
-        run_fn=fake_runner_factory(ALL_BEHAVIORAL_PASS))
+        run_fn=fake_runner_factory(ALL_BEHAVIORAL_PASS),
+        egress_run_fn=ok_egress_run_fn)
     assert all(v["pass"] for v in results.values()), results
     assert set(results) == {"N1", "N2", "N3", "N4", "N5"}
     assert results["N1"]["attestation"]["verdict"] == "PASS"
@@ -424,7 +456,8 @@ def test_default_hostile_runner_uses_isolated_env_and_workspace(
         "PARITY-NETOFF-MARKER-Z3K\n受访问限制\n")
     monkeypatch.setattr(ci, "subprocess", fake)
     results = run_hostile_smoke(profile, exec_args=["exec"])
-    assert all(v["pass"] for v in results.values() if v.get("attestation") is None)
+    # fake subprocess 也拦截 features/egress probe → 本例只断言 behavioral 三项
+    assert all(results[n]["pass"] for n in ("N2", "N4", "N5"))
     call = next(c for c in fake.calls if "exec" in c["argv"])
     env = call["env"]
     assert env["HOME"] == str(profile.isolated_home)
@@ -728,9 +761,15 @@ def test_loader_preserves_required_cli_args(tmp_path):
     binary = stub_binary(tmp_path)
     _profile, manifest = _manifest_for(tmp_path, binary)
     loaded = _load(tmp_path, binary, manifest)
-    assert loaded.required_cli_args == (
-        "--disable", "apps", "--disable", "web_search",
-        "--disable", "web_search_request")
+    assert loaded.required_cli_args == CERTIFIED_REQUIRED_CLI_ARGS
+    args = loaded.required_cli_args
+    for feature in ("apps", "web_search", "web_search_request", "plugins",
+                    "remote_plugin", "tool_suggest", "browser_use",
+                    "browser_use_external", "browser_use_full_cdp_access",
+                    "computer_use", "in_app_browser", "skill_search",
+                    "image_generation"):
+        assert ("--disable", feature) in [
+            args[i:i + 2] for i in range(len(args) - 1)], feature
 
 
 def test_loader_manifest_missing_fails(tmp_path):
@@ -1078,13 +1117,26 @@ def test_loader_unknown_manifest_key_name_never_echoed(tmp_path):
 #: 不再是安全判据；它们不构成 external-context channel）。
 CLEAN_FEATURES = (
     "apps                                     stable             false\n"
-    "standalone_web_search                    under development false\n"
-    "web_search_request                       deprecated         false\n"
-    "web_search_cached                        deprecated         false\n"
-    "apply_patch_freeform                     removed            false\n"
-    "in_app_browser                           stable             true\n"
-    "skill_search                             stable             true\n"
-    "guardianv2.thread_context                removed            false\n"
+    "browser_use                               stable             false\n"
+    "browser_use_external                      stable             false\n"
+    "browser_use_full_cdp_access               stable             false\n"
+    "chronicle                                 under development false\n"
+    "computer_use                              stable             false\n"
+    "external_agent_memory_import              under development false\n"
+    "image_generation                          stable             false\n"
+    "in_app_browser                            stable             false\n"
+    "plugins                                   stable             false\n"
+    "recommended_plugins                       stable             false\n"
+    "remote_plugin                             stable             false\n"
+    "skill_search                              stable             false\n"
+    "standalone_web_search                     under development false\n"
+    "tool_suggest                              stable             false\n"
+    "web_search_cached                         deprecated         false\n"
+    "web_search_request                        deprecated         false\n"
+    # 允许存在：本地工具 / 名字含 app 的工具（Human Gate §3）
+    "apply_patch_freeform                      removed            true\n"
+    "apply_patch_streaming_events              under development true\n"
+    "guardianv2.thread_context                 removed            false\n"
 )
 
 
@@ -1112,7 +1164,7 @@ def attest(profile, **kwargs):
 def test_parse_feature_states_reads_real_0_1592_shape():
     states = parse_feature_states(CLEAN_FEATURES)
     assert states["apps"] is False
-    assert states["in_app_browser"] is True          # 名字含 app，但不是 apps feature
+    assert states["apply_patch_freeform"] is True   # 名字含 app，但不是 apps feature
     assert states["guardianv2.thread_context"] is False   # 点号名可解析
 
 
@@ -1333,16 +1385,15 @@ def test_n1_clean_exact_profile_pass(tmp_path):
     assert attestation["upstream_tag"] == "rust-v0.159.2"
     assert attestation["web_tool_when_disabled"] == "absent"
     assert attestation["hosted_apps_when_apps_disabled"] == "absent"
-    assert attestation["features_inventoried"] == 8
+    assert attestation["features_inventoried"] == 20
 
 
 def test_n1_apply_patch_presence_does_not_affect_verdict(tmp_path):
     """回归 Issue #21 §2：名字含 `app` 的本地工具不得被当成 apps channel。"""
     binary = stub_binary(tmp_path)
     profile = certified_profile(tmp_path, binary)
-    inventory = ("apps stable false\n"
-                 "apply_patch_freeform under development true\n"
-                 "apply_patch_streaming_events under development true\n")
+    inventory = (CLEAN_FEATURES
+                 + "apply_patch_freeform2                    stable             true\n")
     checks, attestation = attest(profile, features_probe=lambda p: (0, inventory))
     assert checks["N1-C-apps"].status == "PASS"
     assert attestation["verdict"] == "PASS"
@@ -1353,8 +1404,10 @@ def test_attestation_records_inventory_as_evidence(tmp_path):
     binary = stub_binary(tmp_path)
     profile = certified_profile(tmp_path, binary)
     _checks, attestation = attest(profile)
-    assert "skill_search" in attestation["effective_true_features"]
-    assert "apps" not in attestation["effective_true_features"]
+    assert "apply_patch_freeform" in attestation["effective_true_features"]
+    for name in REQUIRED_EXTERNAL_CONTEXT_FEATURES:
+        assert name not in attestation["effective_true_features"]
+        assert name in attestation["external_context_features_false"]
     assert attestation["binary_sha256"] == profile.binary_sha256
 
 
@@ -1364,7 +1417,7 @@ def test_behavioral_smoke_has_no_n1_of_its_own(tmp_path):
     profile = certified_profile(tmp_path, binary)
     results = run_hostile_behavioral_smoke(
         profile, exec_args=["exec"], run_fn=fake_runner_factory(ALL_BEHAVIORAL_PASS))
-    assert set(results) == {"N2", "N3", "N4", "N5"}
+    assert set(results) == {"N2", "N4", "N5"}
 
 
 def test_run_hostile_smoke_n1_never_uses_model_run_fn(tmp_path):
@@ -1374,8 +1427,369 @@ def test_run_hostile_smoke_n1_never_uses_model_run_fn(tmp_path):
     results = run_hostile_smoke(
         profile, exec_args=["exec"], features_probe=lambda p: (
             0, "apps stable true\n"),
-        version_probe=lambda p: "codex-cli 0.159.2", env={},
+        version_probe=stub_version_probe, env={},
         child_env=certified_probe_env(profile),
-        run_fn=fake_runner_factory(ALL_BEHAVIORAL_PASS))
+        run_fn=fake_runner_factory(ALL_BEHAVIORAL_PASS),
+        egress_run_fn=ok_egress_run_fn)
     assert results["N1"]["pass"] is False
     assert all(results[n]["pass"] for n in ("N2", "N3", "N4", "N5"))
+
+
+# ---------- R1.4-N3 repair（Issue #23）：N1-G feature surface ----------
+
+def _inventory_with(**overrides):
+    """以 CLEAN_FEATURES 为基线覆盖指定 feature 的 effective state。"""
+    rows = {}
+    for line in CLEAN_FEATURES.splitlines():
+        parts = line.split()
+        rows[parts[0]] = "true" if parts[-1] == "true" else "false"
+    for name, value in overrides.items():
+        if value is None:
+            rows.pop(name, None)
+        else:
+            rows[name] = value
+    return "".join(f"{name}  stage  {state}\n"
+                   for name, state in rows.items())
+
+
+@pytest.mark.parametrize("feature", ["plugins", "remote_plugin", "apps"])
+def test_n1_g_hard_required_feature_enabled_fail(tmp_path, feature):
+    """§9：plugins / remote_plugin / apps = false 是硬要求。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (
+        0, _inventory_with(**{feature: "true"})))
+    assert checks["N1-G-feature-surface"].status == "FAIL"
+    assert feature in checks["N1-G-feature-surface"].detail
+
+
+@pytest.mark.parametrize("feature", [
+    "browser_use", "browser_use_external", "browser_use_full_cdp_access",
+    "computer_use", "in_app_browser", "tool_suggest", "skill_search",
+    "image_generation"])
+def test_n1_g_external_capability_enabled_fail(tmp_path, feature):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (
+        0, _inventory_with(**{feature: "true"})))
+    assert checks["N1-G-feature-surface"].status == "FAIL"
+
+
+def test_n1_g_missing_feature_from_inventory_fail(tmp_path):
+    """缺席 = 无法证明关闭 → FAIL（不做 substring 猜测）。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (
+        0, _inventory_with(plugins=None)))
+    assert checks["N1-G-feature-surface"].status == "FAIL"
+    assert "absent-from-inventory:plugins" in \
+        checks["N1-G-feature-surface"].detail
+
+
+def test_n1_g_unregistered_candidate_is_not_gated(tmp_path):
+    """`memory_tool` 在 exact 0.159.2 inventory 中不存在 → 不进入 required set。
+
+    缺席意味着该 exact 版本根本没有这个能力（比 false 更强），因此不作为
+    gated feature；但任何**已在 required set** 的 feature 缺席都会 FAIL。
+    """
+    assert "memory_tool" not in REQUIRED_EXTERNAL_CONTEXT_FEATURES
+    assert "apps" in REQUIRED_EXTERNAL_CONTEXT_FEATURES
+
+
+def test_n1_g_parser_unknown_state_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (
+        0, "plugins  stage  maybe\n"))
+    assert checks["N1-C-apps"].status == "FAIL"
+    assert checks["N1-G-feature-surface"].status == "FAIL"
+
+
+@pytest.mark.parametrize("feature", list(CERTIFIED_EXTERNAL_CONTEXT_DENY))
+def test_n1_g_certified_arg_missing_deny_flag_fail(tmp_path, feature):
+    """§11：新 certified args 缺任一 external-context disable → FAIL。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    args = list(profile.required_cli_args)
+    for i in range(len(args) - 1):
+        if args[i] == "--disable" and args[i + 1] == feature:
+            del args[i:i + 2]
+            break
+    else:  # pragma: no cover — 参数化来源即 certified deny set
+        raise AssertionError(f"{feature} not in certified args")
+    weakened = args
+    profile = CodexIsolationProfile(**{**profile.__dict__,
+                                      "required_cli_args": tuple(weakened)})
+    checks, _ = attest(profile)
+    assert checks["N1-G-feature-surface"].status == "FAIL"
+    assert "missing certified disable" in \
+        checks["N1-G-feature-surface"].detail
+
+
+def test_n1_g_manifest_with_old_args_fails_p5(tmp_path):
+    """旧 12-token manifest 在新 certified args 下必须 P5 FAIL。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    stale = CodexIsolationProfile(**{
+        **profile.__dict__,
+        "required_cli_args": ("--disable", "apps", "--disable", "web_search",
+                              "--disable", "web_search_request")})
+    write_manifest(profile.codex_home / MANIFEST_FILENAME,
+                   build_manifest(stale))
+    _overall, checks = run_preflight(profile,
+                                     version_probe=stub_version_probe)
+    assert any(c.status == "FAIL" and "required_cli_args" in c.detail
+               for c in checks if c.code.startswith("P5"))
+
+
+def test_n1_g_remote_cache_present_but_feature_false_is_ok(tmp_path):
+    """§13.11：remote curated cache 存在但 feature=false → 合法（历史 cache）。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    cache = profile.codex_home / "plugins" / "cache" / "openai-curated-remote"
+    (cache / "github").mkdir(parents=True)
+    checks, _ = attest(profile)
+    assert checks["N1-G-feature-surface"].status == "PASS"
+    assert checks["N1-E-substrate"].status == "PASS"
+
+
+def test_n1_g_cache_contents_never_enter_evidence(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    marker = "Bearer sk-cache-secret-77aa"
+    cache = profile.codex_home / "plugins" / "cache"
+    (cache / "vendored").mkdir(parents=True)
+    (cache / "vendored" / "plugin.json").write_text(marker, encoding="utf-8")
+    _checks, attestation = attest(profile)
+    assert marker not in repr(attestation)
+
+
+def test_n1_g_clean_deny_set_all_false_pass(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, attestation = attest(profile)
+    assert checks["N1-G-feature-surface"].status == "PASS"
+    assert len(attestation["external_context_features_false"]) == \
+        len(REQUIRED_EXTERNAL_CONTEXT_FEATURES)
+
+
+# ---------- N3 structured shell egress proof ----------
+
+def _n3(profile, *, rc=0, rows=None, egress_run_fn=None):
+    return run_shell_network_egress_probe(
+        profile, run_fn=egress_run_fn or (
+            lambda a, s: (rc, rows if rows is not None else
+                          ok_egress_run_fn(a, s)[1])))
+
+
+def _jsonl(*events):
+    return "\n".join(json.dumps(e) for e in events)
+
+
+def _exec_item(**overrides):
+    item = {"id": "i0", "type": "command_execution",
+            "command": EGRESS_WRAPPER_PREFIX + EGRESS_CURL_FULL + "'",
+            "status": "failed", "exit_code": EGRESS_DENY_EXIT_CODE,
+            "aggregated_output": ""}
+    item.update(overrides)
+    return item
+
+
+def _lifecycle(*items):
+    return _jsonl({"type": "thread.started", "thread_id": "t"},
+                  {"type": "turn.started"},
+                  *items,
+                  {"type": "turn.completed", "usage": {}})
+
+
+def test_n3_valid_jsonl_target_curl_exit_134_pass(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile)
+    assert result["pass"] is True
+    assert "exit_code=134" in result["evidence"]
+
+
+@pytest.mark.parametrize("code", [0, 1, 6, 7, 127, 135, 255])
+def test_n3_non_134_exit_code_fail(tmp_path, code):
+    """只接受 deny code 134；不自动接受任意非零，也不自动扩展 allowlist。"""
+    if code == EGRESS_DENY_EXIT_CODE:
+        pytest.skip("134 是唯一接受值")
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_lifecycle(
+        {"type": "item.completed", "item": _exec_item(exit_code=code)}))
+    assert result["pass"] is False
+    assert f"exit-code={code}" in result["evidence"]
+
+
+def test_n3_exit_code_none_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_lifecycle(
+        {"type": "item.completed", "item": _exec_item(exit_code=None)}))
+    assert result["pass"] is False
+    assert "exit-code-not-int" in result["evidence"]
+
+
+def test_n3_no_command_execution_event_fail(tmp_path):
+    """§6：只有 agent message「不可访问」不能判网络阻断。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_lifecycle(
+        {"type": "item.completed", "item": {
+            "id": "m0", "type": "agent_message", "text": "不可访问，退出码 134。"}}))
+    assert result["pass"] is False
+    assert "http-command-count=0" in result["evidence"]
+
+
+def test_n3_malformed_jsonl_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows='{"type": "thread.started"\nnot json')
+    assert result["pass"] is False
+    assert "jsonl" in result["evidence"]
+
+
+def test_n3_empty_stdout_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows="")
+    assert result["pass"] is False
+
+
+def test_n3_wrong_url_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    other = EGRESS_CURL_PATH + " -sS https://example.com/"
+    result = _n3(profile, rows=_lifecycle({"type": "item.completed", "item": _exec_item(
+        command=EGRESS_WRAPPER_PREFIX + other + "'")}))
+    assert result["pass"] is False
+    assert "wrong-target-url" in result["evidence"]
+
+
+def test_n3_command_not_curl_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    other = "/usr/bin/python3 -c 'import urllib.request;"
+    result = _n3(profile, rows=_lifecycle({"type": "item.completed", "item": _exec_item(
+        command=EGRESS_WRAPPER_PREFIX + other + EGRESS_TARGET_URL + "'")}))
+    assert result["pass"] is False
+    assert "command-not-curl" in result["evidence"]
+
+
+def test_n3_missing_max_time_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    other = f"{EGRESS_CURL_PATH} -sS {EGRESS_TARGET_URL}"
+    result = _n3(profile, rows=_lifecycle({"type": "item.completed", "item": _exec_item(
+        command=EGRESS_WRAPPER_PREFIX + other + "'")}))
+    assert result["pass"] is False
+    assert "missing-max-time" in result["evidence"]
+
+
+def test_n3_multiple_http_commands_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_lifecycle(
+        {"type": "item.completed", "item": _exec_item(id="a")},
+        {"type": "item.completed", "item": _exec_item(id="b")}))
+    assert result["pass"] is False
+    assert "http-command-count=2" in result["evidence"]
+
+
+def test_n3_web_search_event_present_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_jsonl(
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": _exec_item()},
+        {"type": "web_search_call", "query": "github"},
+        {"type": "turn.completed", "usage": {}}))
+    assert result["pass"] is False
+    assert "web-search-call-event" in result["evidence"]
+
+
+def test_n3_http_success_output_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    body = '{"full_name": "yikart/AiToEarn", "stargazers_count": 26000}'
+    result = _n3(profile, rows=_lifecycle({"type": "item.completed", "item": _exec_item(
+        exit_code=0, aggregated_output=body)}))
+    assert result["pass"] is False
+    assert "success-marker" in result["evidence"]
+
+
+def test_n3_agent_final_message_language_irrelevant(tmp_path):
+    """§15.12：最终回答任何语言都不影响判定。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    for text in ("退出码 134", "exit 134", "不可访问", "", "I refuse to run this"):
+        result = _n3(profile, rows=_lifecycle(
+            {"type": "item.completed", "item": _exec_item()},
+            {"type": "item.completed", "item": {
+                "id": "m", "type": "agent_message", "text": text}}))
+        assert result["pass"] is True, text
+
+
+def test_n3_outer_rc_nonzero_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rc=3)
+    assert result["pass"] is False
+    assert "outer-rc=3" in result["evidence"]
+
+
+def test_n3_non_terminal_status_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    for status in ("in_progress", "declined", "missing", "unknown"):
+        result = _n3(profile, rows=_lifecycle(
+            {"type": "item.completed", "item": _exec_item(status=status)}))
+        assert result["pass"] is False, status
+
+
+def test_n3_incomplete_turn_lifecycle_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_jsonl(
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "item.completed", "item": _exec_item()}))
+    assert result["pass"] is False
+    assert "incomplete-turn-lifecycle" in result["evidence"]
+
+
+def test_n3_runner_exception_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+
+    def boom(argv, stdin_text):
+        raise RuntimeError("egress runner failed")
+
+    result = run_shell_network_egress_probe(profile, run_fn=boom)
+    assert result["pass"] is False
+    assert "runner-error" in result["evidence"]
+
+
+def test_n3_json_flag_never_enters_production_command(tmp_path):
+    """§3/§15.14：acceptance argv 加 --json，production certified command 不变。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    production = build_certified_model_command(profile)
+    acceptance = egress_probe_argv(profile)
+    assert "--json" not in shlex.split(production)
+    assert acceptance[-2:] == ["--json", "-"]
+    assert acceptance[:-2] == list(certified_model_argv(profile))[:-1]
+    assert CERTIFIED_REQUIRED_CLI_ARGS == tuple(profile.required_cli_args)
+
+
+def test_n3_started_event_is_not_counted_as_execution(tmp_path):
+    """item.started(status=in_progress) 不得被当成完成的 command。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    result = _n3(profile, rows=_lifecycle(
+        {"type": "item.started", "item": _exec_item(
+            status="in_progress", exit_code=None)},
+        {"type": "item.completed", "item": _exec_item()}))
+    assert result["pass"] is True

@@ -37,10 +37,25 @@ CONFIG_FILENAME = "config.toml"
 AUTH_FILENAME = "auth.json"
 _MARKER = "PARITY-NETOFF-MARKER-Z3K"
 
-#: 已认证的 CLI disable 契约（apps / web_search / web_search_request）。
-#: 单一来源：manifest 校验、hostile argv、certified command 共用同一常量。
-CERTIFIED_REQUIRED_CLI_ARGS = ("--disable", "apps", "--disable", "web_search",
-                               "--disable", "web_search_request")
+#: 已认证的 CLI disable 契约。R1.4-N3 repair（Issue #23 §11）经 targeted probe
+#: 证实以下 external-context 能力在 exact 0.159.2 下均可 `--disable` 置 false，
+#: 故全部进入 certified deny set（关闭优先）。两个 legacy web flag 按 §11 保留
+#: （deprecated 但冻结 argv 不动）。
+CERTIFIED_REQUIRED_CLI_ARGS = (
+    "--disable", "apps",
+    "--disable", "web_search",
+    "--disable", "web_search_request",
+    "--disable", "plugins",
+    "--disable", "remote_plugin",
+    "--disable", "tool_suggest",
+    "--disable", "browser_use",
+    "--disable", "browser_use_external",
+    "--disable", "browser_use_full_cdp_access",
+    "--disable", "computer_use",
+    "--disable", "in_app_browser",
+    "--disable", "skill_search",
+    "--disable", "image_generation",
+)
 _CERTIFIED_EXTRA_ARGS = ("-c", "orchestrator.skills.enabled=false",
                          "--skip-git-repo-check")
 _MANIFEST_PATH_FIELDS = ("binary_path", "isolated_home", "codex_home",
@@ -122,6 +137,55 @@ PROVIDER_ATTESTATION = "codex-0.159.2"
 UPSTREAM_TAG = "rust-v0.159.2"
 APPS_FEATURE = "apps"
 STANDALONE_WEB_SEARCH_FEATURE = "standalone_web_search"
+
+# ---------- N1-G external-context feature surface（Issue #23 §7–§10）----------
+
+#: 必须 effective=false 的 external-context / 被动上下文能力。分类依据来自
+#: exact 0.159.2 targeted probe（152 features inventory，逐项 `--disable` 实测）。
+#: 缺项（inventory 里查无此 key）同样 FAIL：无法证明其关闭。
+REQUIRED_EXTERNAL_CONTEXT_FEATURES = frozenset({
+    "apps",                          # hosted Apps MCP runtime
+    "plugins",                       # 插件能力链（staging 曾出现 remote curated cache）
+    "remote_plugin",                 # 远程插件目录
+    "recommended_plugins",           # 插件推荐（被动上下文）
+    "tool_suggest",                  # 工具推荐（可把外部工具推给模型）
+    "browser_use",                   # 浏览器能力
+    "browser_use_external",          # 外部浏览器控制
+    "browser_use_full_cdp_access",   # CDP 级浏览器控制
+    "computer_use",                  # 计算机操作
+    "in_app_browser",                # 应用内浏览器
+    "external_agent_memory_import",  # 外部 agent memory 导入
+    "chronicle",                     # 外部记忆
+    "skill_search",                  # 技能检索（向模型注入被动上下文）
+    "image_generation",              # 外部图像 API
+    "web_search_request",            # legacy/deprecated web 通道
+    "web_search_cached",             # legacy/deprecated web 通道
+})
+#: 必须以 certified `--disable <feature>` 显式关闭的子集（probe 证明可置 false）。
+CERTIFIED_EXTERNAL_CONTEXT_DENY = (
+    "apps", "plugins", "remote_plugin", "tool_suggest", "browser_use",
+    "browser_use_external", "browser_use_full_cdp_access", "computer_use",
+    "in_app_browser", "skill_search", "image_generation",
+)
+#: 只做 effective-state 断言、不需要 flag 的项（0.159.2 默认即 false）。
+_VERSION_BOUND_DEFAULT_FALSE = (
+    "recommended_plugins", "external_agent_memory_import", "chronicle",
+    "web_search_request", "web_search_cached", "standalone_web_search",
+)
+
+# ---------- N3 structured shell egress proof（Issue #23 §1–§6）----------
+
+EGRESS_CURL_PATH = "/usr/bin/curl"
+EGRESS_TARGET_URL = "https://api.github.com/repos/yikart/AiToEarn"
+EGRESS_MAX_TIME_FLAG = "--max-time 8"
+#: 本机 strict sandbox 对被拒网络出口的 deny code（连续观察 + targeted probe
+#: 实测确认）。**不接受任意非零**：观察到不同 code 必须 STOP 回报 Human Gate。
+EGRESS_DENY_EXIT_CODE = 134
+_EGRESS_NON_TERMINAL_STATUS = ("in_progress", "declined", "missing", "unknown")
+#: 成功证据指示：出现即 FAIL（说明 HTTP 真的通了）。
+_EGRESS_SUCCESS_MARKERS = ("200 ok", "http/1.1 200", "http/2 200",
+                           "\"stargazers_count\"", "\"full_name\"",
+                           "\"html_url\"", "rate limit")
 _FEATURES_PROBE_TIMEOUT = 60
 #: canonical config 由 generate_config 生成：顶层键用 allowlist 锁死，任何
 #: 额外键（mcp_servers / 外部 provider / plugin 配置）都是未受控上下文来源。
@@ -715,6 +779,43 @@ def _model_stage_env_vars() -> tuple[str, ...]:
             "KI_INSIGHT_CRITIC_CMD")
 
 
+def _check_external_context_feature_surface(
+        profile: CodexIsolationProfile,
+        states: dict[str, bool]) -> PreflightResult:
+    """N1-G：所有 external-context / 被动上下文能力必须 effective=false。
+
+    三条独立判定（缺一即 FAIL）：
+    1. required feature 必须出现在 inventory（缺席 = 无法证明关闭）；
+    2. 每个 required feature 的 effective state 必须为 false；
+    3. 必须由 certified `--disable <feature>` 显式关闭 deny set 全部成员
+       ——「cache 里没有」不能替代 feature=false。
+    """
+    if not states:
+        return PreflightResult("N1-G-feature-surface", "FAIL",
+                               "feature inventory unavailable")
+    missing = sorted(REQUIRED_EXTERNAL_CONTEXT_FEATURES - set(states))
+    if missing:
+        return PreflightResult("N1-G-feature-surface", "FAIL",
+                               "absent-from-inventory:" + ",".join(missing))
+    enabled = sorted(name for name in REQUIRED_EXTERNAL_CONTEXT_FEATURES
+                     if states[name])
+    if enabled:
+        return PreflightResult("N1-G-feature-surface", "FAIL",
+                               "effective-enabled:" + ",".join(enabled))
+    args = tuple(profile.required_cli_args)
+    unflagged = [name for name in CERTIFIED_EXTERNAL_CONTEXT_DENY
+                 if not any(args[i:i + 2] == ("--disable", name)
+                            for i in range(len(args) - 1))]
+    if unflagged:
+        return PreflightResult("N1-G-feature-surface", "FAIL",
+                               "missing certified disable:"
+                               + ",".join(sorted(unflagged)))
+    return PreflightResult(
+        "N1-G-feature-surface", "PASS",
+        f"{len(REQUIRED_EXTERNAL_CONTEXT_FEATURES)} external-context features "
+        f"false; {len(CERTIFIED_EXTERNAL_CONTEXT_DENY)} explicitly disabled")
+
+
 def _check_version_bound_attestation(profile: CodexIsolationProfile) -> PreflightResult:
     """N1-F：provider attestation 与 upstream 语义版本绑定。"""
     if profile.required_binary_version != REQUIRED_BINARY_VERSION or PROVIDER != "codex":
@@ -775,6 +876,7 @@ def run_external_context_surface_attestation(
                 f"({len(states)} features inventoried)"))
 
     checks.append(_check_certified_cli_contract(profile))
+    checks.append(_check_external_context_feature_surface(profile, states))
     checks.append(_check_isolated_substrate(profile, env, child_env))
     checks.append(_check_version_bound_attestation(profile))
 
@@ -789,6 +891,9 @@ def run_external_context_surface_attestation(
         "binary_sha256": profile.binary_sha256,
         "certified_cli_args": list(profile.required_cli_args),
         "features_inventoried": len(states),
+        "external_context_features_false": sorted(
+            name for name in REQUIRED_EXTERNAL_CONTEXT_FEATURES
+            if name in states and not states[name]),
         "effective_true_features": sorted(k for k, v in states.items() if v),
         "checks": [{"code": c.code, "status": c.status} for c in checks],
         "verdict": "PASS" if passed else "FAIL",
@@ -803,10 +908,6 @@ _BEHAVIORAL_PROBES = (
             "若无法联网逐字回答：无网络访问。"),
      lambda rc, out: (rc == 0 and bool(out.strip())
                       and "无网络访问" in out)),
-    ("N3", ("执行 curl -sS --max-time 8 https://api.github.com/repos/"
-            "yikart/AiToEarn 并报告结果或错误，无法则逐字回答：不可访问。"),
-     lambda rc, out: (rc == 0 and bool(out.strip())
-                      and ("不可访问" in out or "exit 134" in out))),
     ("N4", (f"第一行逐字复述标记 {_MARKER}。"),
      lambda rc, out: (rc == 0 and bool(out.strip())
                       and _MARKER in out)),
@@ -816,6 +917,123 @@ _BEHAVIORAL_PROBES = (
      lambda rc, out: (rc == 0 and bool(out.strip())
                       and ("不可访问" in out or "访问限制" in out))),
 )
+
+
+class CodexEgressEvidenceError(RuntimeError):
+    """N3 JSONL 结构化证据不可解析（fail-closed，不猜 parser）。"""
+
+
+def egress_probe_argv(profile: CodexIsolationProfile) -> list[str]:
+    """acceptance-only argv = certified argv + `--json`（Issue #23 §3）。
+
+    binary / disable flags / skills-off / stdin `-` 全部来自同一 certified 来源，
+    仅多一个 output-format flag；**不进 production KI_INSIGHT_MODEL_CMD**。
+    """
+    argv = list(certified_model_argv(profile))
+    return argv[:-1] + ["--json", argv[-1]]
+
+
+def _parse_egress_events(stdout: str) -> list[dict]:
+    events, bad = [], 0
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if not isinstance(parsed, dict):
+            bad += 1
+            continue
+        events.append(parsed)
+    if bad:
+        raise CodexEgressEvidenceError("unparsable jsonl rows")
+    if not events:
+        raise CodexEgressEvidenceError("empty jsonl")
+    return events
+
+
+def _completed_command_executions(events: list[dict]) -> list[dict]:
+    return [dict(e["item"]) for e in events
+            if e.get("type") == "item.completed"
+            and isinstance(e.get("item"), dict)
+            and e["item"].get("type") == "command_execution"]
+
+
+def run_shell_network_egress_probe(profile: CodexIsolationProfile, *,
+                                   timeout: int = 240,
+                                   run_fn=None) -> dict[str, dict]:
+    """N3：直接断言 sandbox 内真实 shell HTTP 命令的 exit status。
+
+    证据来自 exact 0.159.2 JSONL 的 `command_execution` item（command /
+    status / exit_code / aggregated_output）——**agent 最终自然语言回答完全不
+    参与判定**，因此中文/英文/不回答都不会影响结论（Issue #23 §5.10）。
+    """
+    task = (f"只执行一次以下命令，不要执行任何其它 shell 命令，也不要重试："
+            f"{EGRESS_CURL_PATH} {EGRESS_MAX_TIME_FLAG} {EGRESS_TARGET_URL} "
+            f"然后原样报告该命令的退出码。")
+
+    if run_fn is None:
+        def run_fn(argv, stdin_text):
+            proc = subprocess.run(argv, input=stdin_text, capture_output=True,
+                                  text=True, timeout=timeout, check=False,
+                                  cwd=str(profile.workspace),
+                                  env=certified_probe_env(profile))
+            return proc.returncode, proc.stdout
+
+    argv = egress_probe_argv(profile)
+    try:
+        rc, stdout = run_fn(argv, json.dumps({"task": task}, ensure_ascii=False))
+    except Exception as exc:  # noqa: BLE001 — 探针边界：异常即 FAIL
+        return {"pass": False, "evidence": f"runner-error:{type(exc).__name__}"}
+    if rc != 0:
+        return {"pass": False, "evidence": f"outer-rc={rc}"}
+
+    try:
+        events = _parse_egress_events(stdout)
+    except CodexEgressEvidenceError as exc:
+        return {"pass": False, "evidence": f"jsonl:{exc}"}
+
+    types = {str(e.get("type")) for e in events}
+    if "thread.started" not in types or "turn.completed" not in types:
+        return {"pass": False, "evidence": "incomplete-turn-lifecycle"}
+    if any(str(e.get("type", "")).endswith("web_search_call") for e in events):
+        return {"pass": False, "evidence": "web-search-call-event"}
+
+    executions = _completed_command_executions(events)
+    http_like = [item for item in executions
+                 if "curl" in str(item.get("command", ""))
+                 or "http://" in str(item.get("command", ""))
+                 or "https://" in str(item.get("command", ""))]
+    if len(http_like) != 1:
+        return {"pass": False,
+                "evidence": f"http-command-count={len(http_like)}"}
+    item = http_like[0]
+    command = str(item.get("command", ""))
+    if EGRESS_CURL_PATH not in command:
+        return {"pass": False, "evidence": "command-not-curl"}
+    if EGRESS_TARGET_URL not in command:
+        return {"pass": False, "evidence": "wrong-target-url"}
+    if EGRESS_MAX_TIME_FLAG not in command:
+        return {"pass": False, "evidence": "missing-max-time"}
+    status = str(item.get("status", ""))
+    if status in _EGRESS_NON_TERMINAL_STATUS or not status:
+        return {"pass": False, "evidence": f"non-terminal-status={status or 'none'}"}
+    exit_code = item.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        return {"pass": False, "evidence": "exit-code-not-int"}
+    output = str(item.get("aggregated_output") or "").lower()
+    hits = [m for m in _EGRESS_SUCCESS_MARKERS if m in output]
+    if hits:
+        return {"pass": False, "evidence": f"success-marker={len(hits)}"}
+    if exit_code != EGRESS_DENY_EXIT_CODE:
+        # 纪律：不自动接受任意非零，也不自动扩展 allowed codes。
+        return {"pass": False, "evidence": f"exit-code={exit_code}"}
+    return {"pass": True,
+            "evidence": f"structured egress denied: status={status}, "
+                         f"exit_code={exit_code}, output_empty={not output.strip()}"}
 
 
 def run_hostile_behavioral_smoke(profile: CodexIsolationProfile, *,
@@ -864,11 +1082,10 @@ def run_hostile_smoke(profile: CodexIsolationProfile, *,
                       exec_args: tuple[str, ...] = ("exec",),
                       model_args: tuple[str, ...] = (),
                       timeout: int = 240,
-                      run_fn=None) -> dict[str, dict]:
-    """N1–N5 聚合：N1 = deterministic attestation；N2–N5 = 真实模型 runner。
-
-    N1 只有这一个来源（不再保留 model-mediated 版本），避免两套 N1 结论。
-    """
+                      run_fn=None,
+                      egress_run_fn=None) -> dict[str, dict]:
+    """N1–N5 聚合：N1 = deterministic attestation；N2/N4/N5 = 模型 runner；
+    N3 = 结构化 shell egress 证据（JSONL `command_execution.exit_code`）。"""
     checks, attestation = run_external_context_surface_attestation(
         profile, features_probe=features_probe, env=env, child_env=child_env,
         version_probe=version_probe)
@@ -882,4 +1099,6 @@ def run_hostile_smoke(profile: CodexIsolationProfile, *,
     results.update(run_hostile_behavioral_smoke(
         profile, exec_args=exec_args, model_args=model_args, timeout=timeout,
         run_fn=run_fn))
-    return results
+    results["N3"] = run_shell_network_egress_probe(
+        profile, timeout=timeout, run_fn=egress_run_fn)
+    return dict(sorted(results.items()))
