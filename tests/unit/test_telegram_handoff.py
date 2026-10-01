@@ -7,6 +7,7 @@
 import asyncio
 import json
 from argparse import Namespace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from knowledge_ingest.config import AppConfig
@@ -17,6 +18,12 @@ from knowledge_ingest.telegram.handoff import (
     TelegramHandoffRunner,
     important_capability_signal,
 )
+
+_T1 = datetime(2026, 9, 19, 10, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+_T2 = datetime(2026, 9, 19, 11, 30, 0, tzinfo=timezone(timedelta(hours=8)))
+_T1_ISO = "2026-09-19T02:00:00+00:00"     # watcher._iso 归一形状（UTC 秒精度）
+_T2_ISO = "2026-09-19T03:30:00+00:00"
+_BODY = "这是一段足够长的知识正文，" * 4
 
 
 def make_config(tmp_path: Path) -> AppConfig:
@@ -114,6 +121,8 @@ def test_build_handoff_v2_shape(tmp_path):
     assert prov["message_ids"] == [7]
     assert prov["sender_id"] == "99"
     assert prov["source_deleted"] is False
+    # K2C Task 9 Change 4：新鲜 handoff 恒定显式 False
+    assert prov["source_edited_after_handoff"] is False
 
 
 def test_build_handoff_v2_records_source_deleted(tmp_path):
@@ -448,3 +457,147 @@ def test_r9_cli_handoff_unknown_item(tmp_path, capsys):
     rc = _cmd_telegram_handoff(config, Namespace(item_id="tg_a:missing"))
     assert rc == 2
     assert "not found" in capsys.readouterr().err
+
+
+# ---------- K2C Task 9：handoff 后 EDIT → 下游 provenance 双位置同状态 ----------
+
+
+def _handoff_completed(tmp_path):
+    """最小真实构建路径：materialized item → prepare_handoff → 真实 job
+    注册到 DOWNLOADED（handoff_completed=1）。返回
+    (store, config, job_id, handoff/source.json 路径)。"""
+    store, _ = seeded_item(tmp_path, body=_BODY)
+    config, runner = make_runner(tmp_path, store)
+    result = runner.prepare_handoff("tg_a:1")
+    assert result is not None and result["job_id"]
+    handoff_file = (config.pipeline_root / "jobs" / result["job_id"]
+                    / "handoff" / "source.json")
+    return store, config, result["job_id"], handoff_file
+
+
+def _drive_edit(store, config, *, edited_at):
+    """经真实 watcher 通路投递一条 EDIT（§19.2：先落库后 Item 层）。"""
+    from knowledge_ingest.telegram.client_port import (
+        TelegramEvent,
+        TelegramEventKind,
+    )
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+    from knowledge_ingest.telegram.watcher import TelegramWatcher
+
+    pipeline = SourceItemPipeline(store, data_root=config.pipeline_root,
+                                  orico_check=lambda: True)
+    watcher = TelegramWatcher(store, client=None, pipeline=pipeline)
+    watcher.handle_event(TelegramEvent(
+        kind=TelegramEventKind.EDIT, chat_id=-1001234567890, message_id=7,
+        message_date=datetime(2026, 9, 18, 9, 1, 0,
+                              tzinfo=timezone(timedelta(hours=8))),
+        sender_id=99, text=_BODY, edited_at=edited_at))
+
+
+def _both_provenances(config, job_id, handoff_file):
+    on_disk = json.loads(handoff_file.read_text(encoding="utf-8"))
+    registered = registered_manifest(config, job_id)
+    return on_disk["provenance"], registered.source["provenance"]
+
+
+def test_pre_handoff_edit_keeps_flag_false_in_both_locations(tmp_path):
+    """Test 3 / Change 4：handoff 之前已编辑（edited_at 已置）的消息属于
+    当前 Source Truth → 初始 source.json 与 job.yaml 的 provenance 都必须
+    显式 source_edited_after_handoff=False，绝不翻 True。"""
+    store, _ = seeded_item(tmp_path, body=_BODY)
+    store.upsert_message("tg_a", 7, message_date=(
+        "2026-09-18T09:01:00+08:00"), sender_id="99", text=_BODY,
+        edited_at="2026-09-18T09:02:00+08:00")
+    config, runner = make_runner(tmp_path, store)
+    result = runner.prepare_handoff("tg_a:1")
+    handoff_file = (config.pipeline_root / "jobs" / result["job_id"]
+                    / "handoff" / "source.json")
+    on_disk_prov, manifest_prov = _both_provenances(
+        config, result["job_id"], handoff_file)
+    assert on_disk_prov["source_edited_after_handoff"] is False
+    assert manifest_prov["source_edited_after_handoff"] is False
+
+
+def test_first_post_handoff_edit_writes_both_locations(tmp_path):
+    """Test 4 / Change 2：EDIT(T1) → source.json 与 job.yaml 的 provenance
+    同时置 True 且 edited_at == T1（两位置状态一致）。"""
+    store, config, job_id, handoff_file = _handoff_completed(tmp_path)
+    _drive_edit(store, config, edited_at=_T1)
+
+    on_disk_prov, manifest_prov = _both_provenances(
+        config, job_id, handoff_file)
+    for provenance in (on_disk_prov, manifest_prov):
+        assert provenance["source_edited_after_handoff"] is True
+        assert provenance["edited_at"] == _T1_ISO
+
+
+def test_second_post_handoff_edit_advances_watermark(tmp_path):
+    """Test 5 / Change 3：T1 → T2（T2 != T1）→ 两位置 edited_at 都前进到
+    T2，flag 保持 True（覆盖而非首写固定）。"""
+    store, config, job_id, handoff_file = _handoff_completed(tmp_path)
+    _drive_edit(store, config, edited_at=_T1)
+    _drive_edit(store, config, edited_at=_T2)
+
+    on_disk_prov, manifest_prov = _both_provenances(
+        config, job_id, handoff_file)
+    for provenance in (on_disk_prov, manifest_prov):
+        assert provenance["source_edited_after_handoff"] is True
+        assert provenance["edited_at"] == _T2_ISO
+        assert provenance["edited_at"] != _T1_ISO
+
+
+def test_edit_then_delete_all_three_facts_coexist(tmp_path):
+    """Test 6 / Change 5：EDIT 后 DELETE → 三事实在同一 provenance 并存，
+    delete 路径不得 clobber edit 字段。"""
+    store, config, job_id, handoff_file = _handoff_completed(tmp_path)
+    _drive_edit(store, config, edited_at=_T1)
+    _drive_edit(store, config, edited_at=_T2)
+
+    from knowledge_ingest.telegram.client_port import (
+        TelegramEvent,
+        TelegramEventKind,
+    )
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+    from knowledge_ingest.telegram.watcher import TelegramWatcher
+    pipeline = SourceItemPipeline(store, data_root=config.pipeline_root,
+                                  orico_check=lambda: True)
+    TelegramWatcher(store, client=None, pipeline=pipeline).handle_event(
+        TelegramEvent(kind=TelegramEventKind.DELETE,
+                      chat_id=-1001234567890, message_id=7))
+
+    on_disk_prov, manifest_prov = _both_provenances(
+        config, job_id, handoff_file)
+    for provenance in (on_disk_prov, manifest_prov):
+        assert provenance["source_edited_after_handoff"] is True
+        assert provenance["edited_at"] == _T2_ISO
+        assert provenance["source_deleted"] is True
+
+
+def test_post_handoff_edit_touches_neither_corpus_nor_materialized(
+        tmp_path):
+    """Test 7：§6.4 C —— Corpus 不动；materialized message.md 字节不变；
+    review 记录仍创建（既有行为）；item 状态不被 EDIT 改写。"""
+    store, config, job_id, _handoff_file = _handoff_completed(tmp_path)
+    materialized = Path(store.get_source_item("tg_a:1")["materialized_path"])
+    before = materialized.read_bytes()
+    _drive_edit(store, config, edited_at=_T1)
+
+    assert materialized.read_bytes() == before
+    registered = registered_manifest(config, job_id)
+    assert registered.docchunk.corpus_path is None     # Corpus 侧不产生
+    assert registered.status == "DOWNLOADED"           # job 状态不动
+    assert store.has_open_review("tg_a:1", "SOURCE_EDITED_AFTER_HANDOFF")
+    assert store.get_source_item("tg_a:1")["processing_status"] == \
+        "materialized"
+
+
+def test_mark_downstream_edited_tolerates_missing_job(tmp_path):
+    """Test 8：无 job_id 的 item → _mark_downstream_edited 静默 no-op
+    （镜像 _mark_downstream_deleted 的容错纪律）。"""
+    from knowledge_ingest.telegram.items import SourceItemPipeline
+
+    store, _ = seeded_item(tmp_path, body=_BODY)   # 从未 prepare_handoff
+    pipeline = SourceItemPipeline(store, data_root=tmp_path / "kp",
+                                  orico_check=lambda: True)
+    pipeline._mark_downstream_edited("tg_a:1", _T1)    # 不抛异常即可
+    assert store.get_source_item("tg_a:1")["knowledge_ingest_job_id"] is None

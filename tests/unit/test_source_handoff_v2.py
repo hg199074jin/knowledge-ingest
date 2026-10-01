@@ -259,3 +259,35 @@ def test_handoff_v2_example_carries_source_deleted():
         .read_text(encoding="utf-8"))
     assert example["schema_version"] == 2
     assert example["provenance"]["source_deleted"] is False
+
+
+# ---------- K2C Task 9：新鲜 handoff 的 provenance 显式携带 edit 旗标 ----------
+
+
+def test_fresh_handoff_v2_carries_source_edited_after_handoff_false(
+        tmp_path: Path):
+    """K2C Task 9 Change 4：build_handoff_v2 产出的新鲜 provenance 显式
+    source_edited_after_handoff=False——handoff 之前的编辑属于当前
+    Source Truth，flag 恒 False。"""
+    from .test_telegram_handoff import make_runner, seeded_item
+
+    store, _ = seeded_item(tmp_path)
+    _config, runner = make_runner(tmp_path, store)
+    handoff = runner.build_handoff_v2("tg_a:1")
+    assert handoff["provenance"]["source_edited_after_handoff"] is False
+    assert handoff["provenance"]["source_deleted"] is False
+
+
+def test_fresh_handoff_registered_provenance_keeps_flag_false(
+        tmp_path: Path):
+    """注册后 job.yaml（manifest.source.provenance）同样显式 False
+    （附录 A-1 双形状：handoff/source.json 与 job.yaml 同状态）。"""
+    from .test_telegram_handoff import make_runner, seeded_item
+
+    store, _ = seeded_item(tmp_path)
+    config, runner = make_runner(tmp_path, store)
+    result = runner.prepare_handoff("tg_a:1")
+    registered = ManifestStore(
+        jobs_root=config.pipeline_root / "jobs").load(result["job_id"])
+    assert registered.source["provenance"][
+        "source_edited_after_handoff"] is False
