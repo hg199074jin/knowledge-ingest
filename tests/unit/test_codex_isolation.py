@@ -885,18 +885,24 @@ def test_loaded_profile_drives_preflight_pass(tmp_path):
 
 
 def test_loader_tolerates_unknown_key_but_preflight_flags_it(tmp_path):
-    """未知键：loader 前向兼容不放行激活，preflight 仍以 drift fail-closed。"""
+    """未知键：loader 前向兼容不放行激活，preflight 仍以 drift fail-closed。
+
+    键名同样来自 manifest（可能被篡改成敏感串）→ detail 只报数量不回显
+    （Issue #17）。
+    """
+    marker = "unknown-key-secret-marker-9f2a"
     binary = stub_binary(tmp_path)
     _profile, manifest = _manifest_for(tmp_path, binary)
-    manifest["experimental_flag"] = True
+    manifest[marker] = True
     loaded = _load(tmp_path, binary, manifest)
     _write_valid_assets(loaded)
     write_manifest(loaded.codex_home / MANIFEST_FILENAME,
-                   build_manifest(loaded) | {"experimental_flag": True})
+                   build_manifest(loaded) | {marker: True})
     _overall, checks = run_preflight(
         loaded, version_probe=lambda p: "codex-cli 0.159.2")
-    assert any(c.status == "FAIL" and "experimental_flag" in c.detail
+    assert any(c.status == "FAIL" and "unknown manifest key" in c.detail
                for c in checks)
+    assert all(marker not in c.detail for c in checks)
 
 
 def test_canonical_manifest_path_matches_preflight_read_location(tmp_path):
@@ -953,3 +959,81 @@ def test_certified_command_has_no_stage_specific_args(tmp_path):
     profile = make_profile(tmp_path, binary)
     argv = shlex.split(build_certified_model_command(profile))
     assert "-m" not in argv and "--model" not in argv
+
+
+# ---------- R1.3 patch（Issue #17）：manifest error sanitization 矩阵 ----------
+
+#: 每个受校验字段注入唯一 secret marker：错误必须 fail-closed 且零回显。
+SECRET_MANIFEST_FIELDS = (
+    "manifest_schema_version",
+    "provider",
+    "certification_state",
+    "required_binary_version",
+    "binary_kind",
+    "network_policy",
+    "filesystem_policy",
+    "web_apps_policy",
+)
+
+
+def _secret_marker(field: str) -> str:
+    return f"Bearer sk-secret-{field.replace('_', '-')}-9f2a"
+
+
+@pytest.mark.parametrize("field", SECRET_MANIFEST_FIELDS)
+def test_loader_error_never_echoes_manifest_raw_value(tmp_path, field):
+    marker = _secret_marker(field)
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest[field] = marker
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    detail = str(exc.value)
+    assert marker not in detail, detail          # 零回显
+    assert field.split("_")[0] in detail or field in detail  # 仍可定位字段
+    assert isinstance(detail, str) and len(detail) < 120
+
+
+@pytest.mark.parametrize("field", SECRET_MANIFEST_FIELDS)
+def test_loader_error_still_names_expected_semantics(tmp_path, field):
+    """不降低诊断能力：字段名 + 类别 + 固定 expected 值仍在。"""
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest[field] = "wrong-value"
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    detail = str(exc.value)
+    if field == "manifest_schema_version":
+        assert "expected 1" in detail
+    elif field == "required_binary_version":
+        assert "expected certified version 0.159.2" in detail
+    else:
+        assert detail in (
+            "provider mismatch", "illegal certification_state",
+            "binary_kind mismatch", "network_policy mismatch",
+            "filesystem_policy mismatch", "web_apps_policy mismatch")
+
+
+def test_loader_required_cli_args_drift_never_echoes(tmp_path):
+    marker = _secret_marker("required_cli_args")
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest["required_cli_args"] = [marker]
+    with pytest.raises(CodexProfileLoadError) as exc:
+        _load(tmp_path, binary, manifest)
+    assert str(exc.value) == "required_cli_args mismatch"
+
+
+def test_loader_unknown_manifest_key_name_never_echoed(tmp_path):
+    """键名也来自 manifest：P5 只报数量，不回显键名。"""
+    marker = _secret_marker("key-name")
+    binary = stub_binary(tmp_path)
+    _profile, manifest = _manifest_for(tmp_path, binary)
+    manifest[marker] = True
+    loaded = _load(tmp_path, binary, manifest)
+    _write_valid_assets(loaded)
+    write_manifest(loaded.codex_home / MANIFEST_FILENAME,
+                   build_manifest(loaded) | {marker: True})
+    _overall, checks = run_preflight(
+        loaded, version_probe=lambda p: "codex-cli 0.159.2")
+    assert all(marker not in c.detail for c in checks)

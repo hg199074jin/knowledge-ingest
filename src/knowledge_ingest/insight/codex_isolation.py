@@ -312,10 +312,11 @@ def _check_manifest(profile: CodexIsolationProfile,
         if manifest.get(key) != want:
             checks.append(PreflightResult("P5-manifest", "FAIL",
                                           f"{key} drift"))
-    for key in manifest:
-        if key not in expected:
-            checks.append(PreflightResult("P5-manifest", "FAIL",
-                                          f"unknown manifest key: {key}"))
+    unknown = [key for key in manifest if key not in expected]
+    if unknown:
+        # 键名同样来自 manifest（可能被篡改成敏感串）→ 只报数量，不回显
+        checks.append(PreflightResult("P5-manifest", "FAIL",
+                                      f"unknown manifest key: {len(unknown)}"))
     if manifest.get("certification_state") not in \
             {s.value for s in CertificationState}:
         checks.append(PreflightResult("P5-manifest", "FAIL",
@@ -379,6 +380,11 @@ def load_codex_profile_from_runtime(*, manifest_path: Path,
 
     任何解析/校验失败 → `CodexProfileLoadError`；绝不回落 ambient/default
     profile，也绝不读 auth 内容。
+
+    错误内容冻结（Issue #17）：只含字段名、错误类别、异常类型名与固定
+    expected 值（schema version / certified binary version）；**绝不回显
+    manifest 提供的值或键名**——被篡改的 manifest 不能借 doctor 输出泄漏
+    任意字符串。
     """
     manifest_path = Path(manifest_path)
     if not manifest_path.is_file():
@@ -392,23 +398,24 @@ def load_codex_profile_from_runtime(*, manifest_path: Path,
     if not isinstance(raw, dict):
         raise CodexProfileLoadError("profile manifest is not a JSON object")
     if raw.get("manifest_schema_version") != MANIFEST_SCHEMA_VERSION:
+        # 冻结：只报字段名 + 期望 schema，不回显 manifest 原始值
         raise CodexProfileLoadError(
-            "unsupported manifest schema version: "
-            f"{raw.get('manifest_schema_version')!r}")
+            "unsupported manifest schema version "
+            f"(expected {MANIFEST_SCHEMA_VERSION})")
     if raw.get("provider") != PROVIDER:
-        raise CodexProfileLoadError(
-            f"provider drift: {raw.get('provider')!r}")
+        raise CodexProfileLoadError("provider mismatch")
     state_value = raw.get("certification_state")
     try:
         state = CertificationState(state_value)
     except ValueError:
-        raise CodexProfileLoadError(
-            f"illegal certification_state: {state_value!r}") from None
+        raise CodexProfileLoadError("illegal certification_state") from None
     profile_id = _require_manifest_str(raw, "profile_id")
     version = _require_manifest_str(raw, "required_binary_version")
     if version != REQUIRED_BINARY_VERSION:
+        # 只允许出现固定 expected pin（公开资产信息），不出现 manifest 提供的值
         raise CodexProfileLoadError(
-            f"required_binary_version drift: want {REQUIRED_BINARY_VERSION}")
+            "required_binary_version mismatch "
+            f"(expected certified version {REQUIRED_BINARY_VERSION})")
     sha = raw.get("binary_sha256")
     if (not isinstance(sha, str) or len(sha) != 64
             or not all(c in string.hexdigits for c in sha)):
@@ -417,13 +424,12 @@ def load_codex_profile_from_runtime(*, manifest_path: Path,
     paths = {key: _require_manifest_path(raw, key)
              for key in _MANIFEST_PATH_FIELDS}
     if raw.get("binary_kind") != "native-macho":
-        raise CodexProfileLoadError(
-            f"binary_kind drift: {raw.get('binary_kind')!r}")
+        raise CodexProfileLoadError("binary_kind mismatch")
     for key, want in (("network_policy", "off"),
                       ("filesystem_policy", "strict"),
                       ("web_apps_policy", "disabled")):
         if raw.get(key) != want:
-            raise CodexProfileLoadError(f"{key} drift: {raw.get(key)!r}")
+            raise CodexProfileLoadError(f"{key} mismatch")
     cli_args = raw.get("required_cli_args")
     if (not isinstance(cli_args, list) or not cli_args
             or not all(isinstance(a, str) and a for a in cli_args)):
@@ -431,9 +437,8 @@ def load_codex_profile_from_runtime(*, manifest_path: Path,
             "manifest field 'required_cli_args' missing or not a string list")
     if tuple(cli_args) != CERTIFIED_REQUIRED_CLI_ARGS:
         # manifest 被改成弱化参数（如丢掉 web_search disable）→ 直接拒绝，
-        # 绝不"按 manifest 现状"生成 production command。
-        raise CodexProfileLoadError(
-            "manifest field 'required_cli_args' drift from certified set")
+        # 绝不"按 manifest 现状"生成 production command，也不回显其内容。
+        raise CodexProfileLoadError("required_cli_args mismatch")
     deny_targets = raw.get("deny_targets")
     if not isinstance(deny_targets, list) or "real-user-home" not in deny_targets:
         raise CodexProfileLoadError(

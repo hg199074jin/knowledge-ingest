@@ -18,6 +18,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from knowledge_ingest.config import AppConfig
 from knowledge_ingest.insight.codex_isolation import (
     CertificationState,
@@ -98,6 +100,46 @@ def test_malformed_manifest_is_fail_and_detail_is_sanitized(certified):
     assert status == "FAIL"
     assert "leaky-manifest-secret-9f3a" not in detail
     assert readiness.profile is None
+
+
+# ---------- Issue #17：doctor/readiness 侧零回显矩阵 ----------
+
+SECRET_MANIFEST_FIELDS = (
+    "manifest_schema_version",
+    "provider",
+    "certification_state",
+    "required_binary_version",
+    "binary_kind",
+    "network_policy",
+    "filesystem_policy",
+    "web_apps_policy",
+)
+
+
+@pytest.mark.parametrize("field", SECRET_MANIFEST_FIELDS)
+def test_doctor_d2_never_echoes_manifest_raw_value(certified, field):
+    marker = f"Bearer sk-secret-{field.replace('_', '-')}-4b8e"
+    assets = certified(tamper=lambda doc: {**doc, field: marker})
+    readiness = collect_isolation_readiness(
+        assets.env, version_probe=assets.version_probe)
+    status, detail = _by_name(readiness)["D2-manifest-load"]
+    assert status == "FAIL"
+    assert marker not in detail, detail
+    assert marker not in readiness.detail
+    joined = " ".join(f"{n} {s} {d}" for n, s, d in readiness.rows())
+    assert marker not in joined
+    assert readiness.profile is None
+    assert readiness.status != "PASS"           # fail-closed，不放行激活
+
+
+def test_doctor_d2_never_echoes_manifest_key_name(certified):
+    marker = "Bearer sk-secret-unknown-key-1c3d"
+    assets = certified(tamper=lambda doc: {**doc, marker: True})
+    readiness = collect_isolation_readiness(
+        assets.env, version_probe=assets.version_probe)
+    joined = " ".join(f"{n} {s} {d}" for n, s, d in readiness.rows())
+    assert marker not in joined
+    assert readiness.status != "PASS"
 
 
 def test_manifest_outside_codex_home_is_fail(certified, tmp_path):
