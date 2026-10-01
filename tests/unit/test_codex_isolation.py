@@ -20,16 +20,21 @@ from knowledge_ingest.insight.codex_isolation import (
     CertificationState,
     CodexIsolationProfile,
     CodexProfileLoadError,
+    CodexSurfaceAttestationError,
     advance_certification_state,
     build_certified_model_command,
     build_manifest,
     canonical_manifest_path,
     certified_model_argv,
+    certified_probe_env,
     certify_binary,
     check_auth,
     generate_config,
     load_codex_profile_from_runtime,
     load_manifest,
+    parse_feature_states,
+    run_external_context_surface_attestation,
+    run_hostile_behavioral_smoke,
     run_hostile_smoke,
     run_preflight,
     sha256_file,
@@ -282,19 +287,45 @@ def fake_runner_factory(responses):
     return run_fn
 
 
+ALL_BEHAVIORAL_PASS = {
+    "star 数": (0, "无网络访问"),
+    "api.github.com": (0, "exit 134 不可访问"),
+    "复述标记": (0, "PARITY-NETOFF-MARKER-Z3K"),
+    "AGENTS.md": (0, "受访问限制"),
+}
+
+
+def clean_features_probe(profile):
+    """N1 deterministic：exact 0.159.2 语义下 apps/standalone web 均 false。"""
+    return 0, ("apps                       stable             false\n"
+               "standalone_web_search      under development false\n"
+               "web_search_request         deprecated         false\n")
+
+
+def certified_profile(tmp_path, binary):
+    """N1 需要 PASS 时的最小资产：config + auth + canonical manifest。"""
+    profile = make_profile(tmp_path, binary)
+    (profile.codex_home / "config.toml").write_text(
+        generate_config(profile), encoding="utf-8")
+    auth = profile.codex_home / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    auth.chmod(0o600)
+    write_manifest(profile.codex_home / MANIFEST_FILENAME,
+                   build_manifest(profile))
+    return profile
+
+
 def test_hostile_smoke_all_pass(tmp_path):
     binary = stub_binary(tmp_path)
-    profile = make_profile(tmp_path, binary)
+    profile = certified_profile(tmp_path, binary)
     results = run_hostile_smoke(
-        profile, exec_args=["exec"], run_fn=fake_runner_factory({
-            "工具名": (0, "无 web 工具"),
-            "star 数": (0, "无网络访问"),
-            "api.github.com": (0, "exit 134 不可访问"),
-            "复述标记": (0, "PARITY-NETOFF-MARKER-Z3K"),
-            "AGENTS.md": (0, "受访问限制"),
-        }))
-    assert all(v["pass"] for v in results.values())
+        profile, exec_args=["exec"], features_probe=clean_features_probe,
+        version_probe=lambda p: "codex-cli 0.159.2",
+        env={}, child_env=certified_probe_env(profile),
+        run_fn=fake_runner_factory(ALL_BEHAVIORAL_PASS))
+    assert all(v["pass"] for v in results.values()), results
     assert set(results) == {"N1", "N2", "N3", "N4", "N5"}
+    assert results["N1"]["attestation"]["verdict"] == "PASS"
 
 
 def test_hostile_smoke_n2_live_web_fail(tmp_path):
@@ -393,8 +424,8 @@ def test_default_hostile_runner_uses_isolated_env_and_workspace(
         "PARITY-NETOFF-MARKER-Z3K\n受访问限制\n")
     monkeypatch.setattr(ci, "subprocess", fake)
     results = run_hostile_smoke(profile, exec_args=["exec"])
-    assert all(v["pass"] for v in results.values())
-    call = fake.calls[0]
+    assert all(v["pass"] for v in results.values() if v.get("attestation") is None)
+    call = next(c for c in fake.calls if "exec" in c["argv"])
     env = call["env"]
     assert env["HOME"] == str(profile.isolated_home)
     assert env["CODEX_HOME"] == str(profile.codex_home)
@@ -600,12 +631,13 @@ def test_f1_n5_rc1_with_correct_text_fail(tmp_path):
 
 
 def test_f1_evidence_contains_rc(tmp_path):
+    """R1.4-N1 repair 后 N1 不再经模型，rc evidence 由 behavioral 探针承担。"""
     binary = stub_binary(tmp_path)
     profile = make_profile(tmp_path, binary)
     results = run_hostile_smoke(
         profile, exec_args=["exec"],
-        run_fn=lambda a, s: (1, "无 web 工具"))
-    assert "rc=1" in results["N1"]["evidence"]
+        run_fn=lambda a, s: (1, "PARITY-NETOFF-MARKER-Z3K"))
+    assert "rc=1" in results["N4"]["evidence"]
 
 
 def test_f1_rc0_still_passes_with_positive_evidence(tmp_path):
@@ -1037,3 +1069,313 @@ def test_loader_unknown_manifest_key_name_never_echoed(tmp_path):
     _overall, checks = run_preflight(
         loaded, version_probe=lambda p: "codex-cli 0.159.2")
     assert all(marker not in c.detail for c in checks)
+
+
+# ---------- R1.4-N1 repair（Issue #21）：deterministic N1 A–F ----------
+
+#: 真实 0.159.2 语义下的 inventory 抽样：apps/standalone web 必须 false；
+#: `apply_patch*` / `in_app_*` 等非 gated 能力存在**不影响** N1（名字含 `app`
+#: 不再是安全判据；它们不构成 external-context channel）。
+CLEAN_FEATURES = (
+    "apps                                     stable             false\n"
+    "standalone_web_search                    under development false\n"
+    "web_search_request                       deprecated         false\n"
+    "web_search_cached                        deprecated         false\n"
+    "apply_patch_freeform                     removed            false\n"
+    "in_app_browser                           stable             true\n"
+    "skill_search                             stable             true\n"
+    "guardianv2.thread_context                removed            false\n"
+)
+
+
+def _probe_ok(_profile):
+    return 0, CLEAN_FEATURES
+
+
+def stub_version_probe(path):
+    """按 stub 文件内容回报版本行（与真实 native binary 行为一致）。"""
+    return path.read_bytes()[20:].decode(errors="ignore").strip()
+
+
+def attest(profile, **kwargs):
+    kwargs.setdefault("features_probe", _probe_ok)
+    kwargs.setdefault("version_probe", stub_version_probe)
+    kwargs.setdefault("env", {})
+    kwargs.setdefault("child_env", certified_probe_env(profile))
+    checks, attestation = run_external_context_surface_attestation(
+        profile, **kwargs)
+    return {c.code: c for c in checks}, attestation
+
+
+# --- parser 严格性 ---
+
+def test_parse_feature_states_reads_real_0_1592_shape():
+    states = parse_feature_states(CLEAN_FEATURES)
+    assert states["apps"] is False
+    assert states["in_app_browser"] is True          # 名字含 app，但不是 apps feature
+    assert states["guardianv2.thread_context"] is False   # 点号名可解析
+
+
+@pytest.mark.parametrize("stdout", [
+    "",
+    "apps stable maybe\n",
+    "apps\n",
+    "apps stable false\napps stable true\n",
+])
+def test_parse_feature_states_fail_closed(stdout):
+    with pytest.raises(CodexSurfaceAttestationError):
+        parse_feature_states(stdout)
+
+
+# --- N1-A exact binary identity ---
+
+def test_n1_wrong_version_fail(tmp_path):
+    binary = stub_binary(tmp_path, "codex-cli 0.160.0")
+    profile = certified_profile(tmp_path, binary)
+    checks, attestation = attest(profile)
+    assert checks["N1-A-binary"].status == "FAIL"
+    assert attestation["verdict"] == "FAIL"
+
+
+def test_n1_binary_hash_mismatch_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    profile = CodexIsolationProfile(**{**profile.__dict__,
+                                      "binary_sha256": "0" * 64})
+    checks, _ = attest(profile)
+    assert checks["N1-A-binary"].status == "FAIL"
+
+
+# --- N1-B effective config contract ---
+
+def test_n1_web_search_not_disabled_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    path = profile.codex_home / "config.toml"
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        'web_search = "disabled"', 'web_search = "live"'), encoding="utf-8")
+    checks, _ = attest(profile)
+    assert checks["N1-B-config"].status == "FAIL"
+    assert "web-search-not-disabled" in checks["N1-B-config"].detail
+
+
+def test_n1_custom_mcp_servers_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    path = profile.codex_home / "config.toml"
+    path.write_text(path.read_text(encoding="utf-8")
+                    + '\n[mcp_servers.victim]\ncommand = "curl"\n',
+                    encoding="utf-8")
+    checks, _ = attest(profile)
+    assert checks["N1-B-config"].status == "FAIL"
+    assert "mcp-servers-configured" in checks["N1-B-config"].detail
+
+
+def test_n1_unknown_config_key_reported_by_count_only(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    path = profile.codex_home / "config.toml"
+    path.write_text(path.read_text(encoding="utf-8")
+                    + '\n[tools.some_vendor]\nkey = "secret-9f2a"\n',
+                    encoding="utf-8")
+    checks, _ = attest(profile)
+    status, detail = checks["N1-B-config"].status, checks["N1-B-config"].detail
+    assert status == "FAIL"
+    assert "secret-9f2a" not in detail            # 不回显键名/取值
+    assert "unknown-top-level:1" in detail
+
+
+def test_n1_config_missing_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    (profile.codex_home / "config.toml").unlink()
+    checks, _ = attest(profile)
+    assert checks["N1-B-config"].status == "FAIL"
+
+
+# --- N1-C apps effective state ---
+
+def test_n1_apps_effectively_enabled_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (
+        0, "apps                       stable             true\n"))
+    assert checks["N1-C-apps"].status == "FAIL"
+    assert "apps-effective-enabled" in checks["N1-C-apps"].detail
+
+
+def test_n1_standalone_web_search_enabled_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (
+        0, "apps stable false\nstandalone_web_search under development true\n"))
+    assert checks["N1-C-apps"].status == "FAIL"
+
+
+def test_n1_features_list_unparsable_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (0, "garbage output"))
+    assert checks["N1-C-apps"].status == "FAIL"
+    assert "undeterminable" in checks["N1-C-apps"].detail
+
+
+def test_n1_features_probe_nonzero_rc_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (1, CLEAN_FEATURES))
+    assert checks["N1-C-apps"].status == "FAIL"
+
+
+def test_n1_apps_absent_from_inventory_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, features_probe=lambda p: (
+        0, "skill_search stable true\n"))
+    assert checks["N1-C-apps"].status == "FAIL"
+    assert "apps-absent-from-inventory" in checks["N1-C-apps"].detail
+
+
+# --- N1-D certified CLI contract ---
+
+def test_n1_disable_apps_missing_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    profile = CodexIsolationProfile(**{
+        **profile.__dict__,
+        "required_cli_args": ("--disable", "web_search",
+                              "--disable", "web_search_request")})
+    checks, _ = attest(profile)
+    assert checks["N1-D-cli"].status == "FAIL"
+    assert "apps" in checks["N1-D-cli"].detail
+
+
+# --- N1-E isolated substrate ---
+
+@pytest.mark.parametrize("target", ["codex_home", "isolated_home", "workspace"])
+def test_n1_agents_md_present_fail(tmp_path, target):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    (getattr(profile, target) / "AGENTS.md").write_text("x", encoding="utf-8")
+    checks, _ = attest(profile)
+    assert checks["N1-E-substrate"].status == "FAIL"
+    assert "agents-md" in checks["N1-E-substrate"].detail
+
+
+def test_n1_user_skills_in_isolated_home_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    skills = profile.isolated_home / ".agents" / "skills"
+    skills.mkdir(parents=True)
+    (skills / "mine").mkdir()
+    checks, _ = attest(profile)
+    assert checks["N1-E-substrate"].status == "FAIL"
+
+
+def test_n1_non_system_codex_skills_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    (profile.codex_home / "skills" / ".system").mkdir(parents=True)
+    (profile.codex_home / "skills" / "user-injected").mkdir()
+    checks, _ = attest(profile)
+    assert "non-system-skills:1" in checks["N1-E-substrate"].detail
+
+
+def test_n1_installed_plugin_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    plugins = profile.codex_home / "plugins"
+    (plugins / "cache").mkdir(parents=True)
+    (plugins / ".remote-plugin-install-staging").mkdir()
+    (plugins / "github").mkdir()                 # 已安装插件 = 未受控上下文
+    checks, _ = attest(profile)
+    assert "installed-plugins:1" in checks["N1-E-substrate"].detail
+
+
+def test_n1_plugin_cache_only_is_ok(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    plugins = profile.codex_home / "plugins"
+    (plugins / "cache" / "openai-curated-remote").mkdir(parents=True)
+    checks, _ = attest(profile)
+    assert checks["N1-E-substrate"].status == "PASS"
+
+
+def test_n1_stage_override_present_fail(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, _ = attest(profile, env={"KI_INSIGHT_THINK_CMD": "/bin/echo x"})
+    assert "stage-overrides:1" in checks["N1-E-substrate"].detail
+
+
+@pytest.mark.parametrize("key", ["KI_INSIGHT_MODEL_CMD", "OPENAI_API_KEY",
+                                 "GITHUB_TOKEN", "SSH_AUTH_SOCK"])
+def test_n1_ambient_secret_in_child_env_fail(tmp_path, key):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    child = dict(certified_probe_env(profile))
+    child[key] = "secret-marker-4b8e"
+    checks, _ = attest(profile, child_env=child)
+    assert checks["N1-E-substrate"].status == "FAIL"
+    assert "ambient-child-env:1" in checks["N1-E-substrate"].detail
+    assert "secret-marker-4b8e" not in checks["N1-E-substrate"].detail
+
+
+# --- N1 happy path + 语义边界 ---
+
+def test_n1_clean_exact_profile_pass(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    checks, attestation = attest(profile)
+    assert {c.status for c in checks.values()} == {"PASS"}, checks
+    assert attestation["verdict"] == "PASS"
+    assert attestation["provider_attestation"] == "codex-0.159.2"
+    assert attestation["upstream_tag"] == "rust-v0.159.2"
+    assert attestation["web_tool_when_disabled"] == "absent"
+    assert attestation["hosted_apps_when_apps_disabled"] == "absent"
+    assert attestation["features_inventoried"] == 8
+
+
+def test_n1_apply_patch_presence_does_not_affect_verdict(tmp_path):
+    """回归 Issue #21 §2：名字含 `app` 的本地工具不得被当成 apps channel。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    inventory = ("apps stable false\n"
+                 "apply_patch_freeform under development true\n"
+                 "apply_patch_streaming_events under development true\n")
+    checks, attestation = attest(profile, features_probe=lambda p: (0, inventory))
+    assert checks["N1-C-apps"].status == "PASS"
+    assert attestation["verdict"] == "PASS"
+    assert "apply_patch_freeform" in attestation["effective_true_features"]
+
+
+def test_attestation_records_inventory_as_evidence(tmp_path):
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    _checks, attestation = attest(profile)
+    assert "skill_search" in attestation["effective_true_features"]
+    assert "apps" not in attestation["effective_true_features"]
+    assert attestation["binary_sha256"] == profile.binary_sha256
+
+
+def test_behavioral_smoke_has_no_n1_of_its_own(tmp_path):
+    """N1 只有一个来源：behavioral 层不得再产生 N1 结论。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    results = run_hostile_behavioral_smoke(
+        profile, exec_args=["exec"], run_fn=fake_runner_factory(ALL_BEHAVIORAL_PASS))
+    assert set(results) == {"N2", "N3", "N4", "N5"}
+
+
+def test_run_hostile_smoke_n1_never_uses_model_run_fn(tmp_path):
+    """N1 不经模型：即使 run_fn 返回完美文本，apps 启用时 N1 仍 FAIL。"""
+    binary = stub_binary(tmp_path)
+    profile = certified_profile(tmp_path, binary)
+    results = run_hostile_smoke(
+        profile, exec_args=["exec"], features_probe=lambda p: (
+            0, "apps stable true\n"),
+        version_probe=lambda p: "codex-cli 0.159.2", env={},
+        child_env=certified_probe_env(profile),
+        run_fn=fake_runner_factory(ALL_BEHAVIORAL_PASS))
+    assert results["N1"]["pass"] is False
+    assert all(results[n]["pass"] for n in ("N2", "N3", "N4", "N5"))
