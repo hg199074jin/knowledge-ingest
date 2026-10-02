@@ -530,9 +530,13 @@ def _build_parser() -> argparse.ArgumentParser:
                                     help="shadow scan LaunchAgent")
     ins_shadow_sub = ins_shadow.add_subparsers(
         dest="insight_shadow_command", required=True)
-    ins_shadow_sub.add_parser("install", parents=[common])
+    ins_shadow_sub.add_parser("install", parents=[common],
+                              help="write production plist (no launchctl)")
+    ins_shadow_sub.add_parser("load", parents=[common],
+                              help="launchctl bootstrap the V3 label")
     ins_shadow_sub.add_parser("status", parents=[common])
-    ins_shadow_sub.add_parser("uninstall", parents=[common])
+    ins_shadow_sub.add_parser("uninstall", parents=[common],
+                              help="bootout V3 label + remove V3 plist")
 
     return parser
 
@@ -2456,6 +2460,73 @@ def _cmd_telegram_retention(config: AppConfig, args) -> int:
 
 # ---- V3 Insight dispatch ----
 
+def _production_executable() -> str:
+    """production 可执行文件绝对路径（与当前解释器同目录的 console script）。"""
+    candidate = Path(sys.executable).parent / "knowledge-ingest"
+    if not candidate.is_file():
+        raise FileNotFoundError(
+            f"knowledge-ingest executable not found: {candidate}")
+    return str(candidate)
+
+
+def _require_production_config_path(args) -> str:
+    """production config 必须是显式、真实存在、可读的绝对路径（R1.5 §8）。
+
+    禁止 `config.example.yaml`：模板/示例文件不得作为 production 部署身份。
+    """
+    raw = getattr(args, "config_path", None) or getattr(args, "config", None)
+    if not raw or not str(raw).strip():
+        raise SystemExit(
+            "shadow-agent install requires --config <absolute production config>")
+    path = Path(str(raw)).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve()
+    if path.name == "config.example.yaml":
+        raise SystemExit(
+            "refusing config.example.yaml as production config (R1.5 §8)")
+    if not path.is_file():
+        raise SystemExit(f"config not found: {path}")
+    return str(path)
+
+
+def _cmd_insight_scan(config: AppConfig, args) -> int:
+    """R1.5-A：真实 production shadow scan（V2 只读、V3 增量、bounded）。"""
+    from knowledge_ingest.insight.production import (
+        InsightActivationError,
+        run_shadow_scan,
+    )
+    from knowledge_ingest.insight.store import InsightStore
+    from knowledge_ingest.telegram.event_store import TelegramEventStore
+    from knowledge_ingest.telegram.insight_adapter import TelegramInsightAdapter
+
+    provider = getattr(args, "provider", "telegram")
+    limit = getattr(args, "limit", None)
+    insight_root = Path(config.pipeline_root) / "insight"
+    store = InsightStore(insight_root / "state.db")
+    try:
+        if provider != "telegram":
+            print(f"unsupported provider: {provider}")
+            return 2
+        # V2 只读：绝不推进 cursor / classifier / handoff / digest / budget
+        telegram = TelegramEventStore.open_read_only(
+            config.pipeline_root / "telegram" / "state.db")
+        adapter = TelegramInsightAdapter(telegram,
+                                         pipeline_root=config.pipeline_root)
+        report = run_shadow_scan(store=store, adapter=adapter,
+                                 insight_root=insight_root, limit=limit)
+    except InsightActivationError as exc:
+        print(f"scan refused (activation gate): {exc}")
+        return 1
+    except FileNotFoundError as exc:
+        print(f"scan unavailable: {exc}")
+        return 1
+    print("scan: shadow mode (V2 read-only, no V2 state mutation)")
+    for line in report.lines():
+        print(line)
+    return 1 if report.errors and not report.outcomes else 0
+
+
 def _cmd_insight(config: AppConfig, args) -> int:
     from knowledge_ingest.insight.digest import build_insight_digest
     from knowledge_ingest.insight.doctor import run_insight_doctor
@@ -2465,8 +2536,7 @@ def _cmd_insight(config: AppConfig, args) -> int:
     store = InsightStore(Path(config.pipeline_root) / "insight" / "state.db")
 
     if sub == "scan":
-        print("scan: shadow mode (no V2 state mutation)")
-        return 0
+        return _cmd_insight_scan(config, args)
     if sub == "status":
         print(f"insight root: {Path(config.pipeline_root) / 'insight'}")
         print(f"sources: {store.count_sources()}")
@@ -2535,28 +2605,45 @@ def _cmd_insight(config: AppConfig, args) -> int:
         from knowledge_ingest.insight.shadow_agent import (
             default_plist_path,
             install_shadow_agent,
+            launchd_domain,
+            launchd_status,
+            load_shadow_agent,
+            remove_shadow_agent_plist,
             shadow_agent_status,
             status_lines,
             uninstall_notice,
+            unload_shadow_agent,
         )
 
         shadow_cmd = getattr(args, "insight_shadow_command", None)
         plist_path = default_plist_path()
         if shadow_cmd == "install":
+            config_path = _require_production_config_path(args)
             result = install_shadow_agent(
                 plist_path=plist_path,
-                ki_exe=str(Path(sys.executable).parent / "knowledge-ingest"),
-                config_path=str(Path("config.example.yaml").resolve()))
+                ki_exe=_production_executable(),
+                config_path=config_path)
             for line in result.rows():
                 print(line)
             print(result.detail)
-            return 0 if result.installed else 1
+            if not result.installed:
+                return 1
+            print(f"written (not loaded): {plist_path}")
+            print("activate with: launchctl bootstrap "
+                  f"{launchd_domain()} {plist_path}")
+            return 0
+        if shadow_cmd == "load":
+            print(load_shadow_agent(plist_path=plist_path))
+            return 0
         if shadow_cmd == "status":
             for line in status_lines(shadow_agent_status(
                     plist_path=plist_path)):
                 print(line)
+            print(f"launchd_loaded: {launchd_status()['loaded']}")
             return 0
         if shadow_cmd == "uninstall":
+            print(unload_shadow_agent())
+            print(remove_shadow_agent_plist(plist_path=plist_path))
             for line in uninstall_notice():
                 print(line)
             return 0

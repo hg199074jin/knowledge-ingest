@@ -14,13 +14,20 @@
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import hashlib
+import os
 import plistlib
+import types
 from pathlib import Path
 
 import pytest
 
+from knowledge_ingest.cli import (
+    _production_executable,
+    _require_production_config_path,
+)
 from knowledge_ingest.insight.codex_isolation import (
     CertificationState,
     build_certified_model_command,
@@ -30,11 +37,18 @@ from knowledge_ingest.insight.shadow_agent import (
     LABEL,
     PLIST_FILENAME,
     ShadowInstallResult,
+    bootout_argv,
+    bootstrap_argv,
     build_plist_environment,
     generate_insight_plist_bytes,
     install_shadow_agent,
+    launchd_status,
+    load_shadow_agent,
+    print_argv,
+    remove_shadow_agent_plist,
     shadow_agent_status,
     uninstall_notice,
+    unload_shadow_agent,
 )
 
 from .conftest import AUTH_SECRET
@@ -291,3 +305,127 @@ def test_install_result_is_frozen_dataclass():
         readiness_status="FAIL", detail="refused")
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.installed = True        # type: ignore[misc]
+
+
+# ---------- R1.5 §14：V3-only launchctl lifecycle ----------
+
+class FakeLaunchctl:
+    """记录 argv 的 launchctl 替身（不触碰真实 launchd）。"""
+
+    def __init__(self, rc=0):
+        self.calls: list[list[str]] = []
+        self.rc = rc
+
+    def __call__(self, argv):
+        self.calls.append(list(argv))
+        return types.SimpleNamespace(returncode=self.rc, stderr="",
+                                     stdout="")
+
+
+def test_bootstrap_argv_is_v3_gui_domain_no_shell():
+    argv = bootstrap_argv(Path("/tmp/x.plist"))
+    assert argv[:2] == ["launchctl", "bootstrap"]
+    assert argv[2] == f"gui/{os.getuid()}"
+    assert argv[3] == "/tmp/x.plist"
+    assert all("*" not in part for part in argv)      # 无 wildcard
+
+
+def test_bootout_argv_targets_exact_v3_label():
+    argv = bootout_argv()
+    assert argv == ["launchctl", "bootout",
+                    f"gui/{os.getuid()}/{LABEL}"]
+    assert "telegram" not in " ".join(argv)          # 绝不涉及 V2 label
+
+
+def test_print_argv_targets_exact_v3_label():
+    assert print_argv() == ["launchctl", "print",
+                            f"gui/{os.getuid()}/{LABEL}"]
+
+
+def test_load_requires_existing_plist(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_shadow_agent(plist_path=tmp_path / "absent.plist")
+
+
+def test_load_invokes_bootstrap_with_fixed_argv(tmp_path):
+    plist = tmp_path / PLIST_FILENAME
+    plist.write_bytes(b"<plist/>")
+    fake = FakeLaunchctl()
+    result = load_shadow_agent(plist_path=plist, run_fn=fake)
+    assert fake.calls == [bootstrap_argv(plist)]
+    assert result["rc"] == 0
+
+
+def test_unload_invokes_bootout_v3_only():
+    fake = FakeLaunchctl()
+    result = unload_shadow_agent(run_fn=fake)
+    assert fake.calls == [bootout_argv()]
+    assert result["action"] == "bootout"
+
+
+def test_launchd_status_reports_loaded_by_rc():
+    assert launchd_status(run_fn=FakeLaunchctl(rc=0))["loaded"] is True
+    assert launchd_status(run_fn=FakeLaunchctl(rc=113))["loaded"] is False
+
+
+def test_remove_plist_refuses_non_v3_file(tmp_path):
+    v2 = tmp_path / "com.sandro.ki-telegram-watch.plist"
+    v2.write_bytes(b"<v2/>")
+    with pytest.raises(ValueError):
+        remove_shadow_agent_plist(plist_path=v2)
+    assert v2.is_file()                              # V2 未被触碰
+
+
+def test_remove_plist_deletes_only_v3(tmp_path):
+    v3 = tmp_path / PLIST_FILENAME
+    v2 = tmp_path / "com.sandro.ki-telegram-digest.plist"
+    v3.write_bytes(b"<v3/>")
+    v2.write_bytes(b"<v2/>")
+    result = remove_shadow_agent_plist(plist_path=v3)
+    assert result["existed"] is True
+    assert not v3.exists() and v2.is_file()
+
+
+def test_lifecycle_never_mentions_v2_labels(tmp_path):
+    fake = FakeLaunchctl()
+    plist = tmp_path / PLIST_FILENAME
+    plist.write_bytes(b"<plist/>")
+    load_shadow_agent(plist_path=plist, run_fn=fake)
+    unload_shadow_agent(run_fn=fake)
+    launchd_status(run_fn=fake)
+    blob = " ".join(" ".join(call) for call in fake.calls)
+    assert "ki-telegram" not in blob
+    assert LABEL in blob
+
+
+# ---------- R1.5 §8：production config path ----------
+
+def test_production_config_rejects_example_file():
+    with pytest.raises(SystemExit) as exc:
+        _require_production_config_path(
+            argparse.Namespace(config="/tmp/config.example.yaml"))
+    assert "config.example.yaml" in str(exc.value)
+
+
+def test_production_config_requires_explicit_flag():
+    with pytest.raises(SystemExit):
+        _require_production_config_path(argparse.Namespace(config=None))
+
+
+def test_production_config_requires_existing_file(tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        _require_production_config_path(
+            argparse.Namespace(config=str(tmp_path / "absent.yaml")))
+    assert "config not found" in str(exc.value)
+
+
+def test_production_config_accepts_real_absolute_file(tmp_path):
+    real = tmp_path / "config.yaml"
+    real.write_text("pipeline_root: /tmp\n", encoding="utf-8")
+    assert _require_production_config_path(
+        argparse.Namespace(config=str(real))) == str(real)
+
+
+def test_production_executable_is_absolute_existing():
+    assert Path(_production_executable()).is_absolute()
+    assert Path(_production_executable()).is_file()
