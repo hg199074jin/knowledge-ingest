@@ -198,6 +198,34 @@ class TelegramEventStore:
         self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         self._ensure_schema()
 
+    @classmethod
+    def open_read_only(cls, db_path: str | Path) -> TelegramEventStore:
+        """只读打开（V3 insight shadow scan 用；R1.5 §4 零 V2 写入保证）。
+
+        与写入口的差别，且刻意只差这几点：
+        - 连接串 `file:...?mode=ro`（SQLite 层面拒绝任何写入）；
+        - **不** mkdir 父目录、**不** 设 journal_mode、**不** 跑 `_ensure_schema()`
+          （避免任何隐式迁移/建表）；
+        - 仍然 fail-fast 校验 schema 版本（只读 PRAGMA）。
+        """
+        path = Path(db_path)
+        instance = cls.__new__(cls)
+        instance.db_path = path
+        if not path.is_file():
+            raise FileNotFoundError(f"telegram state.db not found: {path.name}")
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                               timeout=BUSY_TIMEOUT_MS / 1000.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        instance._conn = conn
+        version = instance.user_version()
+        if version > SCHEMA_VERSION:
+            conn.close()
+            raise UnsupportedSchemaVersionError(
+                f"state.db user_version={version} > supported "
+                f"{SCHEMA_VERSION}; refusing to open (fail-fast)")
+        return instance
+
     # ---------- schema / pragmas ----------
 
     def _ensure_schema(self) -> None:
