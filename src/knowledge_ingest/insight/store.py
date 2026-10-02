@@ -320,6 +320,13 @@ class InsightStore:
             "SELECT * FROM insight_sources WHERE insight_source_id = ?",
             (insight_source_id,)).fetchone()
 
+    def get_source_by_identity(self, provider: str,
+                               source_item_id: str) -> sqlite3.Row | None:
+        """按逻辑身份只读查询（增量扫描选择用；**不**注册、不写）。"""
+        return self._conn.execute(
+            "SELECT * FROM insight_sources WHERE provider = ? "
+            "AND source_item_id = ?", (provider, source_item_id)).fetchone()
+
     def count_sources(self) -> int:
         return self._conn.execute(
             "SELECT COUNT(*) FROM insight_sources").fetchone()[0]
