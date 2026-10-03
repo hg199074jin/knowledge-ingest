@@ -17,7 +17,9 @@ profile/preflight 接到**真正的 activation path**（原实现只有 plist ge
 
 from __future__ import annotations
 
+import os
 import plistlib
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,19 +104,32 @@ def build_plist_environment(profile: CodexIsolationProfile, *,
     return environment
 
 
+class ShadowAgentActivationError(RuntimeError):
+    """R1.5 §6：load 前 activation gate 未 PASS（fail-closed，绝不 bootstrap）。"""
+
+
 def generate_insight_plist_bytes(*, ki_exe: str, config_path: str,
-                                 environment: Mapping[str, str] | None = None
-                                 ) -> bytes:
+                                 environment: Mapping[str, str] | None = None,
+                                 scan_limit: int | None = None) -> bytes:
+    """生成 V3 plist。
+
+    `scan_limit` 写入 ProgramArguments（`--limit N`）：canary 必须**有界**，且
+    boundedness 必须表达在部署资产里而不是只存在于人工命令中（Issue #28 §6）。
+    """
     unapproved = sorted(set(environment or ()) - set(APPROVED_PLIST_ENV_KEYS))
     if unapproved:
         raise ValueError(
             f"refusing to persist unapproved plist env keys: {unapproved}")
+    arguments = [ki_exe, "insight", "scan", "--provider", "telegram",
+                 "--config", config_path]
+    if scan_limit is not None:
+        if isinstance(scan_limit, bool) or not isinstance(scan_limit, int) \
+                or scan_limit < 1:
+            raise ValueError("scan_limit must be a positive int")
+        arguments += ["--limit", str(scan_limit)]
     cfg = {
         "Label": LABEL,
-        "ProgramArguments": [
-            ki_exe, "insight", "scan", "--provider", "telegram",
-            "--config", config_path,
-        ],
+        "ProgramArguments": arguments,
         "StartInterval": START_INTERVAL_SECONDS,
         "RunAtLoad": False,
         "StandardOutPath": "/Users/sandro/Library/Logs/knowledge-ingest/"
@@ -157,12 +172,22 @@ def install_shadow_agent(*, plist_path: Path | None = None,
                          env: Mapping[str, str] | None = None,
                          real_home: Path | None = None,
                          child_path: str = DEFAULT_CHILD_PATH,
+                         scan_limit: int | None = None,
                          version_probe=None) -> ShadowInstallResult:
     """fail-closed install：先过 activation gate，再谈写 plist。
 
     非 PASS → 直接 refuse，`plist_path` 既不创建也不覆盖（父目录都不 mkdir）。
+    非法 `scan_limit` 同样在**任何副作用之前**拒绝并返回 refuse（本函数不抛异常，
+    与 R1.3/R1.4 确立的"install 永远返回判定"契约一致）。
     """
     plist_path = default_plist_path() if plist_path is None else Path(plist_path)
+    if scan_limit is not None and (
+            isinstance(scan_limit, bool) or not isinstance(scan_limit, int)
+            or scan_limit < 1):
+        return ShadowInstallResult(
+            installed=False, wrote=False, plist_path=plist_path,
+            readiness_status="REFUSED",
+            detail="refused: scan_limit must be a positive int")
     readiness = evaluate_activation_readiness(env, real_home=real_home,
                                               version_probe=version_probe)
     if readiness.status != "PASS" or readiness.profile is None \
@@ -177,7 +202,8 @@ def install_shadow_agent(*, plist_path: Path | None = None,
     environment = build_plist_environment(
         profile, manifest_path=readiness.manifest_path, child_path=child_path)
     blob = generate_insight_plist_bytes(ki_exe=ki_exe, config_path=config_path,
-                                        environment=environment)
+                                        environment=environment,
+                                        scan_limit=scan_limit)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_bytes(blob)
     return ShadowInstallResult(
@@ -224,3 +250,85 @@ def uninstall_notice() -> tuple[str, ...]:
 
 def status_lines(status: Mapping[str, str]) -> list[str]:
     return [f"{key}: {value}" for key, value in status.items()]
+
+
+# ---------- V3-only launchctl lifecycle（R1.5 §14）----------
+
+def launchd_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def bootstrap_argv(plist_path: Path) -> list[str]:
+    """V3 label only；argv 固定构造，无 shell、无 wildcard、无 V2 label。"""
+    return ["launchctl", "bootstrap", launchd_domain(), str(plist_path)]
+
+
+def bootout_argv() -> list[str]:
+    return ["launchctl", "bootout",
+            f"{launchd_domain()}/{LABEL}"]
+
+
+def print_argv() -> list[str]:
+    return ["launchctl", "print",
+            f"{launchd_domain()}/{LABEL}"]
+
+
+def _default_launchctl(run: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(run, capture_output=True, text=True, timeout=60,
+                          check=False)
+
+
+def load_shadow_agent(*, plist_path: Path | None = None,
+                      env: Mapping[str, str] | None = None,
+                      real_home: Path | None = None,
+                      version_probe=None,
+                      run_fn=None) -> dict[str, object]:
+    """bootstrap V3 label（`launchctl bootstrap gui/$UID <plist>`）。
+
+    R1.5 §6：write 与 **load** 都必须在 activation gate 之后。plist 可能是旧认证
+    身份留下的陈旧资产，因此 load 独立复核 readiness，绝不假设"文件存在=已认证"。
+    """
+    plist_path = default_plist_path() if plist_path is None else Path(plist_path)
+    if not plist_path.is_file():
+        raise FileNotFoundError(f"V3 plist not found: {plist_path.name}")
+    readiness = evaluate_activation_readiness(env, real_home=real_home,
+                                              version_probe=version_probe)
+    if readiness.status != "PASS":
+        raise ShadowAgentActivationError(
+            f"refusing to load: activation_ready={readiness.status} "
+            f"({readiness.detail})")
+    run = run_fn or _default_launchctl
+    argv = bootstrap_argv(plist_path)
+    proc = run(argv)
+    return {"action": "bootstrap", "argv": argv, "rc": proc.returncode,
+            "stderr": (proc.stderr or "").strip()[:200]}
+
+
+def unload_shadow_agent(*, run_fn=None) -> dict[str, object]:
+    """bootout V3 label only（rollback 的第一步）。"""
+    run = run_fn or _default_launchctl
+    argv = bootout_argv()
+    proc = run(argv)
+    return {"action": "bootout", "argv": argv, "rc": proc.returncode,
+            "stderr": (proc.stderr or "").strip()[:200]}
+
+
+def remove_shadow_agent_plist(*, plist_path: Path | None = None) -> dict[str, object]:
+    """删除 V3 plist（只允许 V3 文件名；绝不触碰其它 LaunchAgent）。"""
+    plist_path = default_plist_path() if plist_path is None else Path(plist_path)
+    if plist_path.name != PLIST_FILENAME:
+        raise ValueError(f"refusing to remove non-V3 plist: {plist_path.name}")
+    existed = plist_path.is_file()
+    if existed:
+        plist_path.unlink()
+    return {"action": "remove_plist", "path": str(plist_path),
+            "existed": existed, "rc": 0}
+
+
+def launchd_status(*, run_fn=None) -> dict[str, object]:
+    """V3 launchd job 状态（`launchctl print` 的 exit code 解读）。"""
+    run = run_fn or _default_launchctl
+    argv = print_argv()
+    proc = run(argv)
+    return {"action": "print", "argv": argv, "rc": proc.returncode,
+            "loaded": proc.returncode == 0}
