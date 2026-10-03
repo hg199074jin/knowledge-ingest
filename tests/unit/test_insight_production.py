@@ -287,3 +287,104 @@ def test_store_identity_lookup_is_read_only(store):
     sid = store.register_source_view(view)
     row = store.get_source_by_identity("telegram", "item-1")
     assert row["insight_source_id"] == sid
+
+# ---------- §25 补齐：合法终态 / model failure 语义 / 完整组合 ----------
+
+def test_model_failure_recorded_as_error_never_as_reject(
+        monkeypatch, tmp_path, store):
+    """§6/§25：model failure → blocked/retryable 语义，绝不记成 reject。"""
+    from knowledge_ingest.insight.model_port import ModelCommandFailedError
+    _patched_service(monkeypatch, RecordingService(outcomes={
+        "i1": ModelCommandFailedError("model command exit 1")}))
+    report = run_shadow_scan(store=store, adapter=FakeAdapter([make_view("i1")]),
+                             insight_root=tmp_path / "insight")
+    assert report.scanned == 0
+    assert report.outcomes == []                    # 失败不是业务终态
+    assert report.errors == ["ModelCommandFailedError"]
+    rendered = " ".join(report.lines())
+    assert "reject" not in rendered.lower()
+
+
+@pytest.mark.parametrize("stage,status", [
+    ("candidate", "rejected"),     # candidate=false：合法
+    ("deep_value_gate", "passed"),
+    ("human_gate", "watch"),      # WATCH：合法业务结果，不强行出 card
+    ("human_gate", "archived"),
+    ("human_gate", "rejected"),
+])
+def test_business_terminals_are_legal_and_not_errors(
+        monkeypatch, tmp_path, store, stage, status):
+    from knowledge_ingest.insight.service import StageOutcome
+    _patched_service(monkeypatch, RecordingService(
+        outcomes={"i1": StageOutcome(stage, status)}))
+    report = run_shadow_scan(store=store, adapter=FakeAdapter([make_view("i1")]),
+                             insight_root=tmp_path / "insight")
+    assert report.errors == []
+    assert report.outcomes == [("text", stage, status)]
+    assert report.scanned == 1
+
+
+def test_production_service_composes_all_existing_components(
+        monkeypatch, tmp_path, store):
+    """§3.1：必须复用现有七件套，不得重写第二套 pipeline。"""
+    from knowledge_ingest.insight.candidate_filter import HighRecallCandidateFilter
+    from knowledge_ingest.insight.cards import DeepInsightCardWriter
+    from knowledge_ingest.insight.content_resolver import PartsContentResolver
+    from knowledge_ingest.insight.critic import QualityCritic, ThinkingOrchestrator
+    from knowledge_ingest.insight.retrieval import PersonalReasoningRetriever
+    from knowledge_ingest.insight.value_gate import DeepValueGate
+
+    env = {"KI_INSIGHT_REQUIRE_ISOLATION": "0",
+           "KI_INSIGHT_MODEL_CMD": "/bin/true"}
+    _patched_gate(monkeypatch)
+    service = build_production_insight_service(
+        store=store, insight_root=tmp_path / "insight", env=env,
+        version_probe=lambda p: "")
+    assert isinstance(service.resolver, PartsContentResolver)
+    assert isinstance(service.retriever, PersonalReasoningRetriever)
+    assert isinstance(service.candidate_filter, HighRecallCandidateFilter)
+    assert isinstance(service.value_gate, DeepValueGate)
+    assert isinstance(service.critic, QualityCritic)
+    assert isinstance(service.card_writer, DeepInsightCardWriter)
+    assert service.model_port is not None
+    assert isinstance(service.orchestrator, ThinkingOrchestrator)
+
+
+def test_model_port_comes_from_strict_factory_not_raw_constructor(
+        monkeypatch, tmp_path, store):
+    """§3.2：model port 必须来自 R1.1 factory。
+
+    行为证明：strict env 下 factory 产出的 port 带 `isolation`（require_strict）；
+    直接 new 原始 CommandInsightModelPort 不会有该属性。
+    """
+    from knowledge_ingest.insight.model_port import CommandInsightModelPort
+    iso_home = tmp_path / "iso-home"
+    iso_home.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    env = {
+        "KI_INSIGHT_REQUIRE_ISOLATION": "1",
+        "KI_INSIGHT_ISOLATION_HOME": str(iso_home),
+        "KI_INSIGHT_ISOLATION_CODEX_HOME": str(tmp_path / "codex-home"),
+        "KI_INSIGHT_ISOLATION_WORKSPACE": str(workspace),
+        "KI_INSIGHT_MODEL_CMD": "/bin/true",
+    }
+    _patched_gate(monkeypatch)
+    service = build_production_insight_service(
+        store=store, insight_root=tmp_path / "insight", env=env)
+    port = service.model_port
+    assert isinstance(port, CommandInsightModelPort)
+    assert port.isolation is not None
+    assert port.isolation.require_strict is True
+    assert port.isolation.workspace_cwd == workspace
+
+
+def _patched_gate(monkeypatch):
+    """组合根 wiring 测试专用：把 activation gate 替换为 no-op。
+
+    gate 本身由 `test_service_construction_refuses_when_gate_fails` /
+    `test_scan_refuses_before_touching_service` 覆盖；这里只验证组件接线。
+    """
+    from knowledge_ingest.insight import production
+    monkeypatch.setattr(production, "assert_activation_ready",
+                        lambda *a, **k: None)
