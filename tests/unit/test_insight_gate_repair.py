@@ -61,20 +61,23 @@ def test_missing_decision_repaired_on_second_attempt():
     assert decision.decision == "WATCH"
     assert len(port.payloads) == 2             # 恰好一次有界 repair
     repair = port.payloads[1]["contract_repair"]
-    assert "decision" in repair["previous_violation"]
+    assert repair["violation_code"] == "MISSING_DECISION"
+    assert repair["violation_field"] == "decision"
+    assert repair["output_contract"]["required"] == ["decision"]
     assert repair["repair_instruction"]
     assert decision.contract_repair == {
         "first_attempt_valid": False, "repair_attempted": True,
         "repair_result": "repaired",
-        "first_violation": "deep_value_gate: missing decision field"}
+        "first_violation_code": "MISSING_DECISION"}
 
 
 def test_invalid_enum_repaired_on_second_attempt():
     port = ScriptedPort([dict(BAD_ENUM), dict(VALID)])
     decision = DeepValueGate(port).evaluate(make_view(), {})
     assert decision.decision == "WATCH"
-    assert decision.contract_repair["first_violation"].endswith(
-        "unknown decision: 'SURE'")
+    # stable code，且**不回显模型返回的非法取值**
+    assert decision.contract_repair["first_violation_code"] == "INVALID_DECISION"
+    assert "SURE" not in str(decision.contract_repair)
 
 
 def test_second_contract_failure_fails_closed_bounded():
@@ -83,6 +86,7 @@ def test_second_contract_failure_fails_closed_bounded():
         DeepValueGate(port).evaluate(make_view(), {})
     assert len(port.payloads) == 2             # 有界：绝不过度重试
     assert "BLOCKED_MODEL_BAD_OUTPUT" in str(exc.value)
+    assert exc.value.code == "BLOCKED_MODEL_BAD_OUTPUT"
 
 
 def test_port_level_bad_output_also_repaired():

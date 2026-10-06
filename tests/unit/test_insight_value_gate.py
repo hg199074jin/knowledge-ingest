@@ -134,3 +134,187 @@ def test_prompt_forbids_speculating_past_cognition():
     import json
     blob = json.dumps(port.calls[0][1], ensure_ascii=False)
     assert "unknown" in blob and "不要推测" in blob
+
+
+# ---------- R2 CAL-1（Issue #31 §12）----------
+
+from knowledge_ingest.insight.model_port import (
+    ModelCommandFailedError,
+    ModelEmptyOutputError,
+    ModelNotConfiguredError,
+    ModelTimeoutError,
+)
+from knowledge_ingest.insight.value_gate import (
+    CONTRACT_REPAIR_EXHAUSTED,
+    DEEP_VALUE_STATES,
+    DIMENSION_VALUES,
+    GateContractViolation,
+    GateContractViolationCode,
+    deep_value_output_contract,
+)
+
+
+class R2ScriptedPort:
+    """按脚本返回；记录每次 payload 以便断言契约与 repair 语义。"""
+
+    def __init__(self, scripts):
+        self.scripts = list(scripts)
+        self.payloads = []
+
+    def run(self, stage, payload):
+        assert stage == "deep_value_gate"
+        self.payloads.append(payload)
+        out = self.scripts.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+
+VALID_R2 = {"decision": "DEEP_READ", "reason": "ok",
+            "novelty": "high", "contradiction_value": "unknown"}
+
+
+def r2_view() -> InsightSourceView:
+    return InsightSourceView(
+        provider="telegram", source_item_id="r2:1", content_kind="text",
+        title="t", visible_text="body", materialized_path=None,
+        full_text_available=True, verification_status="source_only",
+        content_fingerprint="fp-r2", captured_at=NOW)
+
+
+# --- §12.1 first payload 已带权威契约 ---
+
+def test_first_attempt_payload_carries_authoritative_contract():
+    port = R2ScriptedPort([dict(VALID_R2)])
+    DeepValueGate(port).evaluate(r2_view(), {})
+    contract = port.payloads[0]["output_contract"]
+    assert contract["type"] == "object"
+    assert contract["required"] == ["decision"]
+    assert contract["decision"] == list(DEEP_VALUE_STATES)
+    assert set(contract["dimensions"]) == set(DIMENSION_ENUM_EXPECTED)
+    for name, allowed in contract["dimensions"].items():
+        assert allowed == [*DIMENSION_VALUES, None], name
+    assert "contract_repair" not in port.payloads[0]
+
+
+DIMENSION_ENUM_EXPECTED = ("novelty", "cognitive_delta_potential",
+                           "business_potential", "project_relevance",
+                           "transferability", "evidence_quality",
+                           "contradiction_value", "thinking_space")
+
+
+def test_valid_first_attempt_is_single_call():
+    port = R2ScriptedPort([dict(VALID_R2)])
+    decision = DeepValueGate(port).evaluate(r2_view(), {})
+    assert decision.decision == "DEEP_READ"
+    assert len(port.payloads) == 1
+    assert decision.contract_repair is None      # absence == first-valid (§9)
+
+
+def test_contract_is_single_shared_source():
+    """first prompt / repair / parser 三处必须同源（§5）。"""
+    contract = deep_value_output_contract()
+    assert contract["decision"] == list(DEEP_VALUE_STATES)
+    # parser 接受的值域与契约声明一致
+    assert set(DIMENSION_VALUES) <= set(contract["dimensions"]["novelty"])
+    port = R2ScriptedPort([{"reason": "no decision"}, {"decision": "WATCH"}])
+    DeepValueGate(port).evaluate(r2_view(), {})
+    assert port.payloads[0]["output_contract"] == contract
+    assert port.payloads[1]["contract_repair"]["output_contract"] == contract
+
+
+# --- §12.3/§12.4 冻结业务语义未变 ---
+
+def test_missing_dimensions_still_none_and_extra_keys_ignored():
+    port = R2ScriptedPort([{"decision": "WATCH",
+                            "some_model_extra_field": "ignored"}])
+    decision = DeepValueGate(port).evaluate(r2_view(), {})
+    assert decision.decision == "WATCH"
+    assert decision.novelty is None and decision.thinking_space is None
+
+
+def test_contradiction_unknown_still_legal():
+    port = R2ScriptedPort([dict(VALID_R2)])
+    assert DeepValueGate(port).evaluate(
+        r2_view(), {}).contradiction_value == "unknown"
+
+
+# --- §12.6-9 violation taxonomy → repair ---
+
+@pytest.mark.parametrize("bad,code,field", [
+    ({"reason": "r"}, GateContractViolationCode.MISSING_DECISION, "decision"),
+    ({"decision": "MAYBE"}, GateContractViolationCode.INVALID_DECISION, "decision"),
+    ({"decision": "WATCH", "novelty": "extreme"},
+     GateContractViolationCode.INVALID_DIMENSION_VALUE, "novelty"),
+    ("not-a-dict", GateContractViolationCode.NOT_OBJECT, None),
+])
+def test_first_attempt_violations_map_to_stable_codes(bad, code, field):
+    port = R2ScriptedPort([bad, dict(VALID_R2)])
+    decision = DeepValueGate(port).evaluate(r2_view(), {})
+    assert decision.contract_repair["first_violation_code"] == code.value
+    repair = port.payloads[1]["contract_repair"]
+    assert repair["violation_code"] == code.value
+    assert repair["violation_field"] == (field or "")
+
+
+def test_port_level_bad_output_is_not_object_code():
+    port = R2ScriptedPort([ModelBadOutputError("stdout has no JSON object"),
+                           dict(VALID_R2)])
+    decision = DeepValueGate(port).evaluate(r2_view(), {})
+    assert decision.contract_repair["first_violation_code"] == "NOT_OBJECT"
+
+
+# --- §12.10-12 repair payload 内容 ---
+
+def test_repair_payload_has_no_raw_model_output():
+    secret_marker = "MODEL-RAW-SECRET-9f2a"
+    # 首轮必须真的违约（缺 decision）才会 repair；marker 藏在首轮输出里
+    port = R2ScriptedPort([{"reason": secret_marker}, dict(VALID_R2)])
+    DeepValueGate(port).evaluate(r2_view(), {})
+    repair = port.payloads[1]["contract_repair"]
+    assert secret_marker not in str(repair)
+    assert "previous_violation" not in repair          # 旧自由文本字段已移除
+    assert repair["output_contract"]["required"] == ["decision"]
+    # 同一份原始业务输入仍在
+    assert port.payloads[1]["visible_text"] == port.payloads[0]["visible_text"]
+    assert port.payloads[1]["candidate"] == port.payloads[0]["candidate"]
+
+
+def test_repair_instruction_built_from_same_contract():
+    port = R2ScriptedPort([{"reason": "r"}, dict(VALID_R2)])
+    DeepValueGate(port).evaluate(r2_view(), {})
+    instruction = port.payloads[1]["contract_repair"]["repair_instruction"]
+    for state in DEEP_VALUE_STATES:
+        assert state in instruction
+    for value in DIMENSION_VALUES:
+        assert value in instruction
+
+
+def test_second_malformed_is_bounded_fail_closed_with_stable_code():
+    port = R2ScriptedPort([{"reason": "r"}, {"decision": "NOPE"}])
+    with pytest.raises(GateContractViolation) as exc:
+        DeepValueGate(port).evaluate(r2_view(), {})
+    assert len(port.payloads) == 2                     # 恰好两次调用
+    assert exc.value.code == CONTRACT_REPAIR_EXHAUSTED
+    assert str(exc.value) == "deep_value_gate: BLOCKED_MODEL_BAD_OUTPUT"
+
+
+# --- §12.16/17 transient / execution error 绝不 repair ---
+
+@pytest.mark.parametrize("exc_type", [
+    ModelTimeoutError, ModelCommandFailedError, ModelEmptyOutputError,
+    ModelNotConfiguredError,
+])
+def test_transient_errors_never_trigger_repair(exc_type):
+    port = R2ScriptedPort([exc_type("boom")])
+    with pytest.raises(exc_type):
+        DeepValueGate(port).evaluate(r2_view(), {})
+    assert len(port.payloads) == 1                     # 只调用一次，不 repair
+
+
+def test_violation_message_never_echoes_model_value():
+    marker = "LEAKED-MODEL-VALUE-4b8e"
+    port = R2ScriptedPort([{"decision": marker}, dict(VALID_R2)])
+    decision = DeepValueGate(port).evaluate(r2_view(), {})
+    assert marker not in str(decision.contract_repair)
+    assert marker not in str(port.payloads[1]["contract_repair"])

@@ -95,11 +95,13 @@ class InsightService:
             except ModelPortError as exc:
                 run_id = self.store.create_run(sid, "deep_value_gate",
                                                "running")
-                code = ("BLOCKED_MODEL_BAD_OUTPUT"
-                        if isinstance(exc, ModelBadOutputError)
-                        else "MODEL_TRANSIENT_ERROR")
-                self.store.finish_run(run_id, "blocked",
-                                      error_code=f"{code}: {str(exc)[:100]}")
+                # R2 §10：contract exhaustion 用稳定 queryable code；不再把自由
+                # 异常文本混进 error_code（详细诊断留在异常本身，不污染 identity）。
+                code = getattr(exc, "code", None) or (
+                    "BLOCKED_MODEL_BAD_OUTPUT"
+                    if isinstance(exc, ModelBadOutputError)
+                    else "MODEL_TRANSIENT_ERROR")
+                self.store.finish_run(run_id, "blocked", error_code=code)
                 raise
             self.store.record_value_gate(sid, gate_decision)
         gate_row = self.store.latest_value_gate(sid)

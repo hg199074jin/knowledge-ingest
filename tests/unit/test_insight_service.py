@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from knowledge_ingest.insight.content_resolver import ContentPart, ResolvedContent
 from knowledge_ingest.insight.model_port import ModelBadOutputError
 from knowledge_ingest.insight.models import (
@@ -276,3 +278,119 @@ def test_fingerprint_change_resets_downstream(tmp_path):
     # EDIT：指纹变化 → revision 2 → refs 清空（待重检索）
     store.register_source_view(make_view(content_fingerprint="fp-2"))
     assert store.get_context_refs(sid) == ()
+
+
+# ---------- R2 CAL-1（Issue #31 §13）：service / store 层 ----------
+
+GATE_WATCH_R2 = {"decision": "WATCH", "reason": "弱信号", "novelty": "low"}
+
+
+class R2GatePort:
+    """只脚本化 deep_value_gate；其余 stage 交给 FakeModel。"""
+
+    def __init__(self, gate_scripts, inner):
+        self.gate_scripts = list(gate_scripts)
+        self.inner = inner
+        self.gate_calls = 0
+
+    def run(self, stage, payload):
+        if stage != "deep_value_gate":
+            return self.inner.run(stage, payload)
+        self.gate_calls += 1
+        out = self.gate_scripts.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+
+def make_service_with_real_gate(tmp_path, gate_scripts, *, candidate=True):
+    from knowledge_ingest.insight.value_gate import DeepValueGate
+    model = FakeModel([dict(GOOD_THOUGHT)], [],
+                      evidence_outputs=[dict(EVIDENCE)])
+    port = R2GatePort(gate_scripts, model)
+    store, service = make_service(tmp_path, model=model, candidate=candidate)
+    service.value_gate = DeepValueGate(port)      # 真实 gate，非 FakeGate
+    return store, service, port
+
+
+def test_r2_gate_contract_exhausted_records_stable_error_code(tmp_path):
+    """§13.1：blocked run + 可直接查询的稳定 error_code（无自由文本尾巴）。"""
+    from knowledge_ingest.insight.value_gate import GateContractViolation
+    store, service, port = make_service_with_real_gate(
+        tmp_path, [{"reason": "no decision"}, {"decision": "NOPE"}])
+    with pytest.raises(GateContractViolation):
+        service.process(make_view())
+    assert port.gate_calls == 2                       # 有界
+    row = store._conn.execute(
+        "SELECT status, error_code FROM insight_runs "
+        "WHERE stage='deep_value_gate' AND status='blocked'").fetchone()
+    assert row is not None
+    assert row["error_code"] == "BLOCKED_MODEL_BAD_OUTPUT"
+    # R3 的查询契约可直接使用
+    hits = store._conn.execute(
+        "SELECT COUNT(*) FROM insight_runs WHERE stage='deep_value_gate' "
+        "AND error_code='BLOCKED_MODEL_BAD_OUTPUT'").fetchone()[0]
+    assert hits == 1
+
+
+def test_r2_repaired_gate_persists_decision_and_provenance(tmp_path):
+    """§13.2：repaired 决策正常落库且保留 stable provenance。"""
+    store, service, _port = make_service_with_real_gate(
+        tmp_path, [{"reason": "no decision"}, dict(GATE_WATCH_R2)])
+    service.process(make_view())
+    row = store._conn.execute(
+        "SELECT decision_json FROM insight_value_gates "
+        "ORDER BY rowid DESC LIMIT 1").fetchone()
+    import json as _json
+    payload = _json.loads(row["decision_json"])
+    assert payload["decision"] == "WATCH"
+    assert payload["contract_repair"]["repair_result"] == "repaired"
+    assert payload["contract_repair"]["first_violation_code"] == "MISSING_DECISION"
+    assert "no decision" not in row["decision_json"]   # 无自由文本泄漏
+
+
+def test_r2_first_valid_gate_has_no_contract_repair(tmp_path):
+    store, service, _port = make_service_with_real_gate(
+        tmp_path, [dict(GATE_WATCH_R2)])
+    service.process(make_view())
+    import json as _json
+    row = store._conn.execute(
+        "SELECT decision_json FROM insight_value_gates "
+        "ORDER BY rowid DESC LIMIT 1").fetchone()
+    assert _json.loads(row["decision_json"]).get("contract_repair") is None
+
+
+def test_r2_restart_reuses_repaired_gate_decision(tmp_path):
+    """§13.3：repaired 决策落库后，同 revision 不再调用 gate。"""
+    store, service, port = make_service_with_real_gate(
+        tmp_path, [{"reason": "no decision"}, dict(GATE_WATCH_R2)])
+    view = make_view()
+    service.process(view)
+    assert port.gate_calls == 2
+    _store2, svc2, port2 = make_service_with_real_gate(
+        tmp_path, [dict(GATE_WATCH_R2)])   # 脚本不会被消费 = 未被调用
+    svc2.store = store
+    svc2.process(view)
+    assert port2.gate_calls == 0      # 同 revision 直接复用已判定结果
+
+
+def test_r2_transient_gate_error_records_transient_code_no_repair(tmp_path):
+    from knowledge_ingest.insight.model_port import ModelTimeoutError
+    store, service, port = make_service_with_real_gate(
+        tmp_path, [ModelTimeoutError("timeout")])
+    with pytest.raises(ModelTimeoutError):
+        service.process(make_view())
+    assert port.gate_calls == 1                       # 未触发 repair
+    row = store._conn.execute(
+        "SELECT error_code FROM insight_runs WHERE stage='deep_value_gate' "
+        "AND status='blocked'").fetchone()
+    assert row["error_code"] == "MODEL_TRANSIENT_ERROR"
+
+
+def test_r2_no_schema_migration(tmp_path):
+    """§13.4：R2 不得改 schema —— user_version 与列集合保持不变。"""
+    from knowledge_ingest.insight.store import InsightStore
+    store = InsightStore(tmp_path / "insight" / "state.db")
+    assert store.user_version() == 2
+    run_cols = {r[1] for r in store._conn.execute("PRAGMA table_info(insight_runs)")}
+    assert "error_code" in run_cols and "detail" not in run_cols
