@@ -99,13 +99,40 @@ knowledge-ingest source register <job-id> --handoff <path>
 | 场景 | 行为 | exit |
 | --- | --- | --- |
 | 首次注册（job 为 CREATED） | 正常注册并推进 | 0 |
-| **相同 handoff 重放**（ACK 丢失） | `ALREADY_REGISTERED`，**不改** status / mtime / event | 0 |
+| **相同 handoff 重放**（ACK 丢失） | `ALREADY_REGISTERED`，**严格零写入**（bytes / mtime / events 全不变） | 0 |
 | 同 job 不同 handoff | `HANDOFF_CONFLICT`，**不覆盖**旧记录 | 6 |
 | job 已推进 / BLOCKED | `HANDOFF_CONFLICT`，**不复活、不重置** | 6 |
 
-handoff 等价判断只用稳定身份三元组（`local_path` / `remote.id` /
-`provenance.message_ids`），**不**依赖注册时派生的 `source_fingerprint`，
-也**不**把正文写进任何比较或日志。
+### 并发原子性（Issue #37）
+
+判定与写入在**同一个 per-job flock 临界区**内完成，并且**锁内重读** manifest
+后才做最终判断。早期实现把判定放在锁外、写入时又不重检 —— 并发 A/B 都读到
+`CREATED + empty source` 时，败方会覆盖胜方的 handoff，或在已推进状态上继续
+`_advance`。
+
+零写入重放通过 `ManifestStore.locked()` + `LockedSession.commit()` 实现：
+**不 commit 就不落盘**。不能沿用 `edit()`——后者在 contextmanager 退出时
+无条件 `save()`，会改动 mtime / bytes / events。
+
+### handoff 等价契约
+
+`handoff_identity` 取 handoff 的稳定 canonical 字段（不含任何正文）：
+
+`schema_version`、`provider`、`remote.{id,name,size_bytes,mtime,path}`、
+`local_path` 是否存在、`download_completed`、
+`provenance.{source_id,chat_id,message_ids,sender_id,first_message_at,last_message_at,source_deleted}`
+
+规则：
+
+- **排除**下游派生的 `source_fingerprint`（注册时本地 handoff 还没有它）；
+- 用 `local_path` 的**存在性**而非绝对路径本身参与身份（路径随环境变化）；
+- 递归规范化，使 producer 的键序/序列化差异不影响等价性；
+- 因此 `size_bytes` / `mtime` / `source_deleted` / `message_ids` / `chat_id`
+  的变化都会被正确识别为**不同** payload。
+
+> 已知边界：若同一路径的**内容**变化而 size 与 mtime 均不变，该 handoff 本身
+> 未携带任何可区分信息，无法判为不同 payload。调用方（如 Telegram Bridge）
+> 应保证内容变化时至少有一个稳定字段随之变化。
 
 ## 4. 原子性与受控状态
 

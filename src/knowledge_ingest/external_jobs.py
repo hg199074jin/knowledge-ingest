@@ -98,10 +98,10 @@ class HandoffConflictError(ExternalJobError):
 
 # ---------- 纯函数派生 ----------
 
+
 def external_fingerprint(external_id: str) -> str:
     """external-id 的短哈希指纹（日志/错误消息专用，不可逆）。"""
-    return hashlib.sha256(str(external_id).encode("utf-8")).hexdigest()[
-        :EXTERNAL_FINGERPRINT_LEN]
+    return hashlib.sha256(str(external_id).encode("utf-8")).hexdigest()[:EXTERNAL_FINGERPRINT_LEN]
 
 
 def external_job_id(external_id: str) -> str:
@@ -116,6 +116,7 @@ def external_job_id(external_id: str) -> str:
 
 # ---------- 能力自证（供 Bridge 可靠探测，而非 --help 文本匹配） ----------
 
+
 def capabilities() -> dict:
     """machine-readable 能力声明。Bridge 应据此判断能否启用 apply。"""
     return {
@@ -124,12 +125,12 @@ def capabilities() -> dict:
         "idempotent_create": True,
         "external_lookup": True,
         "register_idempotent": True,
-        "lookup_json_fields": ["found", "external_id", "job_id", "status",
-                               "contract_version"],
+        "lookup_json_fields": ["found", "external_id", "job_id", "status", "contract_version"],
     }
 
 
 # ---------- request identity（等价判断；prompt 先脱敏） ----------
+
 
 def request_identity(request: JobRequest) -> tuple:
     """用于「同一 external-id 是否同一意图」的等价判断。
@@ -137,8 +138,7 @@ def request_identity(request: JobRequest) -> tuple:
     prompt 在 CLI 侧已经过 `redact_text`（落盘前脱敏），这里比较的是
     **脱敏后**的字符串，避免用明文 prompt 参与判断而泄漏。
     """
-    return (request.provider, request.source,
-            tuple(request.targets), request.raw_prompt)
+    return (request.provider, request.source, tuple(request.targets), request.raw_prompt)
 
 
 def manifest_identity(manifest: JobManifest) -> tuple:
@@ -146,6 +146,7 @@ def manifest_identity(manifest: JobManifest) -> tuple:
 
 
 # ---------- 受控状态 marker ----------
+
 
 def marker_path(job_dir: Path) -> Path:
     return job_dir / EXTERNAL_MARKER_NAME
@@ -157,8 +158,7 @@ def write_marker(job_dir: Path, external_id: str) -> None:
         "external_id_sha256": external_fingerprint(external_id),
         "protocol_version": EXTERNAL_PROTOCOL_VERSION,
     }
-    fd = os.open(marker_path(job_dir), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                 0o644)
+    fd = os.open(marker_path(job_dir), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
         os.write(fd, json.dumps(payload, sort_keys=True).encode("utf-8"))
         os.fsync(fd)
@@ -178,30 +178,102 @@ def marker_matches(job_dir: Path, external_id: str) -> bool:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return (isinstance(payload, dict)
-            and payload.get("external_id_sha256")
-            == external_fingerprint(external_id)
-            and payload.get("protocol_version") == EXTERNAL_PROTOCOL_VERSION)
+    return (
+        isinstance(payload, dict)
+        and payload.get("external_id_sha256") == external_fingerprint(external_id)
+        and payload.get("protocol_version") == EXTERNAL_PROTOCOL_VERSION
+    )
+
 
 # ---------- source register 幂等（§2.5） ----------
 
-def handoff_identity(handoff: dict) -> tuple:
-    """handoff 的等价判断键：只取稳定身份字段，不含材料正文。
+#: `source` 中由**下游派生**的键：注册时本地 handoff 还没有它们，
+#: 因此必须排除在等价判断之外，否则同一次注册永远"不相等"。
+DERIVED_SOURCE_KEYS = frozenset({"source_fingerprint"})
 
-    选择 local_path + remote.id + message_ids 三元组：
-    - 能区分「不同来源材料」（不同 local_path / remote.id / message 区间）；
-    - 不依赖 `source_fingerprint`（它是注册时**派生**出来的，尚未落盘时没有）；
-    - 不把正文写进任何比较日志。
+#: 参与等价判断的 handoff 稳定字段（Issue #37 §4）。
+#: 刻意**不**包含 `local_path`：它随临时目录变化，不是稳定身份。
+HANDOFF_IDENTITY_FIELDS = (
+    ("schema_version",),
+    ("provider",),
+    ("remote", "id"),
+    ("remote", "name"),
+    ("remote", "size_bytes"),
+    ("remote", "mtime"),
+    ("remote", "path"),
+    ("local_path_present",),
+    ("download_completed",),
+    ("provenance", "source_id"),
+    ("provenance", "chat_id"),
+    ("provenance", "message_ids"),
+    ("provenance", "sender_id"),
+    ("provenance", "first_message_at"),
+    ("provenance", "last_message_at"),
+    ("provenance", "source_deleted"),
+)
+
+
+def _dig(mapping, path: tuple):
+    node = mapping
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node
+
+
+def _normalise(value):
+    """bool 与 int 不可混同；容器递归规范化，使键序差异不影响等价性。"""
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("int", value)
+    if isinstance(value, str) or value is None:
+        return ("scalar", value)
+    if isinstance(value, list):
+        return ("list", tuple(_normalise(v) for v in value))
+    if isinstance(value, dict):
+        return ("dict", tuple(sorted((str(k), _normalise(v)) for k, v in value.items())))
+    return ("other", repr(value))
+
+
+def handoff_identity(handoff: dict) -> tuple:
+    """handoff 的等价判断键（Issue #37 §4 加固）。
+
+    旧实现只取 `(local_path, remote.id, message_ids)`，导致：
+
+    - **同路径内容更新** -> 误判为同一 payload（local_path 没变）；
+    - `size_bytes` / `mtime` / `source_deleted` / `message_ids` / `chat_id`
+      等变化 -> 一律被忽略。
+
+    现在取 handoff 的**稳定 canonical 字段**（不含任何正文），并：
+
+    - 排除下游派生键 `source_fingerprint`（注册时本地还没有）；
+    - 用 `local_path_present` 代替 `local_path` 绝对路径本身
+      （路径随环境变化，不该参与身份）；
+    - 递归规范化，使 producer 的键序/序列化差异不影响等价性。
+
+    同路径内容变化只要伴随 size/mtime 变化即可被发现；若两者都不变，
+    该 handoff 本身就没有携带任何可区分信息 —— 见
+    `source_path_content_changed` 的兜底说明。
     """
     if not isinstance(handoff, dict):
         return ("<non-mapping>",)
-    remote = handoff.get("remote") or {}
-    prov = handoff.get("provenance") or {}
-    return (
-        str(handoff.get("local_path") or ""),
-        str(remote.get("id") or ""),
-        tuple(prov.get("message_ids") or ()),
-    )
+    parts = []
+    for field in HANDOFF_IDENTITY_FIELDS:
+        if field == ("local_path_present",):
+            value = bool(handoff.get("local_path"))
+        else:
+            value = _dig(handoff, field)
+        parts.append((field, _normalise(value)))
+    return tuple(parts)
+
+
+def source_without_derived(handoff: dict) -> dict:
+    """剥离下游派生键后的 handoff 视图（用于与 manifest.source 比对）。"""
+    if not isinstance(handoff, dict):
+        return {}
+    return {k: v for k, v in handoff.items() if k not in DERIVED_SOURCE_KEYS}
 
 
 def already_registered(manifest: JobManifest, handoff: dict) -> bool:

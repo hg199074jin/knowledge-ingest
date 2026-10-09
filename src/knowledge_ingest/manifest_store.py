@@ -159,6 +159,32 @@ def backup_v1_manifest(path: Path, raw: bytes) -> None:
         os.close(fd)
 
 
+class LockedSession:
+    """`ManifestStore.locked()` 的会话对象（Issue #37 §2）。
+
+    显式 `commit()` 才触发写回 —— 这正是 ACK 重放"零写入"所需要的语义。
+    不能用 `@contextmanager` 内的普通局部布尔量：调用方 `changed = True`
+    只会改调用方自己的 frame，生成器帧永远看不到。
+    """
+
+    __slots__ = ("_job_id", "_store", "committed", "manifest")
+
+    def __init__(self, *, manifest: JobManifest, store: ManifestStore,
+                 job_id: str):
+        self.manifest = manifest
+        self._store = store
+        self._job_id = job_id
+        self.committed = False
+
+    def commit(self) -> None:
+        """声明本次需要写回（离开 with 块时执行 validate + atomic save）。"""
+        self.committed = True
+
+    @property
+    def job_id(self) -> str:
+        return self._job_id
+
+
 class ManifestStore:
     def __init__(self, jobs_root: Path) -> None:
         self.jobs_root = Path(jobs_root)
@@ -284,6 +310,36 @@ class ManifestStore:
             raise FileNotFoundError(f"job not found: {path}")
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         return JobManifest.model_validate(data)
+
+    @contextmanager
+    def locked(self, job_id: str) -> Iterator[LockedSession]:
+        """在同一 per-job flock 内读取，并**按需**写回（Issue #37 §2）。
+
+        与 `edit` 的关键区别：**不 commit 就没有任何写入**。ACK 丢失重放必须
+        在同一锁内做最终判定，判定为"已注册"时**严格零写入**（mtime /
+        bytes / events 全不变）—— 而 `edit` 会在 contextmanager 退出时无条件
+        `save()`，不能用于重放路径。
+
+        用法::
+
+            with store.locked(job_id) as session:
+                if already_registered(session.manifest, handoff):
+                    return                 # 零写入
+                session.manifest.source = handoff
+                session.commit()           # 显式写回
+
+        未调用 `commit()` 时离开 with 块不会落盘。
+        """
+        with flock_ctx(self._manifest_lock(job_id),
+                       timeout=MANIFEST_LOCK_TIMEOUT):
+            session = LockedSession(manifest=self.load(job_id), store=self,
+                                    job_id=job_id)
+            yield session
+            if not session.committed:
+                return
+            manifest = session.manifest
+            JobManifest.model_validate(manifest.model_dump(mode="json"))
+            self.save(manifest)
 
     def save(self, manifest: JobManifest) -> None:
         path = self.manifest_path(manifest.job_id)

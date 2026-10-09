@@ -734,6 +734,20 @@ def _cmd_capabilities(config: AppConfig, args) -> int:
 
 
 def _cmd_source_register(config: AppConfig, args) -> int:
+    """注册 Source Handoff —— 判定与写入在**同一 per-job flock** 内。
+
+    Issue #37（P1 TOCTOU）修复要点：
+
+    1. 旧实现把 `already_registered` / 冲突 / status 检查放在锁**外**，
+       写入时又不在锁内重检 —— 并发 A/B 都读到 `CREATED + empty source`
+       时，败方会覆盖胜方的 handoff，或在已推进状态上继续 `_advance`。
+       现在所有判定与写入都在 `store.locked()` 的同一临界区内，
+       并且**锁内重读** manifest 后才做最终判断。
+    2. 相同 handoff 的 ACK 重放**严格零写入**：用 `locked()` 的"不 commit
+       就不写"语义，而不是 `edit()`（后者在 contextmanager 退出时无条件
+       `save()`，会改动 mtime/bytes/events）。
+    3. 冲突在锁内阻断，且不产生额外 status / error / event 副作用。
+    """
     store = _store(config)
     if not store.manifest_path(args.job_id).is_file():
         print(f"error: job not found: {args.job_id}", file=sys.stderr)
@@ -741,28 +755,27 @@ def _cmd_source_register(config: AppConfig, args) -> int:
     handoff_path = Path(args.handoff).expanduser()
     handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
 
-    # spec（ki-external-job-v1 §2.5 / §7.8-7.9）：ACK 丢失重放幂等。
-    # 判定放在写事务之外，只读、不改 status/mtime/event。
-    current = store.load(args.job_id)
-    if already_registered(current, handoff):
-        print(f"{ALREADY_REGISTERED}: {args.job_id}")
-        print(f"status: {current.status}")
-        return 0
-    if isinstance(current.source, dict) and current.source:
-        # 同 job 已注册过**不同** handoff -> 显式冲突，绝不覆盖
-        print(f"error: {HANDOFF_CONFLICT}: job {args.job_id} already "
-              f"registered a different handoff; refusing to overwrite",
-              file=sys.stderr)
-        return EXIT_CODES[HANDOFF_CONFLICT]
-    if current.status != "CREATED":
-        # 已推进 / BLOCKED 的 Job 不允许被重复注册复活或重置（§5）
-        print(f"error: {HANDOFF_CONFLICT}: job {args.job_id} is "
-              f"{current.status}, not CREATED; refusing to re-register",
-              file=sys.stderr)
-        return EXIT_CODES[HANDOFF_CONFLICT]
+    with store.locked(args.job_id) as session:
+        manifest = session.manifest
+        # --- 锁内最终判定（基于锁内重读的 manifest，不是锁外快照） ---
+        if already_registered(manifest, handoff):
+            # ACK 丢失后的重放：幂等早退，**零写入**（不 commit 即不落盘）
+            print(f"{ALREADY_REGISTERED}: {args.job_id}")
+            print(f"status: {manifest.status}")
+            return 0
+        if isinstance(manifest.source, dict) and manifest.source:
+            print(f"error: {HANDOFF_CONFLICT}: job {args.job_id} already "
+                  f"registered a different handoff; refusing to overwrite",
+                  file=sys.stderr)
+            return EXIT_CODES[HANDOFF_CONFLICT]
+        if manifest.status != "CREATED":
+            # 已推进 / BLOCKED 的 Job 不得被重复注册复活或重置
+            print(f"error: {HANDOFF_CONFLICT}: job {args.job_id} is "
+                  f"{manifest.status}, not CREATED; refusing to re-register",
+                  file=sys.stderr)
+            return EXIT_CODES[HANDOFF_CONFLICT]
 
-    # 事务式 mutate：read-modify-write 整体在 manifest 锁临界区内
-    with store.edit(args.job_id) as manifest:
+        # --- 锁内写入 ---
         manifest.source = handoff
 
         _advance(manifest, ["DISCOVERING"])
@@ -771,6 +784,7 @@ def _cmd_source_register(config: AppConfig, args) -> int:
             _block(manifest, validation_error)
             _log(config, manifest, "blocked", reason=validation_error)
             print(f"BLOCKED: {validation_error}")
+            session.commit()
             return 1
 
         fingerprint = _source_fingerprint(
@@ -790,11 +804,13 @@ def _cmd_source_register(config: AppConfig, args) -> int:
                 _block(manifest, "baidu_scope_limited")
                 _log(config, manifest, "blocked", reason="baidu_scope_limited")
                 print(f"BLOCKED: baidu_scope_limited ({remote_path or '<empty>'})")
+                session.commit()
                 return 1
 
         _advance(manifest, ["DOWNLOADING", "DOWNLOADED"])
         print(f"source registered: {handoff.get('local_path')}")
         print(f"status: {manifest.status}")
+        session.commit()
         return 0
 
 
