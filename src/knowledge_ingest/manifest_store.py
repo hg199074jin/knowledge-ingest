@@ -14,6 +14,17 @@ from pathlib import Path
 
 import yaml
 
+from knowledge_ingest.external_jobs import (
+    EXTERNAL_LOCK_DIRNAME,
+    ExternalIdConflictError,
+    IncompleteIdempotentJobError,
+    external_fingerprint,
+    external_job_id,
+    manifest_identity,
+    marker_matches,
+    request_identity,
+    write_marker,
+)
 from knowledge_ingest.models import JobManifest, JobRequest
 
 # v0.3 冻结规格 3/6：manifest 属数据一致性锁 —— EXCLUSIVE + blocking（有界等待）。
@@ -176,6 +187,95 @@ class ManifestStore:
         (job_dir / "reports").mkdir(parents=True, exist_ok=True)
         (job_dir / "logs").mkdir(parents=True, exist_ok=True)
         self.save(manifest)
+        return manifest
+
+    # ---------- 跨仓库 external-id 幂等（Issue #35） ----------
+
+    def external_lock_path(self, external_id: str) -> Path:
+        """跨进程锁：位于 jobs 内的 non-job 锁根（不占用任何 job 目录）。"""
+        job_id = external_job_id(external_id)
+        return self.jobs_root / EXTERNAL_LOCK_DIRNAME / f"{job_id}.lock"
+
+    def create_idempotent(self, request: JobRequest, *,
+                          _kill_after_manifest: bool = False) -> JobManifest:
+        """按 external_id 原子创建/复用 Job（可重放、并发安全）。
+
+        强默认：确定性 job_id + 跨进程 flock + 受控状态 marker。
+
+        - 首次：创建目录树、写 marker（O_EXCL 证明归属）、落 manifest；
+        - 重试（manifest 已存在且意图一致）：返回既有 Job，绝不新建；
+        - 同键不同意图：ExternalIdConflictError（不隐式复用）；
+        - 目录已存在但无法证明归属（无 marker / marker 不匹配 /
+          manifest 不可解析）：IncompleteIdempotentJobError，
+          **不覆盖、不删除**任何既有内容。
+
+        `_kill_after_manifest` 仅供故障注入测试（SIGKILL 窗口）使用。
+        """
+        external_id = request.external_id
+        if not external_id:
+            raise ValueError(
+                "create_idempotent requires JobRequest.external_id")
+        job_id = external_job_id(external_id)
+        with flock_ctx(self.external_lock_path(external_id),
+                       timeout=MANIFEST_LOCK_TIMEOUT):
+            manifest_path = self.manifest_path(job_id)
+            if manifest_path.is_file():
+                manifest = self._load_or_block(job_id, external_id)
+                if request_identity(request) != manifest_identity(manifest):
+                    raise ExternalIdConflictError(
+                        f"{external_fingerprint(external_id)}: external-id "
+                        f"already bound to a different request "
+                        f"(job {job_id}); refusing to reuse")
+                return manifest
+
+            job_dir = self.job_dir(job_id)
+            if job_dir.exists():
+                # 受控状态？-> 有界恢复；否则 STOP，绝不覆盖未知内容
+                if not marker_matches(job_dir, external_id):
+                    raise IncompleteIdempotentJobError(
+                        f"{external_fingerprint(external_id)}: job dir exists "
+                        f"but is not provably owned by this external-id; "
+                        f"refusing to overwrite (job {job_id})")
+            else:
+                job_dir.mkdir(parents=True, exist_ok=True)
+                write_marker(job_dir, external_id)
+
+            for sub in ("source", "handoff/document-set", "reports", "logs"):
+                (job_dir / sub).mkdir(parents=True, exist_ok=True)
+            manifest = JobManifest(
+                job_id=job_id, created_at=_now(), updated_at=_now(),
+                request=request)
+            self.save(manifest)
+            if _kill_after_manifest:
+                # 故障注入：manifest 已落盘但调用方未收到响应即被杀
+                os.kill(os.getpid(), 9)
+            return manifest
+
+    def _load_or_block(self, job_id: str, external_id: str) -> JobManifest:
+        """读取 manifest；不可解析时 fail-closed（不静默重建）。"""
+        try:
+            return self.load(job_id)
+        except (FileNotFoundError, ValueError, yaml.YAMLError) as exc:
+            raise IncompleteIdempotentJobError(
+                f"{external_fingerprint(external_id)}: existing manifest for "
+                f"job {job_id} is unreadable ({type(exc).__name__}); refusing "
+                f"to overwrite") from None
+
+    def get_by_external_id(self, external_id: str) -> JobManifest | None:
+        """只读查找：绝不 migration / 建 manifest / 改 mtime / 推进 Job。"""
+        if not external_id:
+            return None
+        job_id = external_job_id(external_id)
+        manifest_path = self.manifest_path(job_id)
+        if not manifest_path.is_file():
+            return None
+        try:
+            manifest = self.load(job_id)
+        except (FileNotFoundError, ValueError, yaml.YAMLError):
+            return None
+        # 防冒名：目录归属必须与本次 external-id 一致
+        if manifest.request.external_id != external_id:
+            return None
         return manifest
 
     def load(self, job_id: str) -> JobManifest:

@@ -122,6 +122,18 @@ def _jobs_root(config: AppConfig) -> Path:
     return config.pipeline_root / "jobs"
 
 
+from knowledge_ingest.external_jobs import (
+    ALREADY_REGISTERED,
+    EXIT_CODES,
+    EXTERNAL_PROTOCOL_VERSION,
+    HANDOFF_CONFLICT,
+    NOT_FOUND,
+    ExternalJobError,
+    already_registered,
+    capabilities,
+)
+
+
 def _store(config: AppConfig) -> ManifestStore:
     return ManifestStore(jobs_root=_jobs_root(config))
 
@@ -173,6 +185,22 @@ def _build_parser() -> argparse.ArgumentParser:
     create_cmd.add_argument("--prompt", default="",
                             help="raw user request text for provenance")
     create_cmd.add_argument(
+        "--external-id", dest="external_id", default=None,
+        help="跨仓库幂等键（spec ki-external-job-v1）。提供时：job_id 由 "
+             "SHA-256 确定性派生，同键重试/并发返回同一 job；缺省时保持"
+             "旧行为（时间+provider+source+随机 uuid 后缀）")
+    lookup_cmd = job_sub.add_parser(
+        "lookup", parents=[common],
+        help="read-only: find a job by --external-id (never writes)")
+    lookup_cmd.add_argument("--external-id", dest="external_id", required=True,
+                            help="the external-id used at create time")
+    lookup_cmd.add_argument("--json", dest="json_output", action="store_true",
+                            default=True,
+                            help="emit machine-readable JSON (default)")
+    lookup_cmd.add_argument("--plain", dest="json_output",
+                            action="store_const", const=False, default=True,
+                            help="print bare job_id instead of JSON")
+    create_cmd.add_argument(
         "--with-router", dest="with_router", nargs="?",
         const="family_router", default=None, metavar="TARGET",
         help="also request a router target (default: family_router); "
@@ -184,6 +212,15 @@ def _build_parser() -> argparse.ArgumentParser:
     amend_cmd.add_argument("job_id")
     amend_cmd.add_argument("--add-target", required=True,
                            choices=target_choices())
+
+    caps_cmd = sub.add_parser(
+        "capabilities", parents=[common],
+        help="machine-readable capability attestation (ki-external-job-v1)")
+    caps_cmd.add_argument("--json", dest="json_output", action="store_true",
+                          default=True, help="emit JSON (default)")
+    caps_cmd.add_argument("--plain", dest="json_output",
+                          action="store_const", const=False, default=True,
+                          help="print code names only")
 
     register = sub.add_parser("source", parents=[common], help="source operations")
     source_sub = register.add_subparsers(dest="source_command", required=True)
@@ -590,7 +627,20 @@ def _cmd_job_create(config: AppConfig, args) -> int:
         source=args.source,
         targets=targets,
     )
-    manifest = _store(config).create(request)
+    external_id = getattr(args, "external_id", None)
+    store = _store(config)
+    if external_id:
+        # spec（ki-external-job-v1）：确定性 job_id + 跨进程锁 + 受控状态。
+        # stdout 仍为纯 job_id，向后兼容既有调用方。
+        request = request.model_copy(update={"external_id": external_id})
+        try:
+            manifest = store.create_idempotent(request)
+        except ExternalJobError as exc:
+            print(f"error: {exc.code}: {exc}", file=sys.stderr)
+            return exc.exit_code
+        print(manifest.job_id)
+        return 0
+    manifest = store.create(request)
     print(manifest.job_id)
     return 0
 
@@ -639,6 +689,50 @@ def _handoff_validation_error(manifest, handoff: dict) -> str | None:
     return None
 
 
+def _cmd_job_lookup(config: AppConfig, args) -> int:
+    """只读 external-id 查找（spec ki-external-job-v1 §2.2/§2.6）。
+
+    - 绝不执行 schema migration、创建 manifest、touch mtime 或推进 Job；
+    - 始终输出 machine-readable JSON（found 布尔 + 稳定字段序）；
+    - NOT_FOUND 用稳定 exit code，不用用户可见散文替代协议。
+    """
+    external_id = args.external_id
+    manifest = _store(config).get_by_external_id(external_id)
+    if getattr(args, "json_output", True):
+        payload = {
+            "found": manifest is not None,
+            "external_id": external_id,
+            "contract_version": EXTERNAL_PROTOCOL_VERSION,
+        }
+        if manifest is not None:
+            # 只暴露状态与 id；不含原材料 / 私密 provenance（§4）
+            payload["job_id"] = manifest.job_id
+            payload["status"] = manifest.status
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0 if manifest is not None else EXIT_CODES[NOT_FOUND]
+    if manifest is None:
+        print(f"error: {NOT_FOUND}", file=sys.stderr)
+        return EXIT_CODES[NOT_FOUND]
+    print(manifest.job_id)
+    return 0
+
+
+def _cmd_capabilities(config: AppConfig, args) -> int:
+    """machine-readable 能力自证（§2.7/§4）。
+
+    Bridge 依此判断能否启用自动投递，而不是靠 `--help` 子串匹配 ——
+    文本命中不构成语义证据。
+    """
+    payload = capabilities()
+    if getattr(args, "json_output", True):
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
+    for key in ("idempotent_create", "external_lookup", "register_idempotent"):
+        if payload[key]:
+            print(key)
+    return 0
+
+
 def _cmd_source_register(config: AppConfig, args) -> int:
     store = _store(config)
     if not store.manifest_path(args.job_id).is_file():
@@ -646,6 +740,27 @@ def _cmd_source_register(config: AppConfig, args) -> int:
         return 2
     handoff_path = Path(args.handoff).expanduser()
     handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+
+    # spec（ki-external-job-v1 §2.5 / §7.8-7.9）：ACK 丢失重放幂等。
+    # 判定放在写事务之外，只读、不改 status/mtime/event。
+    current = store.load(args.job_id)
+    if already_registered(current, handoff):
+        print(f"{ALREADY_REGISTERED}: {args.job_id}")
+        print(f"status: {current.status}")
+        return 0
+    if isinstance(current.source, dict) and current.source:
+        # 同 job 已注册过**不同** handoff -> 显式冲突，绝不覆盖
+        print(f"error: {HANDOFF_CONFLICT}: job {args.job_id} already "
+              f"registered a different handoff; refusing to overwrite",
+              file=sys.stderr)
+        return EXIT_CODES[HANDOFF_CONFLICT]
+    if current.status != "CREATED":
+        # 已推进 / BLOCKED 的 Job 不允许被重复注册复活或重置（§5）
+        print(f"error: {HANDOFF_CONFLICT}: job {args.job_id} is "
+              f"{current.status}, not CREATED; refusing to re-register",
+              file=sys.stderr)
+        return EXIT_CODES[HANDOFF_CONFLICT]
+
     # 事务式 mutate：read-modify-write 整体在 manifest 锁临界区内
     with store.edit(args.job_id) as manifest:
         manifest.source = handoff
@@ -2284,6 +2399,10 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_insight(config, args)
         if args.command == "job" and args.job_command == "create":
             return _cmd_job_create(config, args)
+        if args.command == "job" and args.job_command == "lookup":
+            return _cmd_job_lookup(config, args)
+        if args.command == "capabilities":
+            return _cmd_capabilities(config, args)
         if args.command == "source" and args.source_command == "register":
             return _cmd_source_register(config, args)
         if args.command == "route":

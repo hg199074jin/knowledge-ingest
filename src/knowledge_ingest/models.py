@@ -66,6 +66,10 @@ class JobRequest(BaseModel):
     provider: ProviderName
     source: str
     targets: list[str]
+    # 规格（GPT-KI-TAD-IDEMPOTENCY / Issue #35）：可选的跨仓库幂等键。
+    # None = 旧行为（随机 job_id）；有值 = 确定性 job_id + 可 lookup。
+    # 旧 V1/V2 manifest 不含该字段时读入即为 None，完全兼容。
+    external_id: str | None = None
 
 
 class StageState(BaseModel):
