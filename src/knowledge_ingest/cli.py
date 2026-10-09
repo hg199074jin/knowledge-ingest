@@ -46,6 +46,27 @@ def _log(config: AppConfig, manifest, event: str, **fields) -> None:
         event, job_id=manifest.job_id, **fields)
 
 
+def _registration_proven(config: AppConfig, store, job_id: str,
+                         manifest) -> bool:
+    """该 Job 是否**可证明**曾成功注册（Issue #39 §1）。
+
+    - 主证据：`manifest.source` 上的 durable receipt（验证通过才写）；
+    - 兼容旧 manifest：既有 `logs/events.jsonl` 里的 `source_registered` 事件。
+
+    没有任一证据时返回 False —— 失败的注册会被拒绝伪装成已注册。
+    """
+    from knowledge_ingest.external_jobs import receipt_matches_source
+
+    if receipt_matches_source(manifest):
+        return True
+    log = store.job_dir(job_id) / "logs" / "events.jsonl"
+    try:
+        text = log.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "source_registered" in text
+
+
 def _source_fingerprint(path: Path) -> str | None:
     from knowledge_ingest.fingerprint import (
         fingerprint_collection,
@@ -128,8 +149,10 @@ from knowledge_ingest.external_jobs import (
     EXTERNAL_PROTOCOL_VERSION,
     HANDOFF_CONFLICT,
     NOT_FOUND,
+    REGISTRATION_RECEIPT_KEY,
     ExternalJobError,
     already_registered,
+    build_registration_receipt,
     capabilities,
 )
 
@@ -758,7 +781,8 @@ def _cmd_source_register(config: AppConfig, args) -> int:
     with store.locked(args.job_id) as session:
         manifest = session.manifest
         # --- 锁内最终判定（基于锁内重读的 manifest，不是锁外快照） ---
-        if already_registered(manifest, handoff):
+        proven = _registration_proven(config, store, args.job_id, manifest)
+        if already_registered(manifest, handoff, proven=proven):
             # ACK 丢失后的重放：幂等早退，**零写入**（不 commit 即不落盘）
             print(f"{ALREADY_REGISTERED}: {args.job_id}")
             print(f"status: {manifest.status}")
@@ -806,6 +830,10 @@ def _cmd_source_register(config: AppConfig, args) -> int:
                 print(f"BLOCKED: baidu_scope_limited ({remote_path or '<empty>'})")
                 session.commit()
                 return 1
+
+        # Issue #39 §1：成功注册凭据 —— 只在验证通过后写。失败的注册绝不带它。
+        manifest.source[REGISTRATION_RECEIPT_KEY] = build_registration_receipt(
+            manifest)
 
         _advance(manifest, ["DOWNLOADING", "DOWNLOADED"])
         print(f"source registered: {handoff.get('local_path')}")

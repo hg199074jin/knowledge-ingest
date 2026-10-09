@@ -191,6 +191,12 @@ def marker_matches(job_dir: Path, external_id: str) -> bool:
 #: 因此必须排除在等价判断之外，否则同一次注册永远"不相等"。
 DERIVED_SOURCE_KEYS = frozenset({"source_fingerprint"})
 
+#: 注册成功凭据在 `manifest.source` 里的键（Issue #39 §1）。
+#: 只在**验证通过**的成功路径写入；失败的注册**绝不**伪造它。
+REGISTRATION_RECEIPT_KEY = "_registration_receipt"
+#: 凭据协议版本（与 external-job contract 解耦，单独演进）
+REGISTRATION_RECEIPT_VERSION = 1
+
 #: 参与等价判断的 handoff 稳定字段（Issue #37 §4）。
 #: 刻意**不**包含 `local_path`：它随临时目录变化，不是稳定身份。
 HANDOFF_IDENTITY_FIELDS = (
@@ -276,12 +282,76 @@ def source_without_derived(handoff: dict) -> dict:
     return {k: v for k, v in handoff.items() if k not in DERIVED_SOURCE_KEYS}
 
 
-def already_registered(manifest: JobManifest, handoff: dict) -> bool:
-    """该 Job 是否已注册过**完全相同**的 handoff。
+def source_without_receipt(source) -> dict:
+    """剥离下游派生键**与**注册凭据后的 source 视图。
 
-    只读判断：供 `source register` 在 ACK 丢失重放时走幂等早退，
-    不改 status / 不追加 event / 不写盘。
+    凭据本身不能参与自己的完整性校验，否则会自指。
     """
+    stripped = source_without_derived(source)
+    stripped.pop(REGISTRATION_RECEIPT_KEY, None)
+    return stripped
+
+
+def source_digest(source) -> str:
+    """source 的稳定摘要（凭据用它绑定「这正是被接受过的那份 handoff」）。"""
+    import hashlib
+
+    canonical = json.dumps(
+        source_without_receipt(source),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def registration_receipt(manifest: JobManifest) -> dict | None:
+    """读取 manifest 上的注册成功凭据；不存在或格式不符返回 None。"""
+    source = manifest.source
+    if not isinstance(source, dict):
+        return None
+    receipt = source.get(REGISTRATION_RECEIPT_KEY)
+    if not isinstance(receipt, dict):
+        return None
+    if receipt.get("validated") is not True:
+        return None
+    if receipt.get("protocol_version") != REGISTRATION_RECEIPT_VERSION:
+        return None
+    return receipt
+
+
+def receipt_matches_source(manifest: JobManifest) -> bool:
+    """凭据是否确实绑定在当前这份 source 上（防篡改 / 防错配）。"""
+    receipt = registration_receipt(manifest)
+    if receipt is None:
+        return False
+    return receipt.get("handoff_sha256") == source_digest(manifest.source)
+
+
+def build_registration_receipt(manifest: JobManifest) -> dict:
+    """构造（但不写入）当前 source 的成功注册凭据。"""
+    return {
+        "validated": True,
+        "protocol_version": REGISTRATION_RECEIPT_VERSION,
+        "handoff_sha256": source_digest(manifest.source),
+    }
+
+
+def already_registered(manifest: JobManifest, handoff: dict, *, proven: bool = False) -> bool:
+    """该 Job 是否**可证明**曾成功注册过完全相同的 handoff（Issue #39 §1）。
+
+    两个条件缺一不可：
+
+    1. `manifest.source` 与传入 handoff 的身份三元组等价（内容/范围一致）；
+    2. `proven=True` —— 调用方已确认存在**成功注册凭据**（receipt 或旧
+       manifest 的 `source_registered` 事件）。
+
+    只有 (1) 时**不能**判定已注册：`manifest.source` 在验证失败时也会被写入
+    （随后 BLOCKED），那时重放必须返回非 0，而不是伪装 `ALREADY_REGISTERED`。
+    """
+    if not proven:
+        return False
     existing = manifest.source
     if not isinstance(existing, dict) or not existing:
         return False

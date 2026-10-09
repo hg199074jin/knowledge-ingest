@@ -134,8 +134,11 @@ def test_already_registered_predicate(tmp_path):
     _cmd_source_register(config, _ns_register(job_id, handoff))
     manifest = store.load(job_id)
     payload = json.loads(handoff.read_text(encoding="utf-8"))
-    payload["source_fingerprint"] = manifest.source["source_fingerprint"]
-    assert already_registered(manifest, payload) is True
+    payload["source_fingerprint"] = manifest.source.get("source_fingerprint")
+    # Issue #39：身份等价之外还必须有**成功注册凭据**（proven）。
+    # 未经证明时必须返回 False（失败的注册不得伪装成已注册）。
+    assert already_registered(manifest, payload) is False
+    assert already_registered(manifest, payload, proven=True) is True
 
 
 # ---------- §7.8 不同 payload -> conflict ----------

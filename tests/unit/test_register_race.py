@@ -472,11 +472,13 @@ def test_already_registered_helper_uses_identity(tmp_path):
     _cmd_source_register(make_config(tmp_path), _ns(job_id, a))
     manifest = store.load(job_id)
     replay = json.loads(a.read_text(encoding="utf-8"))
-    replay["source_fingerprint"] = manifest.source["source_fingerprint"]
-    assert already_registered(manifest, replay) is True
+    replay["source_fingerprint"] = manifest.source.get("source_fingerprint")
+    # Issue #39：proven 由调用方在验证 receipt 后传入；默认 False（fail-closed）
+    assert already_registered(manifest, replay, proven=True) is True
+    assert already_registered(manifest, replay) is False
     changed = json.loads(a.read_text(encoding="utf-8"))
     changed["remote"]["size_bytes"] = 123456
-    assert already_registered(manifest, changed) is False
+    assert already_registered(manifest, changed, proven=True) is False
 
 
 def test_non_mapping_handoff_identity_is_stable():
